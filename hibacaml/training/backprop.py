@@ -19,25 +19,36 @@ class HiBaCaMLBackpropRunner(HiBaCaMLTrainer):
     """Backprop runner that differentiates through predictive-coding inference."""
 
     def clone(self) -> "HiBaCaMLBackpropRunner":
+        ps = self.persistent_state
+        saved_ps_params = ps.params
+        saved_ps_opt = ps.opt_state
+        ps.params = None
+        ps.opt_state = None
+        try:
+            ps_clone = copy.deepcopy(ps)
+        finally:
+            ps.params = saved_ps_params
+            ps.opt_state = saved_ps_opt
+
         cloned = HiBaCaMLBackpropRunner(
-            cfg=copy.deepcopy(self.cfg),
+            cfg=self.cfg,
             structure=self.structure,
-            params=copy.deepcopy(self.params),
+            params=jax.tree_util.tree_map(lambda x: x, self.params),
             tasks=list(self.tasks.values()),
             optimizer=self.optimizer,
             rng_key=self.rng_key,
-            persistent_state=copy.deepcopy(self.persistent_state),
+            persistent_state=ps_clone,
             create_run_logger=False,
         )
-        cloned.opt_state = copy.deepcopy(self.opt_state)
+        cloned.opt_state = jax.tree_util.tree_map(lambda x: x, self.opt_state)
         cloned.persistent_state.params = cloned.params
         cloned.persistent_state.opt_state = cloned.opt_state
-        cloned.current_phi = copy.deepcopy(self.current_phi)
+        cloned.current_phi = self.current_phi
         cloned.current_nonshared = tuple(self.current_nonshared)
         cloned._jit_run_batch_inference = self._jit_run_batch_inference
         cloned._jit_compute_pc_gradients = self._jit_compute_pc_gradients
         cloned._jit_eval_batch = self._jit_eval_batch
-        cloned._eval_cache = copy.deepcopy(self._eval_cache)
+        cloned._eval_cache = {}
         return cloned
 
     def compute_pc_gradients(

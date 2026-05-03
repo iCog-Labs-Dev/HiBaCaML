@@ -10,10 +10,7 @@ from hibacaml.nodes.core import (
     ShellBankResidualNode,
     composer_stage2_details,
 )
-from hibacaml.nodes.energy import (
-    WeightedCrossEntropyEnergy,
-    WeightedGaussianEnergy,
-)
+from hibacaml.nodes.energy import WeightedCrossEntropyEnergy
 
 __all__ = [
     "ComposerStage2Node",
@@ -24,6 +21,5 @@ __all__ = [
     "ShellBankRecurrentNode",
     "ShellBankResidualNode",
     "WeightedCrossEntropyEnergy",
-    "WeightedGaussianEnergy",
     "composer_stage2_details",
 ]
