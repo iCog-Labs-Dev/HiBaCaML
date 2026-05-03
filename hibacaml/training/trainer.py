@@ -17,7 +17,6 @@ from fabricpc.core.inference import run_inference
 from fabricpc.graph.graph_net import compute_local_weight_gradients
 from fabricpc.graph.state_initializer import initialize_graph_state
 from hibacaml.config import HiBaCaMLConfig
-from hibacaml.config import HiBaCaMLConfig
 from hibacaml.control.search import ExactSearchService
 from hibacaml.control.shells import ShellController
 from hibacaml.control.support import (
@@ -187,7 +186,7 @@ class HiBaCaMLTrainer:
         # produces new arrays, never mutating existing ones. So sharing the array
         # leaves via tree_map is safe and avoids copying the full weight tensors
         # for every rollout candidate (135 clones across a full 5-task run).
-        # Temporarily nullify the JAX-array references inside persistent_state so
+        # Temporarily nullify the JAX-array handles inside persistent_state so
         # deepcopy doesn't traverse and copy them; restore immediately after.
         ps = self.persistent_state
         saved_ps_params = ps.params
@@ -500,6 +499,7 @@ class HiBaCaMLTrainer:
         return grads._replace(nodes=masked_nodes)
 
     def _apply_grads(self, grads):
+        grads = self.shell_controller.precision_weight_gradients(grads, self.params)
         updates, self.opt_state = self.optimizer.update(grads, self.opt_state, self.params)
         self.params = optax.apply_updates(self.params, updates)
         self.persistent_state.params = self.params
@@ -555,15 +555,23 @@ class HiBaCaMLTrainer:
                 cert_due = next_step % self.cfg.cert_refresh_interval == 0
                 maintenance_due = (
                     self.cfg.exact_search.enable_exact_search
+                    and self.cfg.exact_search.enable_local_maintenance
                     and task.task_id > 0
                     and next_step - self.persistent_state.last_maintenance_step.get(task.task_id, 0)
                     >= self.cfg.exact_search.maintenance_interval
                 )
-                if batch_idx == 0 or cert_due or maintenance_due or batch_idx + 1 == train_batches:
+                demotion_due = (
+                    self.cfg.exact_search.enable_exact_search
+                    and self.cfg.exact_search.enable_demotion_swap_audit
+                    and task.task_id > 0
+                    and next_step - self.persistent_state.last_demotion_audit_step.get(task.task_id, 0)
+                    >= self.cfg.exact_search.demotion_audit_interval
+                )
+                if batch_idx == 0 or cert_due or maintenance_due or demotion_due or batch_idx + 1 == train_batches:
                     log_progress(
                         f"task={task.task_id} epoch={epoch_idx + 1}/{self.cfg.epochs_per_task} "
                         f"batch={batch_idx + 1}/{train_batches} start step={next_step} "
-                        f"hooks(cert_refresh={cert_due}, maintenance={maintenance_due})",
+                        f"hooks(cert_refresh={cert_due}, maintenance={maintenance_due}, demotion={demotion_due})",
                         component="trainer",
                     )
 
@@ -584,6 +592,10 @@ class HiBaCaMLTrainer:
                 self._bump_params_revision()
                 self.persistent_state.global_step += 1
                 final_losses = dict(losses)
+
+                if demotion_due:
+                    self.exact_search.demotion_swap_audit(task.task_id, final_state, nonshared)
+                    self.persistent_state.last_demotion_audit_step[task.task_id] = self.persistent_state.global_step
 
                 if (
                     batch_idx == 0
@@ -634,6 +646,7 @@ class HiBaCaMLTrainer:
 
                 if (
                     self.cfg.exact_search.enable_exact_search
+                    and self.cfg.exact_search.enable_local_maintenance
                     and task.task_id > 0
                     and self.persistent_state.global_step - self.persistent_state.last_maintenance_step.get(task.task_id, 0)
                     >= self.cfg.exact_search.maintenance_interval
@@ -859,8 +872,11 @@ class HiBaCaMLTrainer:
             "current_support": self.persistent_state.current_support,
             "boundary_support": self.persistent_state.boundary_support,
             "support_tables": self.persistent_state.support_tables,
+            "support_posterior_tables": self.persistent_state.support_posterior_tables,
+            "reserve_recruitment_tables": self.persistent_state.reserve_recruitment_tables,
             "controller_tables": self.persistent_state.controller_tables,
             "local_swap_tables": self.persistent_state.local_swap_tables,
+            "demotion_swap_tables": self.persistent_state.demotion_swap_tables,
             "certificates": self.persistent_state.certificates,
             "task_support_snapshots": self.persistent_state.task_support_snapshots,
             "support_sequence": {
@@ -899,6 +915,16 @@ class HiBaCaMLTrainer:
         with Path(path).open("rb") as fh:
             payload = pickle.load(fh)
         self.persistent_state = payload["persistent_state"]
+        if hasattr(self.persistent_state, "prescreen_tables"):
+            delattr(self.persistent_state, "prescreen_tables")
+        if not hasattr(self.persistent_state, "support_posterior_tables"):
+            self.persistent_state.support_posterior_tables = {}
+        if not hasattr(self.persistent_state, "reserve_recruitment_tables"):
+            self.persistent_state.reserve_recruitment_tables = {}
+        if not hasattr(self.persistent_state, "demotion_swap_tables"):
+            self.persistent_state.demotion_swap_tables = {}
+        if not hasattr(self.persistent_state, "last_demotion_audit_step"):
+            self.persistent_state.last_demotion_audit_step = {}
         self.params = payload["params"]
         self.opt_state = payload["opt_state"]
         self.persistent_state.params = self.params

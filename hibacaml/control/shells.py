@@ -123,33 +123,6 @@ class ShellController:
         persistent_state.certificates = certificates
         return certificates
 
-    def certificate_matrix(
-        self,
-        persistent_state: PersistentHiBaCaMLState,
-        support_mask: jnp.ndarray,
-    ) -> Dict[int, jnp.ndarray]:
-        """Return per-column certificate vectors already masked by support."""
-        matrix = {}
-        for idx in range(self.cfg.column_pool.total_columns):
-            cert = persistent_state.certificates[idx]
-            vec = jnp.asarray(
-                [
-                    cert.q_mean,
-                    cert.prec_mean,
-                    cert.pred_mean,
-                    cert.live_frac,
-                    cert.tier_q[0],
-                    cert.tier_q[1],
-                    cert.tier_q[2],
-                    cert.shared_abstraction_mass,
-                    cert.specificity_load,
-                    cert.demotion_pressure,
-                ],
-                dtype=jnp.float32,
-            )
-            matrix[idx] = vec * support_mask[idx]
-        return matrix
-
     def semantic_penalty(
         self,
         persistent_state: PersistentHiBaCaMLState,
@@ -240,34 +213,135 @@ class ShellController:
                             outer_idx,
                         )
 
-                for inner_shell, outer_shell in (
-                    ("kernel", "tier1"),
-                    ("tier1", "tier2"),
-                    ("tier2", "tier3"),
-                ):
-                    inner_specificity = metrics[inner_shell]["specificity"]
-                    if inner_specificity.size == 0:
-                        continue
-                    inner_idx = int(jnp.argmax(inner_specificity))
-                    if float(inner_specificity[inner_idx]) <= phi.demotion_min_role_gain:
-                        continue
-                    outer_scores = metrics[outer_shell]["score"]
-                    if outer_scores.size == 0:
-                        continue
-                    outer_idx = int(jnp.argmin(outer_scores))
-                    updated_node = self._swap_units(
-                        updated_node,
-                        inner_shell,
-                        inner_idx,
-                        outer_shell,
-                        outer_idx,
-                    )
+                if self.cfg.exact_search.allow_unaudited_demotion:
+                    for inner_shell, outer_shell in (
+                        ("kernel", "tier1"),
+                        ("tier1", "tier2"),
+                        ("tier2", "tier3"),
+                    ):
+                        inner_specificity = metrics[inner_shell]["specificity"]
+                        if inner_specificity.size == 0:
+                            continue
+                        inner_idx = int(jnp.argmax(inner_specificity))
+                        if float(inner_specificity[inner_idx]) <= phi.demotion_min_role_gain:
+                            continue
+                        outer_scores = metrics[outer_shell]["score"]
+                        if outer_scores.size == 0:
+                            continue
+                        outer_idx = int(jnp.argmin(outer_scores))
+                        updated_node = self._swap_units(
+                            updated_node,
+                            inner_shell,
+                            inner_idx,
+                            outer_shell,
+                            outer_idx,
+                        )
 
                 updated_nodes[node_name] = updated_node
 
         params = params._replace(nodes=updated_nodes)
         self.refresh_certificates(params, graph_state, persistent_state)
         return params
+
+    def demotion_swap_candidates(
+        self,
+        params: GraphParams,
+        graph_state: GraphState,
+        active_columns: Sequence[int],
+        phi,
+        *,
+        max_candidates: int,
+    ) -> list[dict[str, object]]:
+        """Return conservative demotion-swap candidates ranked by specificity excess."""
+        candidates = []
+        for column_index in active_columns:
+            meta = self.column_nodes[column_index]
+            for node_name in self._shell_node_names(meta):
+                node_params = params.nodes[node_name]
+                node_state = graph_state.nodes[node_name]
+                metrics = self._unit_metrics(node_params, node_state)
+                for inner_shell, outer_shell in (
+                    ("kernel", "tier1"),
+                    ("tier1", "tier2"),
+                    ("tier2", "tier3"),
+                ):
+                    inner_specificity = metrics[inner_shell]["specificity"]
+                    outer_scores = metrics[outer_shell]["score"]
+                    if inner_specificity.size == 0 or outer_scores.size == 0:
+                        continue
+                    inner_idx = int(jnp.argmax(inner_specificity))
+                    specificity = float(inner_specificity[inner_idx])
+                    if specificity <= phi.demotion_min_role_gain:
+                        continue
+                    outer_idx = int(jnp.argmin(outer_scores))
+                    candidates.append(
+                        {
+                            "score": specificity - float(phi.demotion_min_role_gain),
+                            "column_index": int(column_index),
+                            "node_name": node_name,
+                            "inner_shell": inner_shell,
+                            "outer_shell": outer_shell,
+                            "inner_index": int(inner_idx),
+                            "outer_index": int(outer_idx),
+                        }
+                    )
+        candidates.sort(key=lambda row: float(row["score"]), reverse=True)
+        return candidates[: max(0, int(max_candidates))]
+
+    def apply_demotion_swap(
+        self,
+        params: GraphParams,
+        *,
+        node_name: str,
+        inner_shell: str,
+        outer_shell: str,
+        inner_index: int,
+        outer_index: int,
+    ) -> GraphParams:
+        """Apply one pre-audited demotion swap."""
+        updated_nodes = dict(params.nodes)
+        updated_nodes[node_name] = self._swap_units(
+            updated_nodes[node_name],
+            inner_shell,
+            int(inner_index),
+            outer_shell,
+            int(outer_index),
+        )
+        return params._replace(nodes=updated_nodes)
+
+    def precision_weight_gradients(
+        self,
+        grads: GraphParams,
+        params: GraphParams,
+    ) -> GraphParams:
+        """Precondition shell gradients by inverse effective precision."""
+        if not self.cfg.exact_search.enable_precision_update_resistance:
+            return grads
+        strength = max(float(self.cfg.exact_search.precision_update_strength), 0.0)
+        floor = max(float(self.cfg.exact_search.precision_update_floor), 0.0)
+        updated_nodes = {}
+        for node_name, node_grads in grads.nodes.items():
+            node_params = params.nodes.get(node_name)
+            if node_params is None:
+                updated_nodes[node_name] = node_grads
+                continue
+            weights = dict(node_grads.weights)
+            biases = dict(node_grads.biases)
+            for shell_name in self.shell_slices:
+                precision_key = f"log_precision_{shell_name}"
+                if shell_name not in weights or precision_key not in node_params.biases:
+                    continue
+                precision = jax_nn_sigmoid(node_params.biases[precision_key])
+                factor = jnp.maximum(floor, 1.0 / (1.0 + strength * precision))
+                weights[shell_name] = weights[shell_name] * factor.reshape((1, -1))
+                recurrent_key = f"recur_{shell_name}"
+                if recurrent_key in weights:
+                    weights[recurrent_key] = weights[recurrent_key] * factor.reshape((1, -1))
+                for bias_key in (f"b_{shell_name}", precision_key):
+                    if bias_key in biases:
+                        biases[bias_key] = biases[bias_key] * factor
+            updated_nodes[node_name] = node_grads._replace(weights=weights, biases=biases)
+        return grads._replace(nodes=updated_nodes)
 
     def _compute_column_certificate(
         self,
