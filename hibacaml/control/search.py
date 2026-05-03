@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+import math
 import time
 from typing import Dict, Iterable, List, Sequence, Tuple
 
@@ -11,12 +12,16 @@ import jax.numpy as jnp
 from hibacaml.config import HiBaCaMLConfig, PhiConfig
 from hibacaml.control.support import (
     enumerate_nonshared_supports,
+    enumerate_reserve_recruitment_supports,
     one_swap_neighbors,
 )
 from hibacaml.types import (
     BoundaryBundle,
     ControllerSearchRow,
+    DemotionSwapAuditRow,
     LocalSwapRow,
+    ReserveRecruitmentRow,
+    SupportPosteriorSummary,
     SupportSearchRow,
 )
 
@@ -133,6 +138,167 @@ class ExactSearchService:
         prev_set = set(prev.nonshared) if prev is not None else set(self.trainer.current_nonshared)
         return self.cfg.exact_search.switch_penalty * float(
             len(set(support_cols).symmetric_difference(prev_set))
+        )
+
+    def _certificate_reuse_score(self, support_cols: Sequence[int]) -> float:
+        certificates = getattr(self.trainer.persistent_state, "certificates", {})
+        if not certificates:
+            return 0.0
+        values = []
+        for idx in tuple(sorted(support_cols)):
+            cert = certificates.get(idx)
+            if cert is None:
+                values.append(0.0)
+                continue
+            values.append(
+                cert.q_mean
+                + 0.5 * cert.shared_abstraction_mass
+                - 0.25 * cert.specificity_load
+                - 0.25 * cert.demotion_pressure
+                - 0.10 * cert.saturation
+            )
+        return float(sum(values) / max(len(values), 1))
+
+    def _support_row_from_objective(
+        self,
+        task_id: int,
+        support_cols: Sequence[int],
+        objective: Dict[str, float],
+        *,
+        reserve_recruitment_candidate: bool = False,
+    ) -> SupportSearchRow:
+        cert_score = self._certificate_reuse_score(support_cols)
+        posterior_energy = (
+            float(objective["total"])
+            - self.cfg.exact_search.certificate_support_weight * cert_score
+        )
+        return SupportSearchRow(
+            task_id=task_id,
+            nonshared=tuple(sorted(support_cols)),
+            static_total=objective["total"],
+            current_first_loss=objective["current_first_loss"],
+            current_remaining_loss=objective["current_remaining_loss"],
+            old_worst_loss=objective["old_worst_loss"],
+            old_mix_loss=objective["old_mix_loss"],
+            switch_penalty=objective["switch_penalty"],
+            posterior_energy=float(posterior_energy),
+            certificate_reuse_score=float(cert_score),
+            reserve_recruitment_candidate=bool(reserve_recruitment_candidate),
+        )
+
+    def _rank_support_rows(
+        self,
+        rows: Sequence[SupportSearchRow],
+        *,
+        reserve_recruitment_triggered: bool = False,
+    ) -> List[SupportSearchRow]:
+        if not rows:
+            return []
+        temperature = max(float(self.cfg.exact_search.support_posterior_temperature), 1e-8)
+        ranked = sorted(rows, key=lambda row: row.posterior_energy)
+        logits = [-temperature * float(row.posterior_energy) for row in ranked]
+        max_logit = max(logits)
+        exp_logits = [math.exp(logit - max_logit) for logit in logits]
+        denom = max(sum(exp_logits), 1e-30)
+        probs = [value / denom for value in exp_logits]
+        entropy = -sum(prob * math.log(prob + 1e-30) for prob in probs)
+        top1_prob = max(probs) if probs else 0.0
+        return [
+            SupportSearchRow(
+                **{
+                    **row.__dict__,
+                    "posterior_rank": rank,
+                    "support_prob": float(probs[rank]),
+                    "support_log_prob": float(math.log(probs[rank] + 1e-30)),
+                    "posterior_entropy": float(entropy),
+                    "top1_prob": float(top1_prob),
+                    "reserve_recruitment_candidate": bool(row.reserve_recruitment_candidate),
+                }
+            )
+            for rank, row in enumerate(ranked)
+        ]
+
+    def _posterior_summary(
+        self,
+        task_id: int,
+        rows: Sequence[SupportSearchRow],
+        *,
+        reserve_recruitment_triggered: bool,
+    ) -> SupportPosteriorSummary:
+        if not rows:
+            return SupportPosteriorSummary(
+                task_id=task_id,
+                candidate_count=0,
+                posterior_entropy=0.0,
+                top1_prob=0.0,
+                map_nonshared=tuple(),
+                map_posterior_energy=0.0,
+                reserve_recruitment_triggered=reserve_recruitment_triggered,
+            )
+        best = min(rows, key=lambda row: row.posterior_rank if row.posterior_rank >= 0 else 1_000_000)
+        return SupportPosteriorSummary(
+            task_id=task_id,
+            candidate_count=len(rows),
+            posterior_entropy=float(best.posterior_entropy),
+            top1_prob=float(best.top1_prob),
+            map_nonshared=best.nonshared,
+            map_posterior_energy=float(best.posterior_energy),
+            reserve_recruitment_triggered=reserve_recruitment_triggered,
+        )
+
+    def _adaptive_saturation(self) -> float:
+        certificates = getattr(self.trainer.persistent_state, "certificates", {})
+        values = [
+            certificates[idx].saturation
+            for idx in self.cfg.column_pool.adaptive_indices
+            if idx in certificates
+        ]
+        if not values:
+            return 0.0
+        return float(sum(values) / len(values))
+
+    def _reserve_recruitment_diagnostic(
+        self,
+        task_id: int,
+        adaptive_rows: Sequence[SupportSearchRow],
+    ) -> Tuple[bool, ReserveRecruitmentRow]:
+        saturation = self._adaptive_saturation()
+        entropy = adaptive_rows[0].posterior_entropy if adaptive_rows else 0.0
+        top1_prob = adaptive_rows[0].top1_prob if adaptive_rows else 0.0
+        saturation_ok = saturation >= self.cfg.exact_search.reserve_saturation_threshold
+        confidence_weak = (
+            entropy >= self.cfg.exact_search.reserve_entropy_threshold
+            or top1_prob <= self.cfg.exact_search.reserve_top1_prob_threshold
+        )
+        triggered = (
+            self.cfg.exact_search.support_candidate_policy == "adaptive_reserve_gated"
+            and bool(self.cfg.column_pool.reserve_indices)
+            and saturation_ok
+            and confidence_weak
+        )
+        if triggered:
+            reason = "saturation_and_weak_posterior"
+        elif self.cfg.exact_search.support_candidate_policy != "adaptive_reserve_gated":
+            reason = "policy_disabled"
+        elif not saturation_ok:
+            reason = "saturation_below_threshold"
+        elif not confidence_weak:
+            reason = "posterior_confident"
+        else:
+            reason = "no_reserve_columns"
+        reserve_candidates = enumerate_reserve_recruitment_supports(self.cfg)
+        return triggered, ReserveRecruitmentRow(
+            task_id=task_id,
+            triggered=triggered,
+            adaptive_candidate_count=len(adaptive_rows),
+            reserve_candidate_count=len(reserve_candidates) if triggered else 0,
+            saturation=float(saturation),
+            posterior_entropy=float(entropy),
+            top1_prob=float(top1_prob),
+            saturation_threshold=float(self.cfg.exact_search.reserve_saturation_threshold),
+            entropy_threshold=float(self.cfg.exact_search.reserve_entropy_threshold),
+            top1_prob_threshold=float(self.cfg.exact_search.reserve_top1_prob_threshold),
+            reason=reason,
         )
 
     def boundary_objective(
@@ -266,6 +432,8 @@ class ExactSearchService:
         task_id: int,
         support_cols: Sequence[int],
         bundle: BoundaryBundle,
+        *,
+        reserve_recruitment_candidate: bool = False,
     ) -> SupportSearchRow:
         objective = self.boundary_objective(
             task_id,
@@ -273,15 +441,11 @@ class ExactSearchService:
             bundle,
             refresh_certificates=False,
         )
-        return SupportSearchRow(
-            task_id=task_id,
-            nonshared=tuple(sorted(support_cols)),
-            static_total=objective["total"],
-            current_first_loss=objective["current_first_loss"],
-            current_remaining_loss=objective["current_remaining_loss"],
-            old_worst_loss=objective["old_worst_loss"],
-            old_mix_loss=objective["old_mix_loss"],
-            switch_penalty=objective["switch_penalty"],
+        return self._support_row_from_objective(
+            task_id,
+            support_cols,
+            objective,
+            reserve_recruitment_candidate=reserve_recruitment_candidate,
         )
 
     def static_support_scores_batched(
@@ -289,28 +453,30 @@ class ExactSearchService:
         task_id: int,
         support_candidates: Sequence[Sequence[int]],
         bundle: BoundaryBundle,
+        *,
+        reserve_recruitment_candidate: bool = False,
     ) -> List[SupportSearchRow]:
         """Score exact support candidates in JAX-friendly batches."""
         rows: List[SupportSearchRow] = []
         batch_size = max(1, int(self.cfg.exact_search.static_support_batch_size))
-        for chunk in _chunks(tuple(support_candidates), batch_size):
+        for chunk, real_count in _candidate_chunks(
+            tuple(support_candidates),
+            batch_size,
+            pad=bool(self.cfg.exact_search.pad_support_batches),
+        ):
             objectives = self.boundary_objectives(
                 task_id,
                 chunk,
                 bundle,
                 refresh_certificates=False,
             )
-            for support_cols, objective in zip(chunk, objectives):
+            for support_cols, objective in zip(chunk[:real_count], objectives[:real_count]):
                 rows.append(
-                    SupportSearchRow(
-                        task_id=task_id,
-                        nonshared=tuple(sorted(support_cols)),
-                        static_total=objective["total"],
-                        current_first_loss=objective["current_first_loss"],
-                        current_remaining_loss=objective["current_remaining_loss"],
-                        old_worst_loss=objective["old_worst_loss"],
-                        old_mix_loss=objective["old_mix_loss"],
-                        switch_penalty=objective["switch_penalty"],
+                    self._support_row_from_objective(
+                        task_id,
+                        support_cols,
+                        objective,
+                        reserve_recruitment_candidate=reserve_recruitment_candidate,
                     )
                 )
         return rows
@@ -364,7 +530,25 @@ class ExactSearchService:
         task = clone.task(task_id)
         final_state = None
         for batch in bundle.train_batches:
-            grads, _, final_state = clone.compute_pc_gradients(batch, task, support_cols)
+            if self.cfg.exact_search.rollout_gradient_mode == "trainer":
+                grads, _, final_state = clone.compute_pc_gradients(
+                    batch,
+                    task,
+                    support_cols,
+                )
+            elif self.cfg.exact_search.rollout_gradient_mode == "pc":
+                from hibacaml.training.trainer import HiBaCaMLTrainer
+
+                grads, _, final_state = HiBaCaMLTrainer.compute_pc_gradients(
+                    clone,
+                    batch,
+                    task,
+                    support_cols,
+                )
+            else:
+                raise ValueError(
+                    "rollout_gradient_mode must be 'trainer' or 'pc'"
+                )
             grads = clone._mask_grads(grads, support_cols)
             clone._apply_grads(grads)
             clone.params = clone.shell_controller.apply_structural_edits(
@@ -402,6 +586,12 @@ class ExactSearchService:
                 "cert_prior_mean": 0.0,
             }
         certs = list(clone.persistent_state.certificates.values())
+        occ_tier1 = _mean_or_zero([cert.tier_occ[0] for cert in certs])
+        occ_tier2 = _mean_or_zero([cert.tier_occ[1] for cert in certs])
+        occ_tier3 = _mean_or_zero([cert.tier_occ[2] for cert in certs])
+        q_tier1 = _mean_or_zero([cert.tier_q[0] for cert in certs])
+        q_tier2 = _mean_or_zero([cert.tier_q[1] for cert in certs])
+        q_tier3 = _mean_or_zero([cert.tier_q[2] for cert in certs])
         row = ControllerSearchRow(
             task_id=task_id,
             nonshared=tuple(sorted(support_cols)),
@@ -417,12 +607,12 @@ class ExactSearchService:
             gate_entropy=float(composer_diag.get("gate_entropy", 0.0)),
             gate_deviation=float(composer_diag.get("gate_deviation", 0.0)),
             cert_prior_mean=float(composer_diag.get("cert_prior_mean", 0.0)),
-            occ_tier1=float(jnp.mean(jnp.asarray([cert.tier_occ[0] for cert in certs]))),
-            occ_tier2=float(jnp.mean(jnp.asarray([cert.tier_occ[1] for cert in certs]))),
-            occ_tier3=float(jnp.mean(jnp.asarray([cert.tier_occ[2] for cert in certs]))),
-            q_tier1=float(jnp.mean(jnp.asarray([cert.tier_q[0] for cert in certs]))),
-            q_tier2=float(jnp.mean(jnp.asarray([cert.tier_q[1] for cert in certs]))),
-            q_tier3=float(jnp.mean(jnp.asarray([cert.tier_q[2] for cert in certs]))),
+            occ_tier1=occ_tier1,
+            occ_tier2=occ_tier2,
+            occ_tier3=occ_tier3,
+            q_tier1=q_tier1,
+            q_tier2=q_tier2,
+            q_tier3=q_tier3,
         )
         del clone
         gc.collect()
@@ -438,6 +628,7 @@ class ExactSearchService:
                 "boundary_search_start",
                 task_id=task_id,
                 candidate_count=len(support_candidates),
+                full_audit_candidate_count=len(support_candidates),
                 phi_candidate_count=len(phi_candidates),
             )
         support_rows = self.static_support_scores_batched(
@@ -445,7 +636,29 @@ class ExactSearchService:
             support_candidates,
             bundle,
         )
-        support_rows.sort(key=lambda row: row.static_total)
+        support_rows = self._rank_support_rows(support_rows)
+        reserve_triggered = False
+        reserve_diag: ReserveRecruitmentRow | None = None
+        if self.cfg.exact_search.support_candidate_policy == "adaptive_reserve_gated":
+            reserve_triggered, reserve_diag = self._reserve_recruitment_diagnostic(
+                task_id,
+                support_rows,
+            )
+            if reserve_triggered:
+                reserve_rows = self.static_support_scores_batched(
+                    task_id,
+                    enumerate_reserve_recruitment_supports(self.cfg),
+                    bundle,
+                    reserve_recruitment_candidate=True,
+                )
+                support_rows = self._rank_support_rows(
+                    [*support_rows, *reserve_rows],
+                    reserve_recruitment_triggered=True,
+                )
+        if reserve_diag is None:
+            _, reserve_diag = self._reserve_recruitment_diagnostic(task_id, support_rows)
+
+        support_rows.sort(key=lambda row: row.posterior_energy)
         shortlisted = support_rows[: self.cfg.exact_search.boundary_shortlist]
         shortlisted = [
             SupportSearchRow(**{**row.__dict__, "shortlist_rank": rank})
@@ -483,7 +696,14 @@ class ExactSearchService:
             "boundary_total_seconds",
             time.perf_counter() - search_started,
         )
+        self._ensure_persistent_tables()
         self.trainer.persistent_state.support_tables[task_id] = support_rows
+        self.trainer.persistent_state.support_posterior_tables[task_id] = self._posterior_summary(
+            task_id,
+            support_rows,
+            reserve_recruitment_triggered=reserve_triggered,
+        )
+        self.trainer.persistent_state.reserve_recruitment_tables[task_id] = [reserve_diag]
         self.trainer.persistent_state.controller_tables[task_id] = controller_rows
         if getattr(self.trainer, "run_logger", None) is not None:
             self.trainer.run_logger.event(
@@ -501,8 +721,161 @@ class ExactSearchService:
         self.trainer.set_boundary_choice(task_id, best_row.nonshared, best_row.phi)
         return best_row.nonshared, best_row.phi
 
+    def demotion_swap_audit(
+        self,
+        task_id: int,
+        final_state,
+        nonshared: Sequence[int],
+    ) -> List[DemotionSwapAuditRow]:
+        """Audit a small set of internal demotion swaps before mutating shells."""
+        if not self.cfg.exact_search.enable_demotion_swap_audit:
+            return []
+        self._ensure_persistent_tables()
+        candidates = self.trainer.shell_controller.demotion_swap_candidates(
+            self.trainer.params,
+            final_state,
+            self.trainer.active_full_support(nonshared),
+            self.trainer.current_phi,
+            max_candidates=self.cfg.exact_search.demotion_audit_max_candidates,
+        )
+        if not candidates:
+            return []
+
+        started_at = time.perf_counter()
+        bundle = self.make_bundle(task_id)
+        current_support = tuple(sorted(nonshared))
+        round_index = 1 + len(
+            {row.round_index for row in self.trainer.persistent_state.demotion_swap_tables.get(task_id, [])}
+        )
+        baseline_objective = self.boundary_objective(
+            task_id,
+            current_support,
+            bundle,
+            refresh_certificates=False,
+        )
+        baseline_semantic = (
+            self.trainer.shell_controller.semantic_penalty(
+                self.trainer.persistent_state,
+                self.trainer.active_full_support(current_support),
+            )
+            if self.cfg.exact_search.log_semantic_penalty
+            else 0.0
+        )
+        baseline_total = float(baseline_objective["total"] + baseline_semantic)
+        rows: List[DemotionSwapAuditRow] = []
+        best_row = None
+        for candidate in candidates:
+            clone = self.trainer.clone()
+            clone.params = clone.shell_controller.apply_demotion_swap(
+                clone.params,
+                node_name=str(candidate["node_name"]),
+                inner_shell=str(candidate["inner_shell"]),
+                outer_shell=str(candidate["outer_shell"]),
+                inner_index=int(candidate["inner_index"]),
+                outer_index=int(candidate["outer_index"]),
+            )
+            clone.persistent_state.params = clone.params
+            clone._bump_params_revision()
+            candidate_objective = self.boundary_objective(
+                task_id,
+                current_support,
+                bundle,
+                trainer=clone,
+                refresh_certificates=True,
+            )
+            candidate_semantic = (
+                clone.shell_controller.semantic_penalty(
+                    clone.persistent_state,
+                    clone.active_full_support(current_support),
+                )
+                if self.cfg.exact_search.log_semantic_penalty
+                else 0.0
+            )
+            candidate_total = float(candidate_objective["total"] + candidate_semantic)
+            row = DemotionSwapAuditRow(
+                task_id=task_id,
+                round_index=round_index,
+                global_step=self.trainer.persistent_state.global_step,
+                column_index=int(candidate["column_index"]),
+                node_name=str(candidate["node_name"]),
+                inner_shell=str(candidate["inner_shell"]),
+                outer_shell=str(candidate["outer_shell"]),
+                inner_index=int(candidate["inner_index"]),
+                outer_index=int(candidate["outer_index"]),
+                baseline_total=baseline_total,
+                candidate_total=candidate_total,
+                gain=float(baseline_total - candidate_total),
+                accepted=False,
+            )
+            rows.append(row)
+            if best_row is None or row.gain > best_row.gain:
+                best_row = row
+            del clone
+
+        if best_row is not None and best_row.gain > self.cfg.exact_search.demotion_swap_margin:
+            self.trainer.params = self.trainer.shell_controller.apply_demotion_swap(
+                self.trainer.params,
+                node_name=best_row.node_name,
+                inner_shell=best_row.inner_shell,
+                outer_shell=best_row.outer_shell,
+                inner_index=best_row.inner_index,
+                outer_index=best_row.outer_index,
+            )
+            self.trainer.persistent_state.params = self.trainer.params
+            self.trainer._bump_params_revision()
+            rows = [
+                DemotionSwapAuditRow(
+                    **{
+                        **row.__dict__,
+                        "accepted": (
+                            row.node_name == best_row.node_name
+                            and row.inner_shell == best_row.inner_shell
+                            and row.outer_shell == best_row.outer_shell
+                            and row.inner_index == best_row.inner_index
+                            and row.outer_index == best_row.outer_index
+                        ),
+                    }
+                )
+                for row in rows
+            ]
+
+        history = list(self.trainer.persistent_state.demotion_swap_tables.get(task_id, []))
+        self.trainer.persistent_state.demotion_swap_tables[task_id] = history + rows
+        self.trainer._record_timing(
+            task_id,
+            "demotion_swap_seconds",
+            time.perf_counter() - started_at,
+            accumulate=True,
+        )
+        if getattr(self.trainer, "run_logger", None) is not None:
+            self.trainer.run_logger.event(
+                "demotion_swap_audit_done",
+                task_id=task_id,
+                round_index=round_index,
+                candidate_count=len(rows),
+                accepted=any(row.accepted for row in rows),
+                best_gain=best_row.gain if best_row is not None else None,
+            )
+        gc.collect()
+        return rows
+
+    def _ensure_persistent_tables(self) -> None:
+        defaults = {
+            "support_posterior_tables": {},
+            "reserve_recruitment_tables": {},
+            "controller_tables": {},
+            "local_swap_tables": {},
+            "demotion_swap_tables": {},
+            "last_demotion_audit_step": {},
+        }
+        for name, value in defaults.items():
+            if not hasattr(self.trainer.persistent_state, name):
+                setattr(self.trainer.persistent_state, name, value)
+
     def local_one_swap(self, task_id: int) -> Tuple[int, ...]:
         """Evaluate one-swap neighbors under the Eq. (1) boundary objective."""
+        if not self.cfg.exact_search.enable_local_maintenance:
+            return self.trainer.current_nonshared
         if task_id == 0:
             return self.trainer.current_nonshared
 
@@ -517,9 +890,15 @@ class ExactSearchService:
         # size as static scoring) instead of 46 individual boundary_objective() dispatches.
         all_supports = [current_nonshared] + list(neighbors)
         all_objectives: List[Dict[str, float]] = []
-        for chunk in _chunks(all_supports, self.cfg.exact_search.static_support_batch_size):
+        for chunk, real_count in _candidate_chunks(
+            all_supports,
+            self.cfg.exact_search.static_support_batch_size,
+            pad=bool(self.cfg.exact_search.pad_support_batches),
+        ):
             all_objectives.extend(
-                self.boundary_objectives(task_id, chunk, bundle, refresh_certificates=False)
+                self.boundary_objectives(task_id, chunk, bundle, refresh_certificates=False)[
+                    :real_count
+                ]
             )
         current_objective = all_objectives[0]
         current_semantic = (
@@ -606,9 +985,25 @@ def _phi_l1_distance(left: PhiConfig, right: PhiConfig) -> float:
     )
 
 
-def _chunks(
+def _mean_or_zero(values: Sequence[float]) -> float:
+    if not values:
+        return 0.0
+    return float(sum(float(value) for value in values) / len(values))
+
+
+def _candidate_chunks(
     items: Sequence[Sequence[int]],
     size: int,
-) -> Iterable[Sequence[Sequence[int]]]:
-    for start in range(0, len(items), size):
-        yield items[start : start + size]
+    *,
+    pad: bool,
+) -> Iterable[Tuple[Tuple[Tuple[int, ...], ...], int]]:
+    size = max(1, int(size))
+    normalized = tuple(tuple(sorted(item)) for item in items)
+    for start in range(0, len(normalized), size):
+        real = normalized[start : start + size]
+        if not real:
+            continue
+        chunk = list(real)
+        if pad and len(chunk) < size and size > 1:
+            chunk.extend([chunk[-1]] * (size - len(chunk)))
+        yield tuple(chunk), len(real)

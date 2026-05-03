@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import jax.numpy as jnp
 
@@ -57,6 +57,27 @@ class SupportSearchRow:
     old_mix_loss: float
     switch_penalty: float
     shortlist_rank: int = -1
+    posterior_energy: float = 0.0
+    support_log_prob: float = 0.0
+    support_prob: float = 0.0
+    posterior_rank: int = -1
+    posterior_entropy: float = 0.0
+    top1_prob: float = 0.0
+    certificate_reuse_score: float = 0.0
+    reserve_recruitment_candidate: bool = False
+
+
+@dataclass(frozen=True)
+class SupportPrescreenRow:
+    """Legacy checkpoint shim for pre-pruned support prescreen rows."""
+
+    task_id: int
+    nonshared: Tuple[int, ...]
+    prescreen_total: float
+    current_loss: float
+    switch_penalty: float
+    prescreen_rank: int = -1
+    selected_for_full_audit: bool = False
 
 
 @dataclass(frozen=True)
@@ -101,6 +122,55 @@ class LocalSwapRow:
     switch_penalty: float = 0.0
     semantic_regularizer: float = 0.0
     gain: float = 0.0
+    accepted: bool = False
+
+
+@dataclass(frozen=True)
+class SupportPosteriorSummary:
+    """Per-boundary posterior-style summary over audited supports."""
+
+    task_id: int
+    candidate_count: int
+    posterior_entropy: float
+    top1_prob: float
+    map_nonshared: Tuple[int, ...]
+    map_posterior_energy: float
+    reserve_recruitment_triggered: bool = False
+
+
+@dataclass(frozen=True)
+class ReserveRecruitmentRow:
+    """Why reserve candidates were or were not admitted into support audit."""
+
+    task_id: int
+    triggered: bool
+    adaptive_candidate_count: int
+    reserve_candidate_count: int
+    saturation: float
+    posterior_entropy: float
+    top1_prob: float
+    saturation_threshold: float
+    entropy_threshold: float
+    top1_prob_threshold: float
+    reason: str
+
+
+@dataclass(frozen=True)
+class DemotionSwapAuditRow:
+    """Audited internal demotion-swap candidate."""
+
+    task_id: int
+    round_index: int
+    global_step: int
+    column_index: int
+    node_name: str
+    inner_shell: str
+    outer_shell: str
+    inner_index: int
+    outer_index: int
+    baseline_total: float
+    candidate_total: float
+    gain: float
     accepted: bool = False
 
 
@@ -154,9 +224,13 @@ class PersistentHiBaCaMLState:
     task_support_snapshots: Dict[int, SupportSnapshot] = field(default_factory=dict)
     last_maintenance_step: Dict[int, int] = field(default_factory=dict)
     support_tables: Dict[int, List[SupportSearchRow]] = field(default_factory=dict)
+    support_posterior_tables: Dict[int, SupportPosteriorSummary] = field(default_factory=dict)
+    reserve_recruitment_tables: Dict[int, List[ReserveRecruitmentRow]] = field(default_factory=dict)
     controller_tables: Dict[int, List[ControllerSearchRow]] = field(default_factory=dict)
     local_swap_tables: Dict[int, List[LocalSwapRow]] = field(default_factory=dict)
+    demotion_swap_tables: Dict[int, List[DemotionSwapAuditRow]] = field(default_factory=dict)
     latest_local_swap: Optional[LocalSwapRow] = None
+    last_demotion_audit_step: Dict[int, int] = field(default_factory=dict)
     composer_diagnostics: Dict[int, Dict[str, float]] = field(default_factory=dict)
     certificates: Dict[int, ColumnCertificate] = field(default_factory=dict)
     shell_stats: Dict[int, ShellStats] = field(default_factory=dict)
@@ -179,11 +253,3 @@ class PhiLike:
     middle_quantile: float
     replacement_margin_base: float
     demotion_min_role_gain: float
-
-
-def support_to_full(
-    shared_indices: Sequence[int],
-    nonshared: Sequence[int],
-) -> Tuple[int, ...]:
-    """Return the sorted full support tuple."""
-    return tuple(sorted(tuple(shared_indices) + tuple(nonshared)))

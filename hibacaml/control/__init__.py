@@ -6,6 +6,7 @@ from hibacaml.control.support import (
     build_full_support,
     candidate_nonshared_pool,
     default_nonshared_support,
+    enumerate_reserve_recruitment_supports,
     support_mask_from_nonshared,
 )
 
@@ -15,5 +16,6 @@ __all__ = [
     "build_full_support",
     "candidate_nonshared_pool",
     "default_nonshared_support",
+    "enumerate_reserve_recruitment_supports",
     "support_mask_from_nonshared",
 ]

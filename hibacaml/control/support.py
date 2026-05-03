@@ -11,7 +11,9 @@ from hibacaml.config import HiBaCaMLConfig
 
 
 def candidate_nonshared_pool(cfg: HiBaCaMLConfig) -> Tuple[int, ...]:
-    """Adaptive plus reserve candidates searched by V18 exact mode."""
+    """Nonshared pool for ordinary support search."""
+    if cfg.exact_search.support_candidate_policy in {"adaptive_only", "adaptive_reserve_gated"}:
+        return cfg.column_pool.adaptive_indices
     return cfg.column_pool.adaptive_indices + cfg.column_pool.reserve_indices
 
 
@@ -38,6 +40,19 @@ def support_mask_from_nonshared(
 def enumerate_nonshared_supports(cfg: HiBaCaMLConfig) -> Tuple[Tuple[int, ...], ...]:
     """Enumerate all exact-search nonshared candidate supports."""
     return tuple(combinations(candidate_nonshared_pool(cfg), cfg.column_pool.topk_nonshared))
+
+
+def enumerate_reserve_recruitment_supports(cfg: HiBaCaMLConfig) -> Tuple[Tuple[int, ...], ...]:
+    """Enumerate paper-style candidates with exactly one reserve column."""
+    reserve_count = 1
+    adaptive_count = cfg.column_pool.topk_nonshared - reserve_count
+    if adaptive_count <= 0:
+        return ()
+    candidates = []
+    for reserve in cfg.column_pool.reserve_indices:
+        for adaptive in combinations(cfg.column_pool.adaptive_indices, adaptive_count):
+            candidates.append(tuple(sorted((*adaptive, reserve))))
+    return tuple(candidates)
 
 
 def one_swap_neighbors(
