@@ -35,7 +35,9 @@ def print_pre_run_review(
     print(f"    infer_steps       : {cfg.infer_steps}")
     print(f"    eta_infer         : {cfg.eta_infer}")
     print(f"    shortlist         : {cfg.exact_search.boundary_shortlist}")
+    print(f"    support policy    : {cfg.exact_search.support_candidate_policy}")
     print(f"    rollout steps     : {cfg.exact_search.boundary_rollout_steps}")
+    print(f"    rollout gradients : {cfg.exact_search.rollout_gradient_mode}")
     print(
         "    rollout evals     : "
         f"{cfg.exact_search.boundary_shortlist * phi_candidates}  "
@@ -85,6 +87,20 @@ def print_pre_run_review(
     print("    boundary objective : shared by shortlist, rollout, and one-swap (current + old-worst + old-mix + switch)")
     print("    shell controller   : 4-parameter phi (outer/middle quantile, replacement margin, demotion gain)")
     print("    support search     : exact enumeration -> shortlist -> controller rollout -> one-swap maintenance")
+    print(
+        "    runtime controls   : "
+        f"local_maintenance={cfg.exact_search.enable_local_maintenance}, "
+        f"pad_support_batches={cfg.exact_search.pad_support_batches}"
+    )
+    print(
+        "    paper controls     : "
+        f"cert_weight={cfg.exact_search.certificate_support_weight}, "
+        f"precision_resistance={cfg.exact_search.enable_precision_update_resistance}, "
+        f"demotion_audit={cfg.exact_search.enable_demotion_swap_audit}, "
+        f"reserve_gate=({cfg.exact_search.reserve_saturation_threshold}, "
+        f"{cfg.exact_search.reserve_entropy_threshold}, "
+        f"{cfg.exact_search.reserve_top1_prob_threshold})"
+    )
     print(f"    learning           : {learning_label}")
     print("    column graph       : 20-column K/L/B graph, shell edits, stage-2 composer, hierarchy heads")
     print("    occupancy          : semantic occupancy regularizer and conservative one-swap audits")

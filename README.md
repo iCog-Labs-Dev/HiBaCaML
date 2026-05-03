@@ -8,6 +8,12 @@ The framework is motivated by the idea that catastrophic forgetting can be reduc
 
 The experiments in this repository are implemented using [FabricPC](https://github.com/trueagi-io/FabricPC), a JAX-based predictive coding library for building modular graph-structured models. In this project, it serves as the experimental framework for exploring HiBaCaML-inspired continual learning behavior.
 
+Supported Split-MNIST run modes are:
+
+- `paper_faithful`: the main implementation mode.
+- `full`: the expensive v18 baseline.
+- `smoke`: a small developer sanity-check mode.
+
 The work in this repository focuses on experimenting with these ideas on standard continual learning benchmarks, with particular attention to:
 
 - `SplitMNIST`

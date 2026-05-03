@@ -6,15 +6,15 @@ from __future__ import annotations
 # Script inputs: edit these directly, or import and call
 # run_experiment_notebook(...) from another script.
 # ------------------------------------------------------------
-MODE = "full"                # "smoke", "full", "reference", "compute_debug"
+MODE = "paper_faithful"               # "paper_faithful", "full", "smoke"
 TASKS = None                           # e.g. 2, 5, or None for all
-SHORTLIST = 5                          # e.g. 8 or None
-EPOCHS = 5                             # e.g. 1, 5, or None
-INFER_STEPS = 12                       # e.g. 20 or None
-ROLLOUT_STEPS = 4                      # e.g. 4 or None
-STATIC_SUPPORT_BATCH_SIZE = 4          # e.g. 2 or None
-CURRENT_BOUNDARY_BATCHES = 2           # e.g. 2 or None
-OLD_BOUNDARY_BATCHES = 2               # e.g. 2 or None
+SHORTLIST = None                       # e.g. 8 or None
+EPOCHS = None                          # e.g. 1, 5, or None
+INFER_STEPS = None                     # e.g. 20 or None
+ROLLOUT_STEPS = None                   # e.g. 4 or None
+STATIC_SUPPORT_BATCH_SIZE = None       # e.g. 2 or None
+CURRENT_BOUNDARY_BATCHES = None        # e.g. 2 or None
+OLD_BOUNDARY_BATCHES = None            # e.g. 2 or None
 TRAIN_BATCHES_LIMIT = None             # e.g. 10 or None
 TEST_BATCHES_LIMIT = None              # e.g. 10 or None
 EXACT_SEARCH = None                    # True / False / None; leave None for config default
@@ -22,7 +22,7 @@ LEARNING = "backprop"                  # "pc" or "backprop"
 CONFIRM = False                        # False is best for non-interactive runs
 CPU = False                            # True => force JAX CPU backend
 PLOTS_DIR = None                       # e.g. "/kaggle/working/plots"
-OUTPUT_ROOT = None                     # e.g. "/kaggle/working/reference_runs"
+OUTPUT_ROOT = None                     # e.g. "/kaggle/working/hibacaml_runs"
 RESUME_CHECKPOINT = None               # e.g. "/kaggle/working/.../checkpoint.pkl"
 
 # Memory-related inputs
@@ -505,9 +505,9 @@ def run_experiment_notebook(
 ):
     if learning not in ("pc", "backprop"):
         raise ValueError("learning must be 'pc' or 'backprop'")
-    if mode not in ("smoke", "full", "reference", "compute_debug"):
+    if mode not in ("paper_faithful", "full", "smoke"):
         raise ValueError(
-            "mode must be one of: 'smoke', 'full', 'reference', 'compute_debug'"
+            "mode must be one of: 'paper_faithful', 'full', 'smoke'"
         )
 
     print("JAX backend:", jax.default_backend(), flush=True)

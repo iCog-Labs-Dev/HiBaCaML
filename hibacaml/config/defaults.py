@@ -98,6 +98,23 @@ class ExactSearchConfig:
     local_swap_margin: float = 0.005
     maintenance_interval: int = 64
     cache_evaluations: bool = True
+    rollout_gradient_mode: str = "trainer"
+    enable_local_maintenance: bool = True
+    pad_support_batches: bool = True
+    support_candidate_policy: str = "v18_all"
+    certificate_support_weight: float = 0.0
+    support_posterior_temperature: float = 1.0
+    reserve_saturation_threshold: float = 0.85
+    reserve_entropy_threshold: float = 5.5
+    reserve_top1_prob_threshold: float = 0.10
+    enable_precision_update_resistance: bool = False
+    precision_update_strength: float = 4.0
+    precision_update_floor: float = 0.20
+    enable_demotion_swap_audit: bool = False
+    allow_unaudited_demotion: bool = True
+    demotion_audit_interval: int = 512
+    demotion_audit_max_candidates: int = 8
+    demotion_swap_margin: float = 0.005
     outer_quantile_bounds: Tuple[float, float] = (0.05, 0.30)
     middle_quantile_bounds: Tuple[float, float] = (0.02, 0.15)
     replacement_margin_bounds: Tuple[float, float] = (0.04, 0.18)
@@ -174,28 +191,39 @@ class HiBaCaMLConfig:
         return Path(self.reporting.output_root)
 
 
-def make_hibacaml_config(mode: str = "full") -> HiBaCaMLConfig:
+def make_hibacaml_config(mode: str = "paper_faithful") -> HiBaCaMLConfig:
     """Construct a HiBaCaML config for the given mode."""
-    if mode in {"full", "reference"}:
+    if mode == "full":
         return HiBaCaMLConfig(mode=mode)
 
-    if mode == "compute_debug":
+    if mode == "paper_faithful":
         return HiBaCaMLConfig(
             mode=mode,
-            batch_size=64,
-            epochs_per_task=1,
-            infer_steps=6,
-            cert_refresh_interval=16,
-            train_batches_limit=8,
-            test_batches_limit=4,
+            infer_steps=8,
             exact_search=ExactSearchConfig(
-                enable_exact_search=True,
                 boundary_current_batches=1,
                 boundary_old_batches=1,
                 boundary_rollout_steps=1,
-                boundary_shortlist=3,
-                static_support_batch_size=128,
-                maintenance_interval=32,
+                boundary_shortlist=2,
+                static_support_batch_size=16,
+                maintenance_interval=512,
+                rollout_gradient_mode="pc",
+                enable_local_maintenance=True,
+                pad_support_batches=True,
+                support_candidate_policy="adaptive_reserve_gated",
+                certificate_support_weight=0.05,
+                support_posterior_temperature=1.0,
+                reserve_saturation_threshold=0.85,
+                reserve_entropy_threshold=5.5,
+                reserve_top1_prob_threshold=0.10,
+                enable_precision_update_resistance=True,
+                precision_update_strength=4.0,
+                precision_update_floor=0.20,
+                enable_demotion_swap_audit=True,
+                allow_unaudited_demotion=False,
+                demotion_audit_interval=512,
+                demotion_audit_max_candidates=8,
+                demotion_swap_margin=0.005,
             ),
         )
 
