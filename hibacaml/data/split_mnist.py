@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import os
 import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Tuple
+from typing import Dict, Iterator, Optional, Tuple
 
-import jax.numpy as jnp
 import numpy as np
 
+from hibacaml.config import HiBaCaMLConfig
+from hibacaml.debug import log_progress
 from hibacaml.types import SplitMnistTask
 
 _MNIST_URL = "https://storage.googleapis.com/tensorflow/tf-keras-datasets/mnist.npz"
@@ -20,6 +22,45 @@ _TASK_CLASS_PAIRS: Tuple[Tuple[int, int], ...] = (
     (6, 7),
     (8, 9),
 )
+
+
+@dataclass
+class _ArrayTaskLoader:
+    """Deterministic lazy loader over in-memory task arrays."""
+
+    images: np.ndarray
+    targets: np.ndarray
+    hierarchy_mid: np.ndarray
+    hierarchy_global: np.ndarray
+    batch_size: int
+    shuffle: bool
+    seed: Optional[int]
+    max_batches: Optional[int] = None
+
+    def __iter__(self) -> Iterator[Dict[str, np.ndarray]]:
+        indices = np.arange(self.images.shape[0], dtype=np.int32)
+        if self.shuffle:
+            rng = np.random.default_rng(self.seed)
+            rng.shuffle(indices)
+
+        for batch_idx in range(len(self)):
+            start = batch_idx * self.batch_size
+            stop = min(start + self.batch_size, self.images.shape[0])
+            batch_ids = indices[start:stop]
+            if batch_ids.size == 0:
+                continue
+            yield {
+                "x": self.images[batch_ids],
+                "y": self.targets[batch_ids],
+                "hier_mid": self.hierarchy_mid[batch_ids],
+                "hier_global": self.hierarchy_global[batch_ids],
+            }
+
+    def __len__(self) -> int:
+        total = (self.images.shape[0] + self.batch_size - 1) // self.batch_size
+        if self.max_batches is None:
+            return total
+        return min(total, self.max_batches)
 
 
 def _mnist_cache_path() -> Path:
@@ -68,97 +109,62 @@ def _normalize_images(images: np.ndarray) -> np.ndarray:
     images = images.astype(np.float32) / 255.0
     if images.ndim == 3:
         images = images[..., None]
-    return images
+    mean = np.float32(0.1307)
+    std = np.float32(0.3081)
+    return ((images - mean) / std).astype(np.float32)
 
 
-def _task_query(task_id: int, query_dim: int) -> jnp.ndarray:
+def _task_query(task_id: int, query_dim: int) -> np.ndarray:
     if task_id >= query_dim:
         raise ValueError(f"task_id {task_id} >= query_dim {query_dim}: composer query would alias")
-    return jnp.asarray(np.eye(query_dim, dtype=np.float32)[task_id])
+    query = np.zeros((query_dim,), dtype=np.float32)
+    query[task_id] = 1.0
+    return query
 
 
-def _one_hot(labels: np.ndarray, depth: int) -> np.ndarray:
-    return np.eye(depth, dtype=np.float32)[labels]
+def _task_targets(
+    labels: np.ndarray,
+    classes: Tuple[int, int],
+    output_dim: int,
+    task_local_heads: bool,
+) -> np.ndarray:
+    if task_local_heads:
+        mapped = np.where(labels == classes[0], 0, 1)
+        return np.eye(output_dim, dtype=np.float32)[mapped]
+    return np.eye(output_dim, dtype=np.float32)[labels]
 
 
-def _build_hierarchy_targets(images: np.ndarray, labels: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """Build quadrant-level soft targets plus global task targets.
+def _hierarchy_targets(
+    images: np.ndarray,
+    targets: np.ndarray,
+    mid_targets: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Build quadrant-aware soft targets plus the global class target."""
+    if mid_targets != 4:
+        mid = np.broadcast_to(
+            targets[:, None, :],
+            (targets.shape[0], mid_targets, targets.shape[1]),
+        )
+        return mid.astype(np.float32), targets.astype(np.float32)
 
-    Uses 4 quadrant midscale targets and 1 global target with a deterministic
-    quadrant-sensitive encoding that keeps results reproducible and task-local.
-    """
-    batch = images.shape[0]
-    one_hot = _one_hot(labels, 2)
-    complement = _one_hot(1 - labels, 2)
-
-    h_mid = images.shape[1] // 2
-    w_mid = images.shape[2] // 2
+    batch, height, width, _ = images.shape
+    h_mid = height // 2
+    w_mid = width // 2
     quadrants = (
         images[:, :h_mid, :w_mid, :],
         images[:, :h_mid, w_mid:, :],
         images[:, h_mid:, :w_mid, :],
         images[:, h_mid:, w_mid:, :],
     )
-    quad_mass = np.stack(
-        [np.mean(q, axis=(1, 2, 3)) for q in quadrants],
-        axis=1,
-    ).astype(np.float32)
-    quad_mass = quad_mass / (np.max(quad_mass, axis=1, keepdims=True) + 1e-6)
-    strength = 0.5 + 0.5 * quad_mass
-    hier_mid = strength[..., None] * one_hot[:, None, :] + (1.0 - strength[..., None]) * complement[:, None, :]
-    hier_mid = hier_mid / (np.sum(hier_mid, axis=-1, keepdims=True) + 1e-8)
-    hier_global = one_hot.astype(np.float32).reshape(batch, 2)
-    return hier_mid.astype(np.float32), hier_global
+    masses = np.stack([np.mean(np.abs(q), axis=(1, 2, 3)) for q in quadrants], axis=1)
+    masses = masses / np.maximum(np.max(masses, axis=1, keepdims=True), 1e-6)
+    uniform = np.full((batch, targets.shape[1]), 1.0 / targets.shape[1], dtype=np.float32)
+    alpha = masses[..., None].astype(np.float32)
+    mid = uniform[:, None, :] + alpha * (targets[:, None, :] - uniform[:, None, :])
+    return mid.astype(np.float32), targets.astype(np.float32)
 
 
-def _task_arrays(
-    images: np.ndarray,
-    labels: np.ndarray,
-    classes: Tuple[int, int],
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    mask = np.isin(labels, np.asarray(classes))
-    task_x = images[mask]
-    raw_labels = labels[mask]
-    task_y = np.where(raw_labels == classes[0], 0, 1).astype(np.int32)
-    hier_mid, hier_global = _build_hierarchy_targets(task_x, task_y)
-    return task_x, _one_hot(task_y, 2), hier_mid, hier_global
-
-
-def _batch_loader(
-    x: np.ndarray,
-    y: np.ndarray,
-    hier_mid: np.ndarray,
-    hier_global: np.ndarray,
-    *,
-    batch_size: int,
-    seed: int,
-    shuffle: bool,
-    batch_limit: int | None,
-) -> Tuple[dict, ...]:
-    indices = np.arange(x.shape[0], dtype=np.int32)
-    if shuffle:
-        rng = np.random.default_rng(seed)
-        rng.shuffle(indices)
-
-    batches = []
-    for batch_idx, start in enumerate(range(0, len(indices), batch_size)):
-        if batch_limit is not None and batch_idx >= batch_limit:
-            break
-        batch_ids = indices[start : start + batch_size]
-        if batch_ids.size == 0:
-            continue
-        batches.append(
-            {
-                "x": jnp.asarray(x[batch_ids], dtype=jnp.float32),
-                "y": jnp.asarray(y[batch_ids], dtype=jnp.float32),
-                "hier_mid": jnp.asarray(hier_mid[batch_ids], dtype=jnp.float32),
-                "hier_global": jnp.asarray(hier_global[batch_ids], dtype=jnp.float32),
-            }
-        )
-    return tuple(batches)
-
-
-def build_split_mnist_tasks(cfg) -> Tuple[SplitMnistTask, ...]:
+def build_split_mnist_tasks(cfg: HiBaCaMLConfig) -> Tuple[SplitMnistTask, ...]:
     """Build the five task-incremental Split-MNIST tasks."""
     train_x, train_y, test_x, test_y = _load_mnist_arrays()
     train_x = _normalize_images(train_x)
@@ -166,33 +172,68 @@ def build_split_mnist_tasks(cfg) -> Tuple[SplitMnistTask, ...]:
 
     tasks = []
     for task_id, classes in enumerate(_TASK_CLASS_PAIRS[: cfg.num_tasks]):
-        task_train_x, task_train_y, task_train_mid, task_train_global = _task_arrays(train_x, train_y, classes)
-        task_test_x, task_test_y, task_test_mid, task_test_global = _task_arrays(test_x, test_y, classes)
-        task = SplitMnistTask(
-            task_id=task_id,
-            classes=classes,
-            train_loader=_batch_loader(
-                task_train_x,
-                task_train_y,
-                task_train_mid,
-                task_train_global,
-                batch_size=cfg.batch_size,
-                seed=cfg.seed + task_id,
-                shuffle=True,
-                batch_limit=cfg.train_batches_limit,
-            ),
-            test_loader=_batch_loader(
-                task_test_x,
-                task_test_y,
-                task_test_mid,
-                task_test_global,
-                batch_size=cfg.batch_size,
-                seed=cfg.seed + 10_000 + task_id,
-                shuffle=False,
-                batch_limit=cfg.test_batches_limit,
-            ),
-            task_query=_task_query(task_id, cfg.composer.query_dim),
-            output_dim=cfg.output_dim,
+        train_mask = np.isin(train_y, np.asarray(classes))
+        test_mask = np.isin(test_y, np.asarray(classes))
+
+        task_train_x = train_x[train_mask]
+        task_test_x = test_x[test_mask]
+        task_train_targets = _task_targets(
+            train_y[train_mask],
+            classes,
+            cfg.output_dim,
+            cfg.task_local_heads,
         )
-        tasks.append(task)
+        task_test_targets = _task_targets(
+            test_y[test_mask],
+            classes,
+            cfg.output_dim,
+            cfg.task_local_heads,
+        )
+        task_train_mid, task_train_global = _hierarchy_targets(
+            task_train_x,
+            task_train_targets,
+            cfg.hierarchy.mid_targets,
+        )
+        task_test_mid, task_test_global = _hierarchy_targets(
+            task_test_x,
+            task_test_targets,
+            cfg.hierarchy.mid_targets,
+        )
+
+        train_loader = _ArrayTaskLoader(
+            images=task_train_x,
+            targets=task_train_targets,
+            hierarchy_mid=task_train_mid,
+            hierarchy_global=task_train_global,
+            batch_size=cfg.batch_size,
+            shuffle=True,
+            seed=cfg.seed + task_id,
+            max_batches=cfg.train_batches_limit,
+        )
+        test_loader = _ArrayTaskLoader(
+            images=task_test_x,
+            targets=task_test_targets,
+            hierarchy_mid=task_test_mid,
+            hierarchy_global=task_test_global,
+            batch_size=cfg.batch_size,
+            shuffle=False,
+            seed=None,
+            max_batches=cfg.test_batches_limit,
+        )
+        tasks.append(
+            SplitMnistTask(
+                task_id=task_id,
+                classes=classes,
+                train_loader=train_loader,
+                test_loader=test_loader,
+                task_query=_task_query(task_id, cfg.composer.query_dim),
+                output_dim=cfg.output_dim,
+            )
+        )
+        log_progress(
+            f"task={task_id} built classes={classes} "
+            f"train_examples={task_train_x.shape[0]} test_examples={task_test_x.shape[0]} "
+            f"train_batches={len(train_loader)} test_batches={len(test_loader)}",
+            component="data",
+        )
     return tuple(tasks)

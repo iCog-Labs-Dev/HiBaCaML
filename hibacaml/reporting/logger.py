@@ -40,8 +40,8 @@ class HiBaCaMLRunLogger:
         self.root.mkdir(parents=True, exist_ok=True)
         self.started_at = time.time()
         self._lock = threading.Lock()
-        self._event_path = self.root / cfg.reporting.event_log_filename
-        self._memory_path = self.root / cfg.reporting.memory_samples_filename
+        self._event_path = self.root / "events.jsonl"
+        self._memory_path = self.root / "memory_samples.csv"
         self._phase_timings: Dict[str, float] = {}
         self._task_summaries: Dict[str, Dict[str, Any]] = {}
         self._progress: Dict[str, Any] = {
@@ -111,14 +111,14 @@ class HiBaCaMLRunLogger:
     def phase_timing(self, phase: str, seconds: float) -> None:
         self._phase_timings[phase] = self._phase_timings.get(phase, 0.0) + float(seconds)
         self._write_json(
-            self.root / self.cfg.reporting.phase_timings_filename,
+            self.root / "phase_timings.json",
             self._phase_timings,
         )
 
     def task_summary(self, task_id: int, summary: Dict[str, Any]) -> None:
         self._task_summaries[str(task_id)] = summary
         self._write_json(
-            self.root / self.cfg.reporting.task_summaries_filename,
+            self.root / "task_summaries.json",
             self._task_summaries,
         )
 
