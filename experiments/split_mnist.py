@@ -13,6 +13,7 @@ EPOCHS = None                          # e.g. 1, 5, or None
 INFER_STEPS = None                     # e.g. 20 or None
 ROLLOUT_STEPS = None                   # e.g. 4 or None
 STATIC_SUPPORT_BATCH_SIZE = None       # e.g. 2 or None
+NEIGHBOR_SUPPORT_BATCH_SIZE = None     # e.g. 32 or None
 CURRENT_BOUNDARY_BATCHES = None        # e.g. 2 or None
 OLD_BOUNDARY_BATCHES = None            # e.g. 2 or None
 TRAIN_BATCHES_LIMIT = None             # e.g. 10 or None
@@ -27,7 +28,7 @@ RESUME_CHECKPOINT = None               # e.g. "/kaggle/working/.../checkpoint.pk
 
 # Memory-related inputs
 LOW_MEMORY_BATCH_SIZE_CAP = None       # e.g. 64, or None to disable
-BATCH_SIZE = 64                        # direct batch_size override, e.g. 64
+BATCH_SIZE = 256                        # direct batch_size override, e.g. 64
 
 # Optional: use your patched package written under /kaggle/working
 PREFER_LOCAL_WORKING_COPY = True
@@ -81,6 +82,7 @@ if "MPLCONFIGDIR" not in os.environ:
 # ------------------------------------------------------------
 from fabricpc.core.inference import InferenceSGD
 from fabricpc.graph import initialize_params
+from fabricpc.graph.state_initializer import FeedforwardStateInit
 from hibacaml import (
     HiBaCaMLBackpropRunner,
     HiBaCaMLTrainer,
@@ -140,7 +142,12 @@ def _write_csv(path: Path, rows: Sequence[Dict[str, object]]) -> None:
 def build_trainer(cfg, tasks, learning: str):
     """Construct the HiBaCaML trainer for one learning mode."""
     inference = InferenceSGD(eta_infer=cfg.eta_infer, infer_steps=cfg.infer_steps)
-    structure = create_hibacaml_structure(cfg, inference)
+    graph_state_initializer = FeedforwardStateInit() if learning == "backprop" else None
+    structure = create_hibacaml_structure(
+        cfg,
+        inference,
+        graph_state_initializer=graph_state_initializer,
+    )
     log_progress(f"graph ready with {len(structure.nodes)} nodes", component="runner")
 
     params = initialize_params(structure, jax.random.PRNGKey(cfg.seed))
@@ -356,6 +363,7 @@ def apply_notebook_overrides(
     infer_steps: int | None = INFER_STEPS,
     rollout_steps: int | None = ROLLOUT_STEPS,
     static_support_batch_size: int | None = STATIC_SUPPORT_BATCH_SIZE,
+    neighbor_support_batch_size: int | None = NEIGHBOR_SUPPORT_BATCH_SIZE,
     current_boundary_batches: int | None = CURRENT_BOUNDARY_BATCHES,
     old_boundary_batches: int | None = OLD_BOUNDARY_BATCHES,
     train_batches_limit: int | None = TRAIN_BATCHES_LIMIT,
@@ -408,6 +416,15 @@ def apply_notebook_overrides(
             exact_search=dataclasses.replace(
                 cfg.exact_search,
                 static_support_batch_size=static_support_batch_size,
+            ),
+        )
+
+    if neighbor_support_batch_size is not None:
+        cfg = dataclasses.replace(
+            cfg,
+            exact_search=dataclasses.replace(
+                cfg.exact_search,
+                neighbor_support_batch_size=neighbor_support_batch_size,
             ),
         )
 
@@ -495,6 +512,7 @@ def run_experiment_notebook(
     infer_steps: int | None = INFER_STEPS,
     rollout_steps: int | None = ROLLOUT_STEPS,
     static_support_batch_size: int | None = STATIC_SUPPORT_BATCH_SIZE,
+    neighbor_support_batch_size: int | None = NEIGHBOR_SUPPORT_BATCH_SIZE,
     current_boundary_batches: int | None = CURRENT_BOUNDARY_BATCHES,
     old_boundary_batches: int | None = OLD_BOUNDARY_BATCHES,
     train_batches_limit: int | None = TRAIN_BATCHES_LIMIT,
@@ -522,6 +540,7 @@ def run_experiment_notebook(
         infer_steps=infer_steps,
         rollout_steps=rollout_steps,
         static_support_batch_size=static_support_batch_size,
+        neighbor_support_batch_size=neighbor_support_batch_size,
         current_boundary_batches=current_boundary_batches,
         old_boundary_batches=old_boundary_batches,
         train_batches_limit=train_batches_limit,
@@ -600,6 +619,7 @@ if __name__ == "__main__":
         infer_steps=INFER_STEPS,
         rollout_steps=ROLLOUT_STEPS,
         static_support_batch_size=STATIC_SUPPORT_BATCH_SIZE,
+        neighbor_support_batch_size=NEIGHBOR_SUPPORT_BATCH_SIZE,
         current_boundary_batches=CURRENT_BOUNDARY_BATCHES,
         old_boundary_batches=OLD_BOUNDARY_BATCHES,
         train_batches_limit=TRAIN_BATCHES_LIMIT,
