@@ -36,19 +36,47 @@ from hibacaml.types import (
     TaskSummary,
 )
 
-def _loss_vector_from_state(final_state, structure) -> jnp.ndarray:
+def _composer_details_from_runtime(params, final_state, clamps, structure):
+    meta = structure.config["hibacaml"]
+    composer_name = meta["composer2_node"]
+    feature_names = [meta["feature_gate_names"][idx] for idx in sorted(meta["feature_gate_names"])]
+    cert_names = [meta["cert_input_names"][idx] for idx in sorted(meta["cert_input_names"])]
+    features = jnp.stack([final_state.nodes[name].z_mu for name in feature_names], axis=1)
+    certs = jnp.stack(
+        [clamps.get(name, final_state.nodes[name].z_mu) for name in cert_names],
+        axis=1,
+    )
+    query = clamps[meta["task_query_node"]]
+    node_info = structure.nodes[composer_name].node_info
+    node_params = params.nodes[composer_name]
+    return composer_stage2_details(node_params, features, certs, query, node_info.node_config)
+
+
+def _hierarchy_parent_child_penalty(final_state, structure, weight: float) -> jnp.ndarray:
+    if weight <= 0.0:
+        return jnp.zeros((final_state.batch_size,), dtype=jnp.float32)
+    hier_mid = final_state.nodes[structure.task_map["hier_mid"]].z_mu
+    hier_global = final_state.nodes[structure.task_map["hier_global"]].z_mu
+    mid_parent = jnp.mean(hier_mid, axis=1)
+    return weight * jnp.mean(jnp.square(mid_parent - hier_global), axis=-1)
+
+
+def _loss_vector_from_state(
+    final_state,
+    structure,
+    *,
+    composer_aux_mean: jnp.ndarray,
+    parent_child_mean: jnp.ndarray,
+) -> jnp.ndarray:
     output_name = structure.task_map["y"]
     hier_mid_name = structure.task_map["hier_mid"]
     hier_global_name = structure.task_map["hier_global"]
-    composer_name = structure.config["hibacaml"]["composer2_node"]
     task = jnp.mean(final_state.nodes[output_name].energy)
     hier_mid = jnp.mean(final_state.nodes[hier_mid_name].energy)
     hier_global = jnp.mean(final_state.nodes[hier_global_name].energy)
-    parent_child = jnp.mean(_per_sample_parent_child_from_state(final_state, structure))
-    composer = jnp.mean(final_state.nodes[composer_name].energy)
-    total = task + hier_mid + hier_global + parent_child + composer
+    total = task + hier_mid + hier_global + parent_child_mean + composer_aux_mean
     return jnp.asarray(
-        [task, hier_mid, hier_global, parent_child, composer, total],
+        [task, hier_mid, hier_global, parent_child_mean, composer_aux_mean, total],
         dtype=jnp.float32,
     )
 
@@ -66,26 +94,29 @@ def _loss_dict_from_vector(losses: jnp.ndarray) -> Dict[str, float]:
 
 def _per_sample_parent_child_from_state(final_state, structure) -> jnp.ndarray:
     cfg = structure.config["hibacaml"]["cfg"]
-    hier_mid = final_state.nodes[structure.task_map["hier_mid"]].z_mu
-    hier_global = final_state.nodes[structure.task_map["hier_global"]].z_mu
-    mid_parent = jnp.mean(hier_mid, axis=1)
-    return cfg.hierarchy.parent_child_loss_weight * jnp.sum(
-        jnp.square(mid_parent - hier_global),
-        axis=-1,
+    return _hierarchy_parent_child_penalty(
+        final_state,
+        structure,
+        cfg.hierarchy.parent_child_loss_weight,
     )
 
 
-def _per_sample_total_from_state(final_state, structure) -> jnp.ndarray:
+def _per_sample_total_from_state(
+    final_state,
+    structure,
+    *,
+    composer_aux: jnp.ndarray,
+    parent_child: jnp.ndarray,
+) -> jnp.ndarray:
     output_name = structure.task_map["y"]
     hier_mid_name = structure.task_map["hier_mid"]
     hier_global_name = structure.task_map["hier_global"]
-    composer_name = structure.config["hibacaml"]["composer2_node"]
     return (
         final_state.nodes[output_name].energy
         + final_state.nodes[hier_mid_name].energy
         + final_state.nodes[hier_global_name].energy
-        + _per_sample_parent_child_from_state(final_state, structure)
-        + final_state.nodes[composer_name].energy
+        + parent_child
+        + composer_aux
     )
 
 
@@ -104,15 +135,34 @@ def _run_inference_step(params, clamps, structure, rng_key):
 def _pc_gradient_step(params, clamps, structure, rng_key):
     final_state = _run_inference_step(params, clamps, structure, rng_key)
     grads = compute_local_weight_gradients(params, final_state, structure)
-    losses = _loss_vector_from_state(final_state, structure)
+    composer_details = _composer_details_from_runtime(params, final_state, clamps, structure)
+    parent_child = _per_sample_parent_child_from_state(final_state, structure)
+    losses = _loss_vector_from_state(
+        final_state,
+        structure,
+        composer_aux_mean=jnp.mean(composer_details["aux_penalty"]),
+        parent_child_mean=jnp.mean(parent_child),
+    )
     return grads, losses, final_state
 
 
 def _eval_batch_step(params, clamps, structure, rng_key):
     final_state = _run_inference_step(params, clamps, structure, rng_key)
-    losses = _loss_vector_from_state(final_state, structure)
+    composer_details = _composer_details_from_runtime(params, final_state, clamps, structure)
+    parent_child = _per_sample_parent_child_from_state(final_state, structure)
+    losses = _loss_vector_from_state(
+        final_state,
+        structure,
+        composer_aux_mean=jnp.mean(composer_details["aux_penalty"]),
+        parent_child_mean=jnp.mean(parent_child),
+    )
     logits = final_state.nodes[structure.task_map["y"]].z_mu
-    per_sample_total = _per_sample_total_from_state(final_state, structure)
+    per_sample_total = _per_sample_total_from_state(
+        final_state,
+        structure,
+        composer_aux=composer_details["aux_penalty"],
+        parent_child=parent_child,
+    )
     return logits, per_sample_total, losses
 
 
@@ -170,7 +220,7 @@ class HiBaCaMLTrainer:
         self._eval_cache: Dict[Tuple[int, int, Tuple[int, ...], str], Dict[str, float]] = {}
         self.shell_controller = ShellController(cfg, structure)
         self.run_logger = run_logger
-        if self.run_logger is None and create_run_logger and cfg.reporting.enable_deep_logging:
+        if self.run_logger is None and create_run_logger:
             self.run_logger = HiBaCaMLRunLogger(cfg)
             self.run_logger.event("trainer_created", mode=cfg.mode)
         if tasks is not None:
@@ -295,32 +345,6 @@ class HiBaCaMLTrainer:
             (batch_size, task.task_query.shape[0]),
         )
 
-    def _composer_prior_vector(self, nonshared: Sequence[int]) -> jnp.ndarray:
-        support_mask = self.build_support_mask(nonshared)
-        values: List[float] = []
-        for idx in range(self.cfg.column_pool.total_columns):
-            cert = self.persistent_state.certificates.get(idx)
-            if cert is None:
-                values.append(0.0)
-                continue
-            values.append(
-                cert.q_mean
-                + 0.5 * cert.shared_abstraction_mass
-                - 0.25 * cert.specificity_load
-                - 0.25 * cert.demotion_pressure
-                - 0.10 * cert.saturation
-            )
-        prior = jnp.asarray(values, dtype=jnp.float32)
-        active = support_mask > 0.0
-        active_count = jnp.sum(active.astype(jnp.float32))
-        active_mean = jnp.sum(jnp.where(active, prior, 0.0)) / jnp.maximum(active_count, 1.0)
-        prior = jnp.where(active, prior - active_mean, 0.0)
-        return prior
-
-    def _batch_composer_prior(self, nonshared: Sequence[int], batch_size: int) -> jnp.ndarray:
-        prior = self._composer_prior_vector(nonshared)
-        return jnp.broadcast_to(prior, (batch_size, prior.shape[0]))
-
     def _refresh_certificates(
         self,
         batch_size: int,
@@ -332,6 +356,28 @@ class HiBaCaMLTrainer:
         state = graph_state if graph_state is not None else self._last_graph_state_or_placeholder(batch_size)
         self.shell_controller.refresh_certificates(params, state, self.persistent_state)
 
+    def _build_single_support_clamps(
+        self,
+        batch: Dict[str, jnp.ndarray],
+        task: SplitMnistTask,
+        support_mask: jnp.ndarray,
+        cert_vectors: Dict[int, jnp.ndarray],
+    ) -> Dict[str, jnp.ndarray]:
+        meta = self.structure.config["hibacaml"]
+        batch_size = int(batch["x"].shape[0])
+        clamps = {
+            self.structure.task_map["x"]: jnp.asarray(batch["x"], dtype=jnp.float32),
+            self.structure.task_map["y"]: jnp.asarray(batch["y"], dtype=jnp.float32),
+            self.structure.task_map["hier_mid"]: jnp.asarray(batch["hier_mid"], dtype=jnp.float32),
+            self.structure.task_map["hier_global"]: jnp.asarray(batch["hier_global"], dtype=jnp.float32),
+            meta["support_mask_node"]: jnp.broadcast_to(support_mask, (batch_size, support_mask.shape[0])),
+            meta["task_query_node"]: self._batch_query(task, batch_size),
+        }
+        for column_index, node_name in meta["cert_input_names"].items():
+            vec = cert_vectors[column_index]
+            clamps[node_name] = jnp.broadcast_to(vec, (batch_size, vec.shape[0]))
+        return clamps
+
     def _build_clamps(
         self,
         batch: Dict[str, jnp.ndarray],
@@ -341,20 +387,12 @@ class HiBaCaMLTrainer:
         params=None,
         refresh_certificates: bool = True,
     ) -> Dict[str, jnp.ndarray]:
-        meta = self.structure.config["hibacaml"]
         batch_size = int(batch["x"].shape[0])
         if refresh_certificates:
             self._refresh_certificates(batch_size, params=params)
         support_mask = self.build_support_mask(nonshared)
-        return {
-            self.structure.task_map["x"]: jnp.asarray(batch["x"], dtype=jnp.float32),
-            self.structure.task_map["y"]: jnp.asarray(batch["y"], dtype=jnp.float32),
-            self.structure.task_map["hier_mid"]: jnp.asarray(batch["hier_mid"], dtype=jnp.float32),
-            self.structure.task_map["hier_global"]: jnp.asarray(batch["hier_global"], dtype=jnp.float32),
-            meta["support_mask_node"]: jnp.broadcast_to(support_mask, (batch_size, support_mask.shape[0])),
-            meta["task_query_node"]: self._batch_query(task, batch_size),
-            meta["composer_prior_node"]: self._batch_composer_prior(nonshared, batch_size),
-        }
+        cert_vectors = self.shell_controller.certificate_matrix(self.persistent_state, support_mask)
+        return self._build_single_support_clamps(batch, task, support_mask, cert_vectors)
 
     def _build_multi_support_clamps(
         self,
@@ -369,9 +407,13 @@ class HiBaCaMLTrainer:
         if refresh_certificates:
             self._refresh_certificates(batch_size, params=params)
         support_masks = [self.build_support_mask(nonshared) for nonshared in supports]
+        cert_matrices = [
+            self.shell_controller.certificate_matrix(self.persistent_state, support_mask)
+            for support_mask in support_masks
+        ]
         meta = self.structure.config["hibacaml"]
         total_batch = batch_size * len(supports)
-        return {
+        clamps = {
             self.structure.task_map["x"]: jnp.concatenate(
                 [jnp.asarray(batch["x"], dtype=jnp.float32)] * len(supports),
                 axis=0,
@@ -393,11 +435,16 @@ class HiBaCaMLTrainer:
                 axis=0,
             ),
             meta["task_query_node"]: self._batch_query(task, total_batch),
-            meta["composer_prior_node"]: jnp.concatenate(
-                [self._batch_composer_prior(support, batch_size) for support in supports],
-                axis=0,
-            ),
         }
+        for column_index, node_name in meta["cert_input_names"].items():
+            clamps[node_name] = jnp.concatenate(
+                [
+                    jnp.broadcast_to(matrix[column_index], (batch_size, matrix[column_index].shape[0]))
+                    for matrix in cert_matrices
+                ],
+                axis=0,
+            )
+        return clamps
 
     def _last_graph_state_or_placeholder(self, batch_size: int):
         if getattr(self, "_last_graph_state", None) is not None and self._last_graph_state.batch_size == batch_size:
@@ -452,20 +499,34 @@ class HiBaCaMLTrainer:
             ],
             axis=1,
         )
+        support_mask = self.build_support_mask(nonshared)
+        cert_vectors = self.shell_controller.certificate_matrix(self.persistent_state, support_mask)
+        certs = jnp.stack(
+            [
+                jnp.broadcast_to(
+                    cert_vectors[idx],
+                    (final_state.batch_size, cert_vectors[idx].shape[0]),
+                )
+                for idx in range(self.cfg.column_pool.total_columns)
+            ],
+            axis=1,
+        )
         query = self._batch_query(task, final_state.batch_size)
-        prior = self._batch_composer_prior(nonshared, final_state.batch_size)
         details = composer_stage2_details(
             self.params.nodes[meta["composer2_node"]],
             features,
+            certs,
             query,
             self.structure.nodes[meta["composer2_node"]].node_info.node_config,
-            prior,
         )
         gate_probs = details["gate_probs"]
         return {
             "gate_entropy": float(jnp.mean(details["gate_entropy"])),
-            "gate_deviation": float(jnp.mean(details["gate_deviation"])),
-            "cert_prior_mean": float(jnp.mean(prior)),
+            "gate_deviation": float(jnp.mean(details["gate_dev"])),
+            "cert_prior_mean": float(jnp.mean(certs)),
+            "prior_kl": float(jnp.mean(details["prior_kl"])),
+            "top1_mass": float(jnp.mean(details["top1_mass"])),
+            "effective_k": float(jnp.mean(details["effective_k"])),
             "gate_max": float(jnp.max(gate_probs)),
             "gate_min_active": float(jnp.min(jnp.where(gate_probs > 0.0, gate_probs, 1.0))),
         }

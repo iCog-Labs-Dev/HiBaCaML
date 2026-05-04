@@ -33,6 +33,7 @@ def create_hibacaml_structure(
     nodes = []
     edges = []
     column_metadata: List[Dict[str, str]] = []
+    cert_input_names: Dict[int, str] = {}
     feature_gate_names: Dict[int, str] = {}
     logit_gate_names: Dict[int, str] = {}
     b_micro_names: Dict[int, str] = {}
@@ -43,7 +44,6 @@ def create_hibacaml_structure(
     image_input = IdentityNode(shape=cfg.input_shape, name="image_input")
     support_mask = IdentityNode(shape=(cfg.support_vector_dim,), name="support_mask")
     task_query = IdentityNode(shape=(cfg.composer.query_dim,), name="task_query")
-    composer_prior = IdentityNode(shape=(cfg.support_vector_dim,), name="composer_prior")
     patch_tokens = PatchTokenizerNode(
         shape=(cfg.num_patches, cfg.patch_token_dim),
         name="patch_tokens",
@@ -51,11 +51,15 @@ def create_hibacaml_structure(
         patch_embed_dim=cfg.patch_embed_dim,
         coord_dim=cfg.patch_coord_dim,
     )
-    nodes.extend([image_input, support_mask, task_query, composer_prior, patch_tokens])
+    nodes.extend([image_input, support_mask, task_query, patch_tokens])
     edges.append(Edge(source=image_input, target=patch_tokens.slot("in")))
 
     for column_index in range(cfg.column_pool.total_columns):
         with GraphNamespace(f"col{column_index}"):
+            cert_input = IdentityNode(
+                shape=(cfg.composer_cert_dim,),
+                name="cert_input",
+            )
             token_gate = ElementwiseGateNode(
                 shape=(cfg.num_patches, cfg.patch_token_dim),
                 name="token_gate",
@@ -109,6 +113,7 @@ def create_hibacaml_structure(
             )
             nodes.extend(
                 [
+                    cert_input,
                     token_gate,
                     b_micro,
                     *kernel_nodes,
@@ -142,12 +147,14 @@ def create_hibacaml_structure(
                 previous_kernel_source = kernel_node
             feature_gate_names[column_index] = feature_gate.name
             logit_gate_names[column_index] = logit_gate.name
+            cert_input_names[column_index] = cert_input.name
             b_micro_names[column_index] = b_micro.name
             k_micro_names[column_index] = kernel_nodes[-1].name
             k_micro_depth_names[column_index] = tuple(node.name for node in kernel_nodes)
             l_micro_names[column_index] = l_micro.name
             column_metadata.append(
                 {
+                    "cert_input": cert_input.name,
                     "token_gate": token_gate.name,
                     "b_micro": b_micro.name,
                     "k_micro": kernel_nodes[-1].name,
@@ -182,16 +189,22 @@ def create_hibacaml_structure(
         shape=(cfg.output_dim,),
         name="composer2",
         hidden_dim=cfg.composer.hidden_dim,
+        gate_temp=cfg.composer.gate_temp,
+        prior_logit_scale=cfg.composer.prior_logit_scale,
+        prior_mix_scale=cfg.composer.prior_mix_scale,
+        residual_gate_scale=cfg.composer.residual_gate_scale,
         query_score_scale=cfg.composer.query_score_scale,
-        active_top_k=cfg.composer.active_top_k,
-        cert_prior_scale=cfg.composer.cert_prior_scale,
-        gate_entropy_weight=cfg.composer.gate_entropy_weight,
-        gate_deviation_weight=cfg.composer.gate_deviation_weight,
+        prior_kl_weight=cfg.composer.prior_kl_weight,
+        gate_entropy_ceiling_frac=cfg.composer.gate_entropy_ceiling_frac,
+        gate_entropy_ceiling_weight=cfg.composer.gate_entropy_ceiling_weight,
+        gate_dev_floor=cfg.composer.gate_dev_floor,
+        gate_dev_weight=cfg.composer.gate_dev_weight,
+        topk=cfg.composer.topk,
     )
     final_output = ScaledAddNode(
         shape=(cfg.output_dim,),
         name="final_output",
-        correction_scale=cfg.composer.residual_gate_scale,
+        correction_scale=cfg.composer.scale,
         activation=SoftmaxActivation(),
         energy=WeightedCrossEntropyEnergy(weight=1.0),
     )
@@ -213,16 +226,18 @@ def create_hibacaml_structure(
     for column_index in range(cfg.column_pool.total_columns):
         feature_gate_name = feature_gate_names[column_index]
         logit_gate_name = logit_gate_names[column_index]
+        cert_input_name = cert_input_names[column_index]
         feature_gate_node = next(node for node in nodes if node.name == feature_gate_name)
         logit_gate_node = next(node for node in nodes if node.name == logit_gate_name)
+        cert_input_node = next(node for node in nodes if node.name == cert_input_name)
         edges.append(Edge(source=logit_gate_node, target=stage1_logits.slot("in")))
         edges.append(Edge(source=feature_gate_node, target=active_feature_summary.slot("in")))
         edges.append(Edge(source=feature_gate_node, target=composer2.slot("feature")))
+        edges.append(Edge(source=cert_input_node, target=composer2.slot("cert")))
 
     edges.extend(
         [
             Edge(source=task_query, target=composer2.slot("query")),
-            Edge(source=composer_prior, target=composer2.slot("cert_prior")),
             Edge(source=stage1_logits, target=final_output.slot("base")),
             Edge(source=composer2, target=final_output.slot("correction")),
             Edge(source=active_feature_summary, target=hier_mid.slot("in")),
@@ -247,7 +262,6 @@ def create_hibacaml_structure(
         "cfg": cfg,
         "support_mask_node": support_mask.name,
         "task_query_node": task_query.name,
-        "composer_prior_node": composer_prior.name,
         "patch_tokens_node": patch_tokens.name,
         "stage1_logits_node": stage1_logits.name,
         "active_feature_summary_node": active_feature_summary.name,
@@ -258,6 +272,7 @@ def create_hibacaml_structure(
         "k_micro_names": k_micro_names,
         "k_micro_depth_names": k_micro_depth_names,
         "l_micro_names": l_micro_names,
+        "cert_input_names": cert_input_names,
         "feature_gate_names": feature_gate_names,
         "logit_gate_names": logit_gate_names,
     }

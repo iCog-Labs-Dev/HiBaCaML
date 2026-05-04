@@ -27,9 +27,9 @@ class ShellController:
             "tier3": slice(kernel_dim + s1 + s2, kernel_dim + s1 + s2 + s3),
         }
         self.inhibition_strengths = {
-            "tier1": 0.08,
+            "tier1": 0.30,
             "tier2": 0.18,
-            "tier3": 0.30,
+            "tier3": 0.08,
         }
 
     def update_shell_stats(
@@ -122,6 +122,36 @@ class ShellController:
             cert.similarity_signature = tuple(signature)
         persistent_state.certificates = certificates
         return certificates
+
+    def certificate_matrix(
+        self,
+        persistent_state: PersistentHiBaCaMLState,
+        support_mask: jnp.ndarray,
+    ) -> Dict[int, jnp.ndarray]:
+        """Return per-column certificate vectors masked by active support."""
+        matrix = {}
+        for idx in range(self.cfg.column_pool.total_columns):
+            cert = persistent_state.certificates.get(idx)
+            if cert is None:
+                matrix[idx] = jnp.zeros((self.cfg.composer_cert_dim,), dtype=jnp.float32)
+                continue
+            vec = jnp.asarray(
+                [
+                    cert.q_mean,
+                    cert.prec_mean,
+                    cert.pred_mean,
+                    cert.live_frac,
+                    cert.tier_q[0],
+                    cert.tier_q[1],
+                    cert.tier_q[2],
+                    cert.shared_abstraction_mass,
+                    cert.specificity_load,
+                    cert.demotion_pressure,
+                ],
+                dtype=jnp.float32,
+            )
+            matrix[idx] = vec * support_mask[idx]
+        return matrix
 
     def semantic_penalty(
         self,

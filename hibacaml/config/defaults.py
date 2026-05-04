@@ -64,7 +64,7 @@ class HierarchyConfig:
     mid_targets: int = 4
     mid_loss_weight: float = 0.06
     global_loss_weight: float = 0.03
-    parent_child_loss_weight: float = 0.02
+    parent_child_loss_weight: float = 0.04
 
 
 @dataclass(frozen=True)
@@ -73,12 +73,19 @@ class ComposerConfig:
 
     hidden_dim: int = 64
     query_dim: int = 5
+    cert_dim: int = 10
+    scale: float = 0.42
+    gate_temp: float = 0.52
+    prior_logit_scale: float = 0.68
+    prior_mix_scale: float = 0.16
+    residual_gate_scale: float = 2.35
+    prior_kl_weight: float = 0.0008
+    gate_entropy_ceiling_frac: float = 0.52
+    gate_entropy_ceiling_weight: float = 0.009
     query_score_scale: float = 1.0
-    active_top_k: int = 5
-    cert_prior_scale: float = 0.25
-    gate_entropy_weight: float = 0.002
-    gate_deviation_weight: float = 0.01
-    residual_gate_scale: float = 0.42
+    gate_dev_floor: float = 0.14
+    gate_dev_weight: float = 0.005
+    topk: int = 3
 
 
 @dataclass(frozen=True)
@@ -87,10 +94,11 @@ class ExactSearchConfig:
 
     enable_exact_search: bool = True
     boundary_current_batches: int = 2
-    boundary_old_batches: int = 1
+    boundary_old_batches: int = 2
     boundary_rollout_steps: int = 4
-    boundary_shortlist: int = 3
-    static_support_batch_size: int = 64
+    boundary_shortlist: int = 8
+    static_support_batch_size: int = 8
+    neighbor_support_batch_size: int = 8
     exact_old_worst_weight: float = 1.0
     exact_old_mix_weight: float = 0.5
     switch_penalty: float = 0.015
@@ -129,13 +137,10 @@ class ReportingConfig:
 
     output_root: str = "runs/hibacaml"
     checkpoint_filename: str = "hibacaml_checkpoint.pkl"
-    event_log_filename: str = "events.jsonl"
     heartbeat_filename: str = "heartbeat.json"
     progress_filename: str = "progress.json"
-    memory_samples_filename: str = "memory_samples.csv"
-    phase_timings_filename: str = "phase_timings.json"
-    task_summaries_filename: str = "task_summaries.json"
-    enable_deep_logging: bool = True
+    export_progress_every: int = 1
+    export_selector_replay_dataset: bool = True
 
 
 @dataclass(frozen=True)
@@ -150,7 +155,7 @@ class HiBaCaMLConfig:
     patch_coord_dim: int = 2
     task_local_heads: bool = True
     num_tasks: int = 5
-    batch_size: int = 128
+    batch_size: int = 256
     epochs_per_task: int = 5
     infer_steps: int = 12
     eta_infer: float = 0.05
@@ -181,6 +186,10 @@ class HiBaCaMLConfig:
         return self.patch_embed_dim + self.patch_coord_dim
 
     @property
+    def composer_cert_dim(self) -> int:
+        return self.composer.cert_dim
+
+    @property
     def support_vector_dim(self) -> int:
         return self.column_pool.total_columns
 
@@ -201,13 +210,14 @@ def make_hibacaml_config(mode: str = "paper_faithful") -> HiBaCaMLConfig:
             mode=mode,
             infer_steps=8,
             exact_search=ExactSearchConfig(
-                boundary_current_batches=1,
-                boundary_old_batches=1,
-                boundary_rollout_steps=1,
-                boundary_shortlist=2,
-                static_support_batch_size=16,
+                boundary_current_batches=2,
+                boundary_old_batches=2,
+                boundary_rollout_steps=4,
+                boundary_shortlist=8,
+                static_support_batch_size=8,
+                neighbor_support_batch_size=8,
                 maintenance_interval=512,
-                rollout_gradient_mode="pc",
+                rollout_gradient_mode="trainer",
                 enable_local_maintenance=True,
                 pad_support_batches=True,
                 support_candidate_policy="adaptive_reserve_gated",
@@ -245,14 +255,16 @@ def make_hibacaml_config(mode: str = "paper_faithful") -> HiBaCaMLConfig:
             composer=ComposerConfig(
                 hidden_dim=16,
                 query_dim=5,
-                residual_gate_scale=0.25,
+                cert_dim=10,
+                scale=0.25,
             ),
             exact_search=ExactSearchConfig(
                 boundary_current_batches=1,
                 boundary_old_batches=1,
                 boundary_rollout_steps=1,
                 boundary_shortlist=3,
-                static_support_batch_size=64,
+                static_support_batch_size=16,
+                neighbor_support_batch_size=16,
                 maintenance_interval=2,
             ),
         )

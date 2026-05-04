@@ -81,43 +81,89 @@ def _masked_softmax(logits: jnp.ndarray, mask: jnp.ndarray, *, axis: int = -1) -
 def composer_stage2_details(
     params: NodeParams,
     features: jnp.ndarray,
+    certs: jnp.ndarray,
     query: jnp.ndarray,
     node_config: Dict[str, Any],
-    cert_prior: Optional[jnp.ndarray] = None,
 ) -> Dict[str, jnp.ndarray]:
-    """Attention-style composer computation."""
-    active_mask = jnp.linalg.norm(features, axis=-1) > 1e-8
+    """Attention-style composer computation with certificate-vector priors."""
+    active_mask = (jnp.linalg.norm(features, axis=-1) + jnp.linalg.norm(certs, axis=-1)) > 1e-8
+    active_count = jnp.maximum(jnp.sum(active_mask.astype(features.dtype), axis=-1, keepdims=True), 1.0)
+    uniform_prior = active_mask.astype(features.dtype) / active_count
+
+    prior_raw = jnp.matmul(certs, params.weights["prior_proj"]).squeeze(-1)
+    base_prior = _masked_softmax(prior_raw, active_mask)
+    prior_mix_scale = float(node_config.get("prior_mix_scale", 0.0))
+    prior_probs = (1.0 - prior_mix_scale) * base_prior + prior_mix_scale * uniform_prior
+    prior_probs = prior_probs / (jnp.sum(prior_probs, axis=-1, keepdims=True) + 1e-8)
+    prior_logits = jnp.log(prior_probs + 1e-8)
+
     q_context = (
         node_config.get("query_score_scale", 1.0)
         * jnp.matmul(query, params.weights["query_proj"])[:, None, :]
     )
     feature_hidden = jnp.tanh(jnp.matmul(features, params.weights["feature_proj"]) + q_context)
-    gate_logits = jnp.matmul(feature_hidden, params.weights["attn_v"]).squeeze(-1)
-    if cert_prior is not None:
-        gate_logits = gate_logits + node_config.get("cert_prior_scale", 0.0) * cert_prior
-    active_top_k = int(node_config.get("active_top_k", features.shape[1]))
-    if 0 < active_top_k < features.shape[1]:
-        masked_logits = jnp.where(active_mask, gate_logits, -1e9)
-        _, top_indices = jax.lax.top_k(masked_logits, active_top_k)
-        top_mask = jnp.zeros_like(active_mask, dtype=bool)
-        row_indices = jnp.arange(features.shape[0])[:, None]
-        top_mask = top_mask.at[row_indices, top_indices].set(True)
-        active_mask = active_mask & top_mask
-    gate_probs = _masked_softmax(gate_logits, active_mask)
+    residual_logits = jnp.matmul(feature_hidden, params.weights["attn_v"]).squeeze(-1)
+
+    gate_logits = (
+        node_config["prior_logit_scale"] * prior_logits
+        + node_config["residual_gate_scale"] * residual_logits
+    )
+    topk = int(node_config.get("topk", 0))
+    if 0 < topk < gate_logits.shape[-1]:
+        topk_values, _ = jax.lax.top_k(jnp.where(active_mask, gate_logits, -1e9), topk)
+        threshold = topk_values[..., -1:]
+        active_mask = active_mask & (gate_logits >= threshold)
+    gate_probs = _masked_softmax(gate_logits / node_config["gate_temp"], active_mask)
 
     weighted_features = jnp.sum(features * gate_probs[..., None], axis=1)
     correction = jnp.matmul(weighted_features, params.weights["out_proj"]) + params.biases["b_out"]
-    active_count = jnp.maximum(jnp.sum(active_mask.astype(jnp.float32), axis=-1), 1.0)
-    uniform = jnp.where(active_mask, 1.0 / active_count[:, None], 0.0)
+
     gate_entropy = -jnp.sum(gate_probs * jnp.log(gate_probs + 1e-8), axis=-1)
-    target_entropy = jnp.log(active_count + 1e-8)
-    gate_deviation = jnp.sum(jnp.square(gate_probs - uniform), axis=-1)
+    entropy_ceiling = (
+        node_config.get("gate_entropy_ceiling_frac", 1.0)
+        * jnp.log(jnp.maximum(jnp.sum(active_mask.astype(features.dtype), axis=-1), 1.0))
+    )
+    entropy_penalty = node_config.get("gate_entropy_ceiling_weight", 0.0) * jnp.maximum(
+        0.0,
+        gate_entropy - entropy_ceiling,
+    )
+    prior_kl = jnp.sum(
+        gate_probs * (jnp.log(gate_probs + 1e-8) - jnp.log(prior_probs + 1e-8)),
+        axis=-1,
+    )
+    prior_kl_penalty = node_config.get("prior_kl_weight", 0.0) * prior_kl
+    gate_dev = jnp.mean(jnp.abs(gate_probs - prior_probs), axis=-1)
+    gate_dev_penalty = node_config.get("gate_dev_weight", 0.0) * jnp.maximum(
+        0.0,
+        node_config.get("gate_dev_floor", 0.0) - gate_dev,
+    )
+    aux_penalty = prior_kl_penalty + entropy_penalty + gate_dev_penalty
+
+    topk_take = min(2, gate_probs.shape[-1])
+    topk_mass, _ = jax.lax.top_k(gate_probs, topk_take)
+    top1_mass = topk_mass[:, 0]
+    top2_mass = topk_mass[:, 1] if topk_take > 1 else jnp.zeros_like(top1_mass)
+    effective_k = jnp.exp(gate_entropy)
+    pair_attention = gate_probs[:, :, None] * gate_probs[:, None, :]
+    flat_attention = pair_attention.reshape(pair_attention.shape[0], -1)
+    attention_entropy = -jnp.sum(
+        flat_attention * jnp.log(flat_attention + 1e-8),
+        axis=-1,
+    )
+
     return {
+        "prior_probs": prior_probs,
         "gate_probs": gate_probs,
+        "pair_attention": pair_attention,
         "correction": correction,
+        "aux_penalty": aux_penalty,
         "gate_entropy": gate_entropy,
-        "gate_entropy_deficit": jnp.maximum(0.0, target_entropy - gate_entropy),
-        "gate_deviation": gate_deviation,
+        "prior_kl": prior_kl,
+        "top1_mass": top1_mass,
+        "top2_mass": top2_mass,
+        "effective_k": effective_k,
+        "attention_entropy": attention_entropy,
+        "gate_dev": gate_dev,
     }
 
 
@@ -567,11 +613,17 @@ class ComposerStage2Node(NodeBase):
         latent_init=NormalInitializer(),
         weight_init=NormalInitializer(std=0.02),
         hidden_dim: int = 64,
+        gate_temp: float = 0.52,
+        prior_logit_scale: float = 0.68,
+        prior_mix_scale: float = 0.16,
+        residual_gate_scale: float = 2.35,
         query_score_scale: float = 1.0,
-        active_top_k: int = 5,
-        cert_prior_scale: float = 0.0,
-        gate_entropy_weight: float = 0.0,
-        gate_deviation_weight: float = 0.0,
+        prior_kl_weight: float = 0.0,
+        gate_entropy_ceiling_frac: float = 1.0,
+        gate_entropy_ceiling_weight: float = 0.0,
+        gate_dev_floor: float = 0.0,
+        gate_dev_weight: float = 0.0,
+        topk: int = 0,
     ):
         super().__init__(
             shape=shape,
@@ -581,19 +633,25 @@ class ComposerStage2Node(NodeBase):
             latent_init=latent_init,
             weight_init=weight_init,
             hidden_dim=hidden_dim,
+            gate_temp=gate_temp,
+            prior_logit_scale=prior_logit_scale,
+            prior_mix_scale=prior_mix_scale,
+            residual_gate_scale=residual_gate_scale,
             query_score_scale=query_score_scale,
-            active_top_k=active_top_k,
-            cert_prior_scale=cert_prior_scale,
-            gate_entropy_weight=gate_entropy_weight,
-            gate_deviation_weight=gate_deviation_weight,
+            prior_kl_weight=prior_kl_weight,
+            gate_entropy_ceiling_frac=gate_entropy_ceiling_frac,
+            gate_entropy_ceiling_weight=gate_entropy_ceiling_weight,
+            gate_dev_floor=gate_dev_floor,
+            gate_dev_weight=gate_dev_weight,
+            topk=topk,
         )
 
     @staticmethod
     def get_slots() -> Dict[str, SlotSpec]:
         return {
             "feature": SlotSpec(name="feature", is_multi_input=True),
+            "cert": SlotSpec(name="cert", is_multi_input=True),
             "query": SlotSpec(name="query", is_multi_input=False, is_variance_scalable=False),
-            "cert_prior": SlotSpec(name="cert_prior", is_multi_input=False, is_variance_scalable=False),
         }
 
     @staticmethod
@@ -610,23 +668,27 @@ class ComposerStage2Node(NodeBase):
             weight_init = NormalInitializer(std=0.02)
 
         feature_dim = None
+        cert_dim = None
         query_dim = None
         for edge_key, shape in input_shapes.items():
             if ":feature" in edge_key and feature_dim is None:
                 feature_dim = int(shape[-1])
+            elif ":cert" in edge_key and cert_dim is None:
+                cert_dim = int(shape[-1])
             elif ":query" in edge_key and query_dim is None:
                 query_dim = int(shape[-1])
 
-        if feature_dim is None or query_dim is None:
-            raise ValueError("ComposerStage2Node requires feature and query inputs")
+        if feature_dim is None or cert_dim is None or query_dim is None:
+            raise ValueError("ComposerStage2Node requires feature, cert, and query inputs")
 
         hidden_dim = int(config["hidden_dim"])
-        keys = jax.random.split(key, 4)
+        keys = jax.random.split(key, 5)
         weights = {
-            "feature_proj": initialize(keys[0], (feature_dim, hidden_dim), weight_init),
-            "query_proj": initialize(keys[1], (query_dim, hidden_dim), weight_init),
-            "attn_v": initialize(keys[2], (hidden_dim, 1), weight_init),
-            "out_proj": initialize(keys[3], (feature_dim, node_shape[-1]), weight_init),
+            "prior_proj": initialize(keys[0], (cert_dim, 1), weight_init),
+            "feature_proj": initialize(keys[1], (feature_dim, hidden_dim), weight_init),
+            "query_proj": initialize(keys[2], (query_dim, hidden_dim), weight_init),
+            "attn_v": initialize(keys[3], (hidden_dim, 1), weight_init),
+            "out_proj": initialize(keys[4], (feature_dim, node_shape[-1]), weight_init),
         }
         biases = {
             "b_out": jnp.zeros((1, node_shape[-1])),
@@ -641,40 +703,27 @@ class ComposerStage2Node(NodeBase):
         node_info: NodeInfo,
     ) -> Tuple[jax.Array, NodeState]:
         feature_edges = _slot_inputs(inputs, "feature")
+        cert_edges = _slot_inputs(inputs, "cert")
         query = _sum_inputs(_slot_inputs(inputs, "query"))
-        cert_prior = _sum_inputs(_slot_inputs(inputs, "cert_prior"))
-        if not feature_edges or query is None:
-            raise ValueError(f"{node_info.name} requires feature and query inputs")
+        if not feature_edges or not cert_edges or query is None:
+            raise ValueError(f"{node_info.name} requires feature, cert, and query inputs")
 
         feature_keys = sorted(feature_edges, key=_feature_edge_column_index)
+        cert_keys = sorted(cert_edges, key=_feature_edge_column_index)
         features = jnp.stack([feature_edges[key] for key in feature_keys], axis=1)
-        ordered_prior = None
-        if cert_prior is not None:
-            column_indices = jnp.asarray(
-                [_feature_edge_column_index(key) for key in feature_keys],
-                dtype=jnp.int32,
-            )
-            ordered_prior = cert_prior[:, column_indices]
-
+        certs = jnp.stack([cert_edges[key] for key in cert_keys], axis=1)
         details = composer_stage2_details(
             params,
             features,
+            certs,
             query,
             node_info.node_config,
-            ordered_prior,
         )
         pre_activation = details["correction"]
         z_mu = _apply_activation(node_info, pre_activation)
         error = state.z_latent - z_mu
         state = state._replace(pre_activation=pre_activation, z_mu=z_mu, error=error)
         state = node_info.node_class.energy_functional(state, node_info)
-        aux_energy = (
-            node_info.node_config.get("gate_entropy_weight", 0.0)
-            * details["gate_entropy_deficit"]
-            + node_info.node_config.get("gate_deviation_weight", 0.0)
-            * details["gate_deviation"]
-        )
-        state = state._replace(energy=state.energy + aux_energy)
         return jnp.sum(state.energy), state
 
 
