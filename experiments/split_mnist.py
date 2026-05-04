@@ -12,8 +12,8 @@ SHORTLIST = None                       # e.g. 8 or None
 EPOCHS = None                          # e.g. 1, 5, or None
 INFER_STEPS = None                     # e.g. 20 or None
 ROLLOUT_STEPS = None                   # e.g. 4 or None
-STATIC_SUPPORT_BATCH_SIZE = None       # e.g. 2 or None
-NEIGHBOR_SUPPORT_BATCH_SIZE = None     # e.g. 32 or None
+STATIC_SUPPORT_BATCH_SIZE = 16       # e.g. 2 or None
+NEIGHBOR_SUPPORT_BATCH_SIZE = 16     # e.g. 32 or None
 CURRENT_BOUNDARY_BATCHES = None        # e.g. 2 or None
 OLD_BOUNDARY_BATCHES = None            # e.g. 2 or None
 TRAIN_BATCHES_LIMIT = None             # e.g. 10 or None
@@ -28,7 +28,7 @@ RESUME_CHECKPOINT = None               # e.g. "/kaggle/working/.../checkpoint.pk
 
 # Memory-related inputs
 LOW_MEMORY_BATCH_SIZE_CAP = None       # e.g. 64, or None to disable
-BATCH_SIZE = 256                        # direct batch_size override, e.g. 64
+BATCH_SIZE = 512                        # direct batch_size override, e.g. 64
 
 # Optional: use your patched package written under /kaggle/working
 PREFER_LOCAL_WORKING_COPY = True

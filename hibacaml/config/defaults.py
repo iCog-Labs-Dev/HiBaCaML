@@ -120,7 +120,7 @@ class ExactSearchConfig:
     precision_update_floor: float = 0.20
     enable_demotion_swap_audit: bool = False
     allow_unaudited_demotion: bool = True
-    demotion_audit_interval: int = 512
+    demotion_audit_interval: int = 64
     demotion_audit_max_candidates: int = 8
     demotion_swap_margin: float = 0.005
     outer_quantile_bounds: Tuple[float, float] = (0.05, 0.30)
@@ -216,7 +216,7 @@ def make_hibacaml_config(mode: str = "paper_faithful") -> HiBaCaMLConfig:
                 boundary_shortlist=8,
                 static_support_batch_size=8,
                 neighbor_support_batch_size=8,
-                maintenance_interval=512,
+                maintenance_interval=64,
                 rollout_gradient_mode="trainer",
                 enable_local_maintenance=True,
                 pad_support_batches=True,
@@ -231,7 +231,7 @@ def make_hibacaml_config(mode: str = "paper_faithful") -> HiBaCaMLConfig:
                 precision_update_floor=0.20,
                 enable_demotion_swap_audit=True,
                 allow_unaudited_demotion=False,
-                demotion_audit_interval=512,
+                demotion_audit_interval=64,
                 demotion_audit_max_candidates=8,
                 demotion_swap_margin=0.005,
             ),
