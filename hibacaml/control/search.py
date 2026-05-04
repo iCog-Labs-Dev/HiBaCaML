@@ -32,6 +32,7 @@ class ExactSearchService:
     def __init__(self, cfg: HiBaCaMLConfig, trainer):
         self.cfg = cfg
         self.trainer = trainer
+        self._old_audit_cache: Dict[Tuple[int, int, int], Dict[str, float]] = {}
 
     def make_bundle(self, task_id: int) -> BoundaryBundle:
         """Build the audit bundle: current eval batches + worst-old + mixed-old."""
@@ -335,8 +336,6 @@ class ExactSearchService:
         task = trainer.task(task_id)
         current_first = [0.0 for _ in range(count)]
         current_remaining = [0.0 for _ in range(count)]
-        old_worst = [0.0 for _ in range(count)]
-        old_mix = [0.0 for _ in range(count)]
 
         for idx, batch in enumerate(bundle.current_eval):
             losses = self._evaluate_batch_losses(
@@ -350,32 +349,9 @@ class ExactSearchService:
             for row_idx, loss in enumerate(losses):
                 target[row_idx] += float(loss)
 
-        if bundle.worst_old_eval is not None:
-            prev_task_id, batch = bundle.worst_old_eval
-            old_worst = [
-                float(loss)
-                for loss in self._evaluate_batch_losses(
-                    trainer,
-                    trainer.task(prev_task_id),
-                    batch,
-                    support_list,
-                    refresh_certificates=False,
-                )
-            ]
-
-        if bundle.mixed_old_eval:
-            mix_sums = [0.0 for _ in range(count)]
-            for prev_task_id, batch in bundle.mixed_old_eval:
-                losses = self._evaluate_batch_losses(
-                    trainer,
-                    trainer.task(prev_task_id),
-                    batch,
-                    support_list,
-                    refresh_certificates=False,
-                )
-                for row_idx, loss in enumerate(losses):
-                    mix_sums[row_idx] += float(loss)
-            old_mix = [value / max(len(bundle.mixed_old_eval), 1) for value in mix_sums]
+        old_terms = self._old_audit_terms(trainer, bundle)
+        old_worst_loss = old_terms["old_worst_loss"]
+        old_mix_loss = old_terms["old_mix_loss"]
 
         rows = []
         for idx, support_cols in enumerate(support_list):
@@ -383,21 +359,67 @@ class ExactSearchService:
             total = (
                 current_first[idx]
                 + current_remaining[idx]
-                + self.cfg.exact_search.exact_old_worst_weight * old_worst[idx]
-                + self.cfg.exact_search.exact_old_mix_weight * old_mix[idx]
+                + self.cfg.exact_search.exact_old_worst_weight * old_worst_loss
+                + self.cfg.exact_search.exact_old_mix_weight * old_mix_loss
                 + switch_penalty
             )
             rows.append(
                 {
                     "current_first_loss": float(current_first[idx]),
                     "current_remaining_loss": float(current_remaining[idx]),
-                    "old_worst_loss": float(old_worst[idx]),
-                    "old_mix_loss": float(old_mix[idx]),
+                    "old_worst_loss": float(old_worst_loss),
+                    "old_mix_loss": float(old_mix_loss),
                     "switch_penalty": float(switch_penalty),
                     "total": float(total),
                 }
             )
         return rows
+
+    def _old_audit_terms(self, trainer, bundle: BoundaryBundle) -> Dict[str, float]:
+        """Compute old-task audit losses under their frozen saved supports."""
+        cache_key = (
+            id(trainer),
+            id(bundle),
+            int(getattr(trainer.persistent_state, "params_revision", 0)),
+        )
+        cached = self._old_audit_cache.get(cache_key)
+        if cached is not None:
+            return dict(cached)
+
+        if bundle.worst_old_eval is None and not bundle.mixed_old_eval:
+            return {"old_worst_loss": 0.0, "old_mix_loss": 0.0}
+
+        old_worst_loss = 0.0
+        if bundle.worst_old_eval is not None:
+            prev_task_id, batch = bundle.worst_old_eval
+            snapshot = trainer.persistent_state.task_support_snapshots.get(prev_task_id)
+            prev_support = snapshot.nonshared if snapshot is not None else trainer.current_nonshared
+            old_worst_loss = trainer.evaluate_batch_loss(
+                trainer.task(prev_task_id),
+                batch,
+                prev_support,
+                refresh_certificates=False,
+            )
+
+        mix_losses = []
+        for prev_task_id, batch in bundle.mixed_old_eval:
+            snapshot = trainer.persistent_state.task_support_snapshots.get(prev_task_id)
+            prev_support = snapshot.nonshared if snapshot is not None else trainer.current_nonshared
+            mix_losses.append(
+                trainer.evaluate_batch_loss(
+                    trainer.task(prev_task_id),
+                    batch,
+                    prev_support,
+                    refresh_certificates=False,
+                )
+            )
+
+        terms = {
+            "old_worst_loss": float(old_worst_loss),
+            "old_mix_loss": float(sum(mix_losses) / max(len(mix_losses), 1)),
+        }
+        self._old_audit_cache[cache_key] = dict(terms)
+        return terms
 
     def _evaluate_batch_losses(
         self,
@@ -892,7 +914,7 @@ class ExactSearchService:
         all_objectives: List[Dict[str, float]] = []
         for chunk, real_count in _candidate_chunks(
             all_supports,
-            self.cfg.exact_search.static_support_batch_size,
+            self.cfg.exact_search.neighbor_support_batch_size,
             pad=bool(self.cfg.exact_search.pad_support_batches),
         ):
             all_objectives.extend(
