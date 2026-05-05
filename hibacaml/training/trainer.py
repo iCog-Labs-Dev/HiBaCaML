@@ -16,7 +16,8 @@ import optax
 from fabricpc.core.inference import run_inference
 from fabricpc.graph.graph_net import compute_local_weight_gradients
 from fabricpc.graph.state_initializer import initialize_graph_state
-from hibacaml.config import HiBaCaMLConfig
+from hibacaml.config import V20_SCHEMA_VERSION, HiBaCaMLConfig
+from hibacaml.control.replay_bank import SelectorBank
 from hibacaml.control.search import ExactSearchService
 from hibacaml.control.shells import ShellController
 from hibacaml.control.support import (
@@ -199,6 +200,8 @@ class HiBaCaMLTrainer:
         persistent_state: Optional[PersistentHiBaCaMLState] = None,
         run_logger: Optional[HiBaCaMLRunLogger] = None,
         create_run_logger: bool = True,
+        selector_bank: Optional[SelectorBank] = None,
+        run_id: str = "",
     ):
         self.cfg = cfg
         self.structure = structure
@@ -225,7 +228,21 @@ class HiBaCaMLTrainer:
             self.run_logger.event("trainer_created", mode=cfg.mode)
         if tasks is not None:
             self.register_tasks(tasks)
-        self.exact_search = ExactSearchService(cfg, self)
+        self.run_id = str(run_id)
+        if selector_bank is None:
+            selector_bank = SelectorBank(
+                cfg.selector_state_path(),
+                bank_filename=cfg.reporting.selector_bank_filename,
+                metadata_filename=cfg.reporting.selector_bank_metadata_filename,
+            )
+            selector_bank.load()
+        self.selector_bank = selector_bank
+        self.exact_search = ExactSearchService(
+            cfg,
+            self,
+            selector_bank=self.selector_bank,
+            run_id=self.run_id,
+        )
 
     def register_tasks(self, tasks: Sequence[SplitMnistTask]) -> None:
         for task in tasks:
@@ -258,6 +275,8 @@ class HiBaCaMLTrainer:
             rng_key=self.rng_key,
             persistent_state=ps_clone,
             create_run_logger=False,
+            selector_bank=self.selector_bank,  # rollout clones share the bank for proposal scoring
+            run_id=self.run_id,
         )
         cloned.opt_state = jax.tree_util.tree_map(lambda x: x, self.opt_state)
         cloned.persistent_state.params = cloned.params
@@ -297,6 +316,20 @@ class HiBaCaMLTrainer:
         boundary = tuple(sorted(nonshared))
         self.current_phi = phi
         self.persistent_state.boundary_support[task_id] = boundary
+        # V20.2b: track which columns were dropped vs the previous task's snapshot.
+        if task_id > 0:
+            prev_snapshot = self.persistent_state.task_support_snapshots.get(task_id - 1)
+            if prev_snapshot is not None:
+                dropped = tuple(
+                    c for c in prev_snapshot.nonshared if c not in set(boundary)
+                )
+                self.persistent_state.recently_demoted[task_id] = dropped
+                # Prune entries older than the configured history window.
+                window = max(0, int(self.cfg.exact_search.replay_history_window))
+                cutoff = task_id - window
+                stale = [t for t in self.persistent_state.recently_demoted if t < cutoff]
+                for t in stale:
+                    self.persistent_state.recently_demoted.pop(t, None)
         log_progress(
             f"task={task_id} boundary choice set nonshared={boundary} "
             f"phi=({phi.outer_quantile:.3f},{phi.middle_quantile:.3f},"
@@ -616,7 +649,6 @@ class HiBaCaMLTrainer:
                 cert_due = next_step % self.cfg.cert_refresh_interval == 0
                 maintenance_due = (
                     self.cfg.exact_search.enable_exact_search
-                    and self.cfg.exact_search.enable_local_maintenance
                     and task.task_id > 0
                     and next_step - self.persistent_state.last_maintenance_step.get(task.task_id, 0)
                     >= self.cfg.exact_search.maintenance_interval
@@ -707,7 +739,6 @@ class HiBaCaMLTrainer:
 
                 if (
                     self.cfg.exact_search.enable_exact_search
-                    and self.cfg.exact_search.enable_local_maintenance
                     and task.task_id > 0
                     and self.persistent_state.global_step - self.persistent_state.last_maintenance_step.get(task.task_id, 0)
                     >= self.cfg.exact_search.maintenance_interval
@@ -723,6 +754,15 @@ class HiBaCaMLTrainer:
             )
 
         self.freeze_task_support(task.task_id)
+        if self.cfg.reporting.write_selector_state:
+            self.selector_bank.save()
+            if self.run_logger is not None:
+                self.run_logger.event(
+                    "selector_bank_saved",
+                    task_id=task.task_id,
+                    row_count=len(self.selector_bank),
+                    path=str(self.selector_bank.bank_path),
+                )
         metrics = self.evaluate_task(task.task_id)
         summary = TaskSummary(
             task_id=task.task_id,
@@ -916,7 +956,7 @@ class HiBaCaMLTrainer:
         return results
 
     def export_task_artifacts(self, task_id: int, root: Optional[str | Path] = None) -> Path:
-        run_root = Path(root) if root is not None else self.cfg.output_root_path() / f"task_{task_id}"
+        run_root = Path(root) if root is not None else self.cfg.experiment_root_path() / f"task_{task_id}"
         log_progress(f"export task={task_id} start root={run_root}", component="report")
         if self.run_logger is not None:
             self.run_logger.event("export_start", task_id=task_id, root=str(run_root))
@@ -938,6 +978,8 @@ class HiBaCaMLTrainer:
             "controller_tables": self.persistent_state.controller_tables,
             "local_swap_tables": self.persistent_state.local_swap_tables,
             "demotion_swap_tables": self.persistent_state.demotion_swap_tables,
+            "replay_proposals": self.persistent_state.replay_proposals,
+            "recently_demoted": self.persistent_state.recently_demoted,
             "certificates": self.persistent_state.certificates,
             "task_support_snapshots": self.persistent_state.task_support_snapshots,
             "support_sequence": {
@@ -954,13 +996,17 @@ class HiBaCaMLTrainer:
             "timing_summaries": self.persistent_state.timing_summaries,
             "support_diagnostics": self._support_diagnostics(),
             "composer_diagnostics": self.persistent_state.composer_diagnostics,
+            "selector_bank_summary": self.selector_bank.summary(),
+            "run_id": self.run_id,
+            "schema_version": V20_SCHEMA_VERSION,
         }
 
     def save_checkpoint(self, task_id: int, root: Optional[str | Path] = None) -> Path:
-        checkpoint_root = Path(root) if root is not None else self.cfg.output_root_path()
+        checkpoint_root = Path(root) if root is not None else self.cfg.experiment_root_path()
         checkpoint_root.mkdir(parents=True, exist_ok=True)
         path = checkpoint_root / self.cfg.reporting.checkpoint_filename
         payload = {
+            "schema_version": V20_SCHEMA_VERSION,
             "task_id": task_id,
             "persistent_state": self.persistent_state,
             "params": self.params,
@@ -973,19 +1019,26 @@ class HiBaCaMLTrainer:
         return path
 
     def load_checkpoint(self, path: str | Path) -> None:
-        with Path(path).open("rb") as fh:
-            payload = pickle.load(fh)
+        try:
+            with Path(path).open("rb") as fh:
+                payload = pickle.load(fh)
+        except (
+            AttributeError,
+            ModuleNotFoundError,
+            ImportError,
+            pickle.UnpicklingError,
+        ) as exc:
+            raise ValueError(
+                "Checkpoint could not be loaded for V20 schema validation; "
+                "V18 checkpoints are not supported by V20.2b. Start a fresh run."
+            ) from exc
+        schema = payload.get("schema_version") if isinstance(payload, dict) else None
+        if schema != V20_SCHEMA_VERSION:
+            raise ValueError(
+                f"Checkpoint schema {schema!r} is not {V20_SCHEMA_VERSION!r}; "
+                "V18 checkpoints are not supported by V20.2b. Start a fresh run."
+            )
         self.persistent_state = payload["persistent_state"]
-        if hasattr(self.persistent_state, "prescreen_tables"):
-            delattr(self.persistent_state, "prescreen_tables")
-        if not hasattr(self.persistent_state, "support_posterior_tables"):
-            self.persistent_state.support_posterior_tables = {}
-        if not hasattr(self.persistent_state, "reserve_recruitment_tables"):
-            self.persistent_state.reserve_recruitment_tables = {}
-        if not hasattr(self.persistent_state, "demotion_swap_tables"):
-            self.persistent_state.demotion_swap_tables = {}
-        if not hasattr(self.persistent_state, "last_demotion_audit_step"):
-            self.persistent_state.last_demotion_audit_step = {}
         self.params = payload["params"]
         self.opt_state = payload["opt_state"]
         self.persistent_state.params = self.params

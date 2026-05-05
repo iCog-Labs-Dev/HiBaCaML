@@ -68,19 +68,6 @@ class SupportSearchRow:
 
 
 @dataclass(frozen=True)
-class SupportPrescreenRow:
-    """Legacy checkpoint shim for pre-pruned support prescreen rows."""
-
-    task_id: int
-    nonshared: Tuple[int, ...]
-    prescreen_total: float
-    current_loss: float
-    switch_penalty: float
-    prescreen_rank: int = -1
-    selected_for_full_audit: bool = False
-
-
-@dataclass(frozen=True)
 class ControllerSearchRow:
     """Rollout-scored support/controller row."""
 
@@ -175,6 +162,36 @@ class DemotionSwapAuditRow:
 
 
 @dataclass(frozen=True)
+class ReplayProposalRow:
+    """V20.2b reselection audit row.
+
+    Captures the three streams considered at every support-acceptance decision
+    (boundary or local one-swap): the exact-search winner, the local one-hop
+    refinement baseline, and the best replay-bank candidate. Plus the penalised
+    scores, overlap diagnostics, and which stream was finally accepted.
+    """
+
+    task_id: int
+    global_step: int
+    provenance: str  # "boundary" | "local_swap"
+    original_nonshared: Tuple[int, ...]
+    local_baseline_nonshared: Tuple[int, ...]
+    replay_candidate_nonshared: Tuple[int, ...]
+    original_total: float
+    local_total: float
+    replay_total: float
+    original_penalised: float
+    local_penalised: float
+    replay_penalised: float
+    overlap_jaccard: float
+    jump_size: int
+    history_intersection: int
+    accepted_source: str  # "original" | "local" | "replay"
+    accepted_nonshared: Tuple[int, ...]
+    reason: str
+
+
+@dataclass(frozen=True)
 class TaskSummary:
     """Per-task summary emitted after training/evaluation."""
 
@@ -229,6 +246,8 @@ class PersistentHiBaCaMLState:
     controller_tables: Dict[int, List[ControllerSearchRow]] = field(default_factory=dict)
     local_swap_tables: Dict[int, List[LocalSwapRow]] = field(default_factory=dict)
     demotion_swap_tables: Dict[int, List[DemotionSwapAuditRow]] = field(default_factory=dict)
+    replay_proposals: Dict[int, List[ReplayProposalRow]] = field(default_factory=dict)
+    recently_demoted: Dict[int, Tuple[int, ...]] = field(default_factory=dict)
     latest_local_swap: Optional[LocalSwapRow] = None
     last_demotion_audit_step: Dict[int, int] = field(default_factory=dict)
     composer_diagnostics: Dict[int, Dict[str, float]] = field(default_factory=dict)

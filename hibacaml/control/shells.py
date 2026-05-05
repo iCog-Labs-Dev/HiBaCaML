@@ -243,30 +243,8 @@ class ShellController:
                             outer_idx,
                         )
 
-                if self.cfg.exact_search.allow_unaudited_demotion:
-                    for inner_shell, outer_shell in (
-                        ("kernel", "tier1"),
-                        ("tier1", "tier2"),
-                        ("tier2", "tier3"),
-                    ):
-                        inner_specificity = metrics[inner_shell]["specificity"]
-                        if inner_specificity.size == 0:
-                            continue
-                        inner_idx = int(jnp.argmax(inner_specificity))
-                        if float(inner_specificity[inner_idx]) <= phi.demotion_min_role_gain:
-                            continue
-                        outer_scores = metrics[outer_shell]["score"]
-                        if outer_scores.size == 0:
-                            continue
-                        outer_idx = int(jnp.argmin(outer_scores))
-                        updated_node = self._swap_units(
-                            updated_node,
-                            inner_shell,
-                            inner_idx,
-                            outer_shell,
-                            outer_idx,
-                        )
-
+                # V20.2b: demotion swaps go through the audited
+                # demotion_swap_audit path; no unaudited demotion here.
                 updated_nodes[node_name] = updated_node
 
         params = params._replace(nodes=updated_nodes)

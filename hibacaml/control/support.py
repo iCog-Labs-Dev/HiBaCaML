@@ -11,10 +11,12 @@ from hibacaml.config import HiBaCaMLConfig
 
 
 def candidate_nonshared_pool(cfg: HiBaCaMLConfig) -> Tuple[int, ...]:
-    """Nonshared pool for ordinary support search."""
-    if cfg.exact_search.support_candidate_policy in {"adaptive_only", "adaptive_reserve_gated"}:
-        return cfg.column_pool.adaptive_indices
-    return cfg.column_pool.adaptive_indices + cfg.column_pool.reserve_indices
+    """Nonshared pool for ordinary support search.
+
+    V20.2b uses adaptive-only enumeration; reserves enter via the explicit
+    reserve-recruitment path in `enumerate_reserve_recruitment_supports`.
+    """
+    return cfg.column_pool.adaptive_indices
 
 
 def default_nonshared_support(cfg: HiBaCaMLConfig) -> Tuple[int, ...]:

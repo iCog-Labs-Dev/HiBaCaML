@@ -1,6 +1,7 @@
 """Configuration objects and defaults for HiBaCaML."""
 
 from hibacaml.config.defaults import (
+    V20_SCHEMA_VERSION,
     ColumnPoolConfig,
     ComposerConfig,
     ExactSearchConfig,
@@ -12,6 +13,7 @@ from hibacaml.config.defaults import (
 )
 
 __all__ = [
+    "V20_SCHEMA_VERSION",
     "ColumnPoolConfig",
     "ComposerConfig",
     "ExactSearchConfig",

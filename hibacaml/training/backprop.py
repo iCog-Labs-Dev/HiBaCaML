@@ -59,6 +59,8 @@ class HiBaCaMLBackpropRunner(HiBaCaMLTrainer):
             rng_key=self.rng_key,
             persistent_state=ps_clone,
             create_run_logger=False,
+            selector_bank=self.selector_bank,
+            run_id=self.run_id,
         )
         cloned.opt_state = jax.tree_util.tree_map(lambda x: x, self.opt_state)
         cloned.persistent_state.params = cloned.params

@@ -35,7 +35,6 @@ def print_pre_run_review(
     print(f"    infer_steps       : {cfg.infer_steps}")
     print(f"    eta_infer         : {cfg.eta_infer}")
     print(f"    shortlist         : {cfg.exact_search.boundary_shortlist}")
-    print(f"    support policy    : {cfg.exact_search.support_candidate_policy}")
     print(f"    rollout steps     : {cfg.exact_search.boundary_rollout_steps}")
     print(f"    rollout gradients : {cfg.exact_search.rollout_gradient_mode}")
     print(
@@ -57,7 +56,16 @@ def print_pre_run_review(
     print(f"    optimizer_lr      : {cfg.optimizer_lr}")
     print(f"    weight_decay      : {cfg.weight_decay}")
     print(f"    seed              : {cfg.seed}")
-    print(f"    output_root       : {cfg.reporting.output_root}")
+    print(f"    experiment_root   : {cfg.reporting.experiment_root}")
+    print(f"    selector_state    : {cfg.reporting.selector_state_root}")
+    print(
+        "    reselection       : "
+        f"replay_topk={cfg.exact_search.replay_topk}, "
+        f"overlap_floor={cfg.exact_search.replay_overlap_floor}, "
+        f"alpha={cfg.exact_search.replay_overlap_penalty_alpha}, "
+        f"beta={cfg.exact_search.replay_jump_penalty_beta}, "
+        f"gamma={cfg.exact_search.replay_history_penalty_gamma}"
+    )
 
     print("\n[2] Architecture")
     cp = cfg.column_pool
@@ -89,8 +97,7 @@ def print_pre_run_review(
     print("    support search     : exact enumeration -> shortlist -> controller rollout -> one-swap maintenance")
     print(
         "    runtime controls   : "
-        f"local_maintenance={cfg.exact_search.enable_local_maintenance}, "
-        f"pad_support_batches={cfg.exact_search.pad_support_batches}"
+        "local_maintenance=on, pad_support_batches=on"
     )
     print(
         "    paper controls     : "
@@ -110,7 +117,7 @@ def print_pre_run_review(
     print("\n[5] Implementation Notes")
     print("    hierarchy targets : deterministic quadrant-sensitive task-local targets")
     print("    controller search : bounded local phi neighborhood around the current controller")
-    print("    artifacts         : support tables and metrics written to output_root")
+    print("    artifacts         : per-run tables and metrics written under experiment_root")
 
     print(f"\n{sep}")
     if confirm:

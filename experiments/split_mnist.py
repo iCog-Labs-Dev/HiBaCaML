@@ -23,12 +23,13 @@ LEARNING = "backprop"                  # "pc" or "backprop"
 CONFIRM = False                        # False is best for non-interactive runs
 CPU = False                            # True => force JAX CPU backend
 PLOTS_DIR = None                       # e.g. "/kaggle/working/plots"
-OUTPUT_ROOT = None                     # e.g. "/kaggle/working/hibacaml_runs"
-RESUME_CHECKPOINT = None               # e.g. "/kaggle/working/.../checkpoint.pkl"
+EXPERIMENT_ROOT = None                 # e.g. "/kaggle/working/hibacaml/experiments"
+SELECTOR_STATE_ROOT = None             # e.g. "/kaggle/working/hibacaml/selector_state"
+RUN_ID = None                          # auto-generated from timestamp+seed if None
 
 # Memory-related inputs
 LOW_MEMORY_BATCH_SIZE_CAP = None       # e.g. 64, or None to disable
-BATCH_SIZE = 512                        # direct batch_size override, e.g. 64
+BATCH_SIZE = 768                        # direct batch_size override, e.g. 64
 
 # Optional: use your patched package written under /kaggle/working
 PREFER_LOCAL_WORKING_COPY = True
@@ -139,7 +140,7 @@ def _write_csv(path: Path, rows: Sequence[Dict[str, object]]) -> None:
 # ------------------------------------------------------------
 # Trainer construction
 # ------------------------------------------------------------
-def build_trainer(cfg, tasks, learning: str):
+def build_trainer(cfg, tasks, learning: str, *, run_id: str = ""):
     """Construct the HiBaCaML trainer for one learning mode."""
     inference = InferenceSGD(eta_infer=cfg.eta_infer, infer_steps=cfg.infer_steps)
     graph_state_initializer = FeedforwardStateInit() if learning == "backprop" else None
@@ -154,7 +155,7 @@ def build_trainer(cfg, tasks, learning: str):
     log_progress("parameter initialization complete", component="runner")
 
     trainer_cls = HiBaCaMLBackpropRunner if learning == "backprop" else HiBaCaMLTrainer
-    trainer = trainer_cls(cfg, structure, params, tasks=tasks)
+    trainer = trainer_cls(cfg, structure, params, tasks=tasks, run_id=run_id)
     log_progress(f"trainer constructed class={type(trainer).__name__}", component="runner")
     return structure, trainer
 
@@ -256,21 +257,19 @@ def run_experiment(
     cfg,
     tasks,
     learning: str,
-    output_root: Path,
+    run_root: Path,
     *,
-    resume_checkpoint: str | None = None,
+    run_id: str = "",
 ) -> dict:
     """Run the HiBaCaML experiment for one learning mode."""
-    cfg = dataclasses.replace(
+    trainer_cfg = dataclasses.replace(
         cfg,
-        reporting=dataclasses.replace(cfg.reporting, output_root=str(output_root)),
+        reporting=dataclasses.replace(
+            cfg.reporting,
+            experiment_root=str(run_root),
+        ),
     )
-
-    _, trainer = build_trainer(cfg, tasks, learning)
-
-    if resume_checkpoint:
-        trainer.load_checkpoint(resume_checkpoint)
-        log_progress(f"resumed checkpoint: {resume_checkpoint}", component="runner")
+    _, trainer = build_trainer(trainer_cfg, tasks, learning, run_id=run_id)
 
     accuracy_matrix: Dict[int, Dict[int, float]] = {}
     task_summaries: List[Dict[str, object]] = []
@@ -300,7 +299,7 @@ def run_experiment(
         )
 
         artifact_root = trainer.export_task_artifacts(task.task_id)
-        checkpoint_root = output_root / f"task_{task.task_id}" / "checkpoints"
+        checkpoint_root = run_root / f"task_{task.task_id}" / "checkpoints"
         checkpoint_path = trainer.save_checkpoint(task.task_id, root=checkpoint_root)
 
         artifact_roots[task.task_id] = str(artifact_root)
@@ -330,7 +329,7 @@ def run_experiment(
         task_summaries,
     )
 
-    export_run_artifacts(snapshot, output_root / "final")
+    export_run_artifacts(snapshot, run_root / "final")
 
     results = {
         "learning": learning,
@@ -346,8 +345,8 @@ def run_experiment(
         "checkpoint_paths": checkpoint_paths,
     }
 
-    _write_json(output_root / "run_summary.json", results)
-    _write_csv(output_root / "task_summary.csv", task_metric_rows)
+    _write_json(run_root / "run_summary.json", results)
+    _write_csv(run_root / "task_summary.csv", task_metric_rows)
 
     return results
 
@@ -369,7 +368,8 @@ def apply_notebook_overrides(
     train_batches_limit: int | None = TRAIN_BATCHES_LIMIT,
     test_batches_limit: int | None = TEST_BATCHES_LIMIT,
     exact_search: bool | None = EXACT_SEARCH,
-    output_root: str | None = OUTPUT_ROOT,
+    experiment_root: str | None = EXPERIMENT_ROOT,
+    selector_state_root: str | None = SELECTOR_STATE_ROOT,
     low_memory_batch_size_cap: int | None = LOW_MEMORY_BATCH_SIZE_CAP,
     batch_size: int | None = BATCH_SIZE,
 ):
@@ -449,10 +449,16 @@ def apply_notebook_overrides(
     if test_batches_limit is not None:
         cfg = dataclasses.replace(cfg, test_batches_limit=test_batches_limit)
 
-    if output_root is not None:
+    if experiment_root is not None:
         cfg = dataclasses.replace(
             cfg,
-            reporting=dataclasses.replace(cfg.reporting, output_root=output_root),
+            reporting=dataclasses.replace(cfg.reporting, experiment_root=experiment_root),
+        )
+
+    if selector_state_root is not None:
+        cfg = dataclasses.replace(
+            cfg,
+            reporting=dataclasses.replace(cfg.reporting, selector_state_root=selector_state_root),
         )
 
     if low_memory_batch_size_cap is not None:
@@ -505,8 +511,9 @@ def run_experiment_notebook(
     learning: str = LEARNING,
     confirm: bool = CONFIRM,
     plots_dir: str | None = PLOTS_DIR,
-    output_root: str | None = OUTPUT_ROOT,
-    resume_checkpoint: str | None = RESUME_CHECKPOINT,
+    experiment_root: str | None = EXPERIMENT_ROOT,
+    selector_state_root: str | None = SELECTOR_STATE_ROOT,
+    run_id: str | None = RUN_ID,
     shortlist: int | None = SHORTLIST,
     epochs: int | None = EPOCHS,
     infer_steps: int | None = INFER_STEPS,
@@ -523,10 +530,8 @@ def run_experiment_notebook(
 ):
     if learning not in ("pc", "backprop"):
         raise ValueError("learning must be 'pc' or 'backprop'")
-    if mode not in ("paper_faithful", "full", "smoke"):
-        raise ValueError(
-            "mode must be one of: 'paper_faithful', 'full', 'smoke'"
-        )
+    if mode not in ("paper_faithful", "smoke"):
+        raise ValueError("mode must be 'paper_faithful' or 'smoke'")
 
     print("JAX backend:", jax.default_backend(), flush=True)
     print("JAX devices:", jax.devices(), flush=True)
@@ -546,7 +551,8 @@ def run_experiment_notebook(
         train_batches_limit=train_batches_limit,
         test_batches_limit=test_batches_limit,
         exact_search=exact_search,
-        output_root=output_root,
+        experiment_root=experiment_root,
+        selector_state_root=selector_state_root,
         low_memory_batch_size_cap=low_memory_batch_size_cap,
         batch_size=batch_size,
     )
@@ -575,7 +581,11 @@ def run_experiment_notebook(
     del review_structure
     gc.collect()
 
-    run_output_root = Path(cfg.reporting.output_root)
+    if run_id is None:
+        from datetime import datetime, timezone
+        run_id = f"{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}_seed{cfg.seed}"
+    run_output_root = cfg.experiment_root_path() / run_id
+    run_output_root.mkdir(parents=True, exist_ok=True)
     run_plots_dir = Path(plots_dir) if plots_dir else run_output_root / "plots"
 
     results = run_experiment(
@@ -583,19 +593,24 @@ def run_experiment_notebook(
         tasks,
         learning,
         run_output_root,
-        resume_checkpoint=resume_checkpoint,
+        run_id=run_id,
     )
     generate_plots(results, run_plots_dir)
 
     print("\nRun complete.")
+    print(f"  Run ID  : {run_id}")
+    print(f"  Run dir : {run_output_root}")
     print(f"  Summary : {run_output_root / 'run_summary.json'}")
     print(f"  Table   : {run_output_root / 'task_summary.csv'}")
     print(f"  Plots   : {run_plots_dir}")
+    print(f"  Selector: {cfg.selector_state_path()}")
 
     return {
         "cfg": cfg,
         "results": results,
-        "output_root": run_output_root,
+        "run_id": run_id,
+        "run_output_root": run_output_root,
+        "selector_state_root": cfg.selector_state_path(),
         "plots_dir": run_plots_dir,
         "summary_path": run_output_root / "run_summary.json",
         "table_path": run_output_root / "task_summary.csv",
@@ -612,8 +627,9 @@ if __name__ == "__main__":
         learning=LEARNING,
         confirm=CONFIRM,
         plots_dir=PLOTS_DIR,
-        output_root=OUTPUT_ROOT,
-        resume_checkpoint=RESUME_CHECKPOINT,
+        experiment_root=EXPERIMENT_ROOT,
+        selector_state_root=SELECTOR_STATE_ROOT,
+        run_id=RUN_ID,
         shortlist=SHORTLIST,
         epochs=EPOCHS,
         infer_steps=INFER_STEPS,

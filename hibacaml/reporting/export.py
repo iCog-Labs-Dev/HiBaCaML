@@ -70,7 +70,7 @@ def _write_csv(path: Path, rows: Iterable[Dict[str, Any]]) -> None:
 
 
 def export_run_artifacts(snapshot: Dict[str, object], root: str | Path) -> None:
-    """Export the HiBaCaML artifact bundle."""
+    """Export the HiBaCaML artifact bundle (V20.2b)."""
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
 
@@ -80,6 +80,8 @@ def export_run_artifacts(snapshot: Dict[str, object], root: str | Path) -> None:
             "cfg": snapshot["cfg"],
             "global_step": snapshot["global_step"],
             "params_revision": snapshot["params_revision"],
+            "schema_version": snapshot.get("schema_version"),
+            "run_id": snapshot.get("run_id"),
         },
     )
     _write_json(root / "task_evaluations.json", snapshot["evaluations"])
@@ -99,12 +101,16 @@ def export_run_artifacts(snapshot: Dict[str, object], root: str | Path) -> None:
     _write_json(root / "support_posterior.json", snapshot.get("support_posterior_tables", {}))
     _write_json(root / "reserve_recruitment.json", snapshot.get("reserve_recruitment_tables", {}))
     _write_json(root / "task_support_snapshots.json", snapshot["task_support_snapshots"])
+    _write_json(root / "replay_proposals.json", snapshot.get("replay_proposals", {}))
+    _write_json(root / "recently_demoted.json", snapshot.get("recently_demoted", {}))
+    _write_json(root / "selector_bank_summary.json", snapshot.get("selector_bank_summary", {}))
     _write_csv(root / "support_posterior.csv", _rows_from_mapping(snapshot.get("support_posterior_tables", {})))
     _write_csv(root / "reserve_recruitment.csv", _rows_from_mapping(snapshot.get("reserve_recruitment_tables", {})))
     _write_csv(root / "exact_support_search.csv", _rows_from_mapping(snapshot["support_tables"]))
     _write_csv(root / "controller_search.csv", _rows_from_mapping(snapshot["controller_tables"]))
     _write_csv(root / "local_swap_audit.csv", _rows_from_mapping(snapshot["local_swap_tables"]))
     _write_csv(root / "demotion_swap_audit.csv", _rows_from_mapping(snapshot.get("demotion_swap_tables", {})))
+    _write_csv(root / "replay_proposals.csv", _rows_from_mapping(snapshot.get("replay_proposals", {})))
     _write_csv(root / "column_certificates.csv", _rows_from_mapping(snapshot["certificates"]))
     _write_csv(root / "composer_diagnostics.csv", _rows_from_mapping(snapshot.get("composer_diagnostics", {})))
     _write_csv(

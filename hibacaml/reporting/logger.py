@@ -34,9 +34,9 @@ def rss_mb() -> float | None:
 class HiBaCaMLRunLogger:
     """Small JSONL/JSON/CSV logger for HiBaCaML experiments."""
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, root: Optional[Path] = None):
         self.cfg = cfg
-        self.root = Path(cfg.reporting.output_root)
+        self.root = Path(root) if root is not None else Path(cfg.reporting.experiment_root)
         self.root.mkdir(parents=True, exist_ok=True)
         self.started_at = time.time()
         self._lock = threading.Lock()
