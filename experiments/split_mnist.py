@@ -82,8 +82,8 @@ if "MPLCONFIGDIR" not in os.environ:
 # Project imports
 # ------------------------------------------------------------
 from fabricpc.core.inference import InferenceSGD
-from fabricpc.graph import initialize_params
-from fabricpc.graph.state_initializer import FeedforwardStateInit
+from fabricpc.graph_initialization import initialize_params
+from fabricpc.graph_initialization.state_initializer import FeedforwardStateInit
 from hibacaml import (
     HiBaCaMLBackpropRunner,
     HiBaCaMLTrainer,

@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from typing import Dict, List
 
-from fabricpc.builder import Edge, GraphNamespace, TaskMap, graph
+from fabricpc.core.topology import Edge, GraphNamespace
+from fabricpc.graph_assembly import graph, TaskMap
 from fabricpc.nodes import IdentityNode, Linear
 from fabricpc.core.activations import IdentityActivation, SoftmaxActivation, TanhActivation
 from fabricpc.core.inference import InferenceBase
-from fabricpc.graph.state_initializer import NodeDistributionStateInit, StateInitBase
+from fabricpc.graph_initialization.state_initializer import NodeDistributionStateInit, StateInitBase
 from hibacaml.config import HiBaCaMLConfig
 from hibacaml.nodes import (
     ComposerStage2Node,

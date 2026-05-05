@@ -14,8 +14,8 @@ import jax.numpy as jnp
 import optax
 
 from fabricpc.core.inference import run_inference
-from fabricpc.graph.graph_net import compute_local_weight_gradients
-from fabricpc.graph.state_initializer import initialize_graph_state
+from fabricpc.core.learning import compute_local_weight_gradients
+from fabricpc.graph_initialization.state_initializer import initialize_graph_state
 from hibacaml.config import V20_SCHEMA_VERSION, HiBaCaMLConfig
 from hibacaml.control.replay_bank import SelectorBank
 from hibacaml.control.search import ExactSearchService

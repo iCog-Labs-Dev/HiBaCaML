@@ -8,7 +8,7 @@ from typing import Dict, List, Sequence
 import jax
 import jax.numpy as jnp
 
-from fabricpc.graph.state_initializer import FeedforwardStateInit, initialize_graph_state
+from fabricpc.graph_initialization.state_initializer import FeedforwardStateInit, initialize_graph_state
 from hibacaml.training.trainer import (
     HiBaCaMLTrainer,
     _composer_details_from_runtime,
