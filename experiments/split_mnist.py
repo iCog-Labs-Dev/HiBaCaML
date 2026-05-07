@@ -22,17 +22,18 @@ EXACT_SEARCH = None                    # True / False / None; leave None for con
 LEARNING = "backprop"                  # "pc" or "backprop"
 CONFIRM = False                        # False is best for non-interactive runs
 CPU = False                            # True => force JAX CPU backend
-PLOTS_DIR = None                       # e.g. "/kaggle/working/plots"
-EXPERIMENT_ROOT = None                 # e.g. "/kaggle/working/hibacaml/experiments"
-SELECTOR_STATE_ROOT = None             # e.g. "/kaggle/working/hibacaml/selector_state"
-RUN_ID = None                          # auto-generated from timestamp+seed if None
+PLOTS_DIR = None                       
+EXPERIMENT_ROOT = None               
+SELECTOR_STATE_ROOT = None             
+RUN_ID = None                         
+
+# Resume controls
+RESUME_FROM_TASK = None                # e.g. 4 — next task to train; loads task_(N-1)/checkpoints/...
+RESUME_RUN_ID = None                   # optional explicit run_id; auto-detected if None
 
 # Memory-related inputs
 LOW_MEMORY_BATCH_SIZE_CAP = None       # e.g. 64, or None to disable
 BATCH_SIZE = 768                        # direct batch_size override, e.g. 64
-
-# Optional: use your patched package written under /kaggle/working
-PREFER_LOCAL_WORKING_COPY = True
 
 
 # ------------------------------------------------------------
@@ -47,11 +48,6 @@ import os
 import sys
 from pathlib import Path
 from typing import Dict, List, Sequence
-
-if PREFER_LOCAL_WORKING_COPY:
-    working_root = "/kaggle/working"
-    if working_root not in sys.path:
-        sys.path.insert(0, working_root)
 
 if "." not in sys.path:
     sys.path.insert(0, ".")
@@ -135,6 +131,62 @@ def _write_csv(path: Path, rows: Sequence[Dict[str, object]]) -> None:
         writer.writeheader()
         for row in rows:
             writer.writerow({key: _jsonable(row.get(key)) for key in fieldnames})
+
+
+# ------------------------------------------------------------
+# Resume helpers
+# ------------------------------------------------------------
+def _load_task_evaluations(run_root: Path, task_id: int) -> Dict[int, Dict[str, float]]:
+    path = run_root / f"task_{task_id}" / "task_evaluations.json"
+    raw = json.loads(path.read_text())
+    return {int(k): v for k, v in raw.items()}
+
+
+def _reconstruct_task_summary(task, evaluations: Dict[int, Dict[str, float]], snapshot) -> Dict[str, object]:
+    own = evaluations[task.task_id]
+    return {
+        "task_id": task.task_id,
+        "classes": list(task.classes),
+        "support_indices": list(snapshot.full_support),
+        "accuracy": own["accuracy"],
+        "mean_loss": own["mean_loss"],
+        "best_old_accuracy": own["best_old_accuracy"],
+        "support_entropy": own["support_entropy"],
+    }
+
+
+def _infer_resume_run_id(experiment_root: Path, prev_task_id: int, checkpoint_filename: str) -> str:
+    if not experiment_root.is_dir():
+        raise FileNotFoundError(f"experiment_root not found: {experiment_root}")
+    candidates = [
+        d for d in experiment_root.iterdir()
+        if d.is_dir() and (d / f"task_{prev_task_id}" / "checkpoints" / checkpoint_filename).is_file()
+    ]
+    if not candidates:
+        raise FileNotFoundError(
+            f"No run directory under {experiment_root} contains "
+            f"task_{prev_task_id}/checkpoints/{checkpoint_filename}"
+        )
+    if len(candidates) > 1:
+        candidates.sort(key=lambda d: d.stat().st_mtime, reverse=True)
+        log_progress(
+            f"multiple resume candidates found; picking most recent: {candidates[0].name}",
+            component="runner",
+        )
+    return candidates[0].name
+
+
+def _resolve_resume_checkpoint(cfg, resume_from_task: int, explicit_run_id: str | None) -> tuple[str, Path]:
+    prev_task_id = resume_from_task - 1
+    if prev_task_id < 0:
+        raise ValueError(f"resume_from_task must be >= 1, got {resume_from_task}")
+    experiment_root = cfg.experiment_root_path()
+    checkpoint_filename = cfg.reporting.checkpoint_filename
+    run_id = explicit_run_id or _infer_resume_run_id(experiment_root, prev_task_id, checkpoint_filename)
+    checkpoint_path = experiment_root / run_id / f"task_{prev_task_id}" / "checkpoints" / checkpoint_filename
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"checkpoint not found: {checkpoint_path}")
+    return run_id, checkpoint_path
 
 
 # ------------------------------------------------------------
@@ -260,6 +312,7 @@ def run_experiment(
     run_root: Path,
     *,
     run_id: str = "",
+    resume_from: str | Path | None = None,
 ) -> dict:
     """Run the HiBaCaML experiment for one learning mode."""
     trainer_cfg = dataclasses.replace(
@@ -275,8 +328,52 @@ def run_experiment(
     task_summaries: List[Dict[str, object]] = []
     artifact_roots: Dict[int, str] = {}
     checkpoint_paths: Dict[int, str] = {}
+    completed_ids: set = set()
+
+    if resume_from is not None:
+        trainer.load_checkpoint(resume_from)
+        snapshots = trainer.persistent_state.task_support_snapshots
+        completed_ids = set(snapshots.keys())
+        if snapshots:
+            # load_checkpoint restores persistent_state/params/opt_state but leaves
+            # current_phi/current_nonshared at their constructor defaults. The next
+            # boundary_search builds phi_candidates() around trainer.current_phi, so
+            # without this the resumed controller would search a different neighborhood
+            # than an uninterrupted run.
+            last = snapshots[max(snapshots)]
+            trainer.current_phi = last.phi
+            trainer.current_nonshared = tuple(last.nonshared)
+            log_progress(
+                f"restored controller state from task={max(snapshots)} "
+                f"nonshared={trainer.current_nonshared}",
+                component="runner",
+            )
+        log_progress(
+            f"resumed from {resume_from}; completed tasks={sorted(completed_ids)}",
+            component="runner",
+        )
+        for task in tasks:
+            if task.task_id not in completed_ids:
+                continue
+            evals = _load_task_evaluations(run_root, task.task_id)
+            accuracy_matrix[task.task_id] = {
+                eval_id: metrics["accuracy"] for eval_id, metrics in evals.items()
+            }
+            task_summaries.append(
+                _reconstruct_task_summary(
+                    task,
+                    evals,
+                    trainer.persistent_state.task_support_snapshots[task.task_id],
+                )
+            )
+            artifact_roots[task.task_id] = str(run_root / f"task_{task.task_id}")
+            checkpoint_paths[task.task_id] = str(
+                run_root / f"task_{task.task_id}" / "checkpoints" / cfg.reporting.checkpoint_filename
+            )
 
     for task in tasks:
+        if task.task_id in completed_ids:
+            continue
         log_progress(f"task={task.task_id} train start", component="runner")
         summary = trainer.train_task(task)
         eval_results = trainer.evaluate_all_saved_supports()
@@ -527,6 +624,8 @@ def run_experiment_notebook(
     exact_search: bool | None = EXACT_SEARCH,
     low_memory_batch_size_cap: int | None = LOW_MEMORY_BATCH_SIZE_CAP,
     batch_size: int | None = BATCH_SIZE,
+    resume_from_task: int | None = RESUME_FROM_TASK,
+    resume_run_id: str | None = RESUME_RUN_ID,
 ):
     if learning not in ("pc", "backprop"):
         raise ValueError("learning must be 'pc' or 'backprop'")
@@ -581,7 +680,17 @@ def run_experiment_notebook(
     del review_structure
     gc.collect()
 
-    if run_id is None:
+    resume_checkpoint_path: Path | None = None
+    if resume_from_task is not None:
+        resolved_run_id, resume_checkpoint_path = _resolve_resume_checkpoint(
+            cfg, resume_from_task, resume_run_id
+        )
+        run_id = resolved_run_id
+        log_progress(
+            f"resume mode: run_id={run_id} checkpoint={resume_checkpoint_path}",
+            component="runner",
+        )
+    elif run_id is None:
         from datetime import datetime, timezone
         run_id = f"{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}_seed{cfg.seed}"
     run_output_root = cfg.experiment_root_path() / run_id
@@ -594,6 +703,7 @@ def run_experiment_notebook(
         learning,
         run_output_root,
         run_id=run_id,
+        resume_from=resume_checkpoint_path,
     )
     generate_plots(results, run_plots_dir)
 
@@ -643,4 +753,6 @@ if __name__ == "__main__":
         exact_search=EXACT_SEARCH,
         low_memory_batch_size_cap=LOW_MEMORY_BATCH_SIZE_CAP,
         batch_size=BATCH_SIZE,
+        resume_from_task=RESUME_FROM_TASK,
+        resume_run_id=RESUME_RUN_ID,
     )
