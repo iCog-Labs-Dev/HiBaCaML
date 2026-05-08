@@ -1,12 +1,6 @@
 # HiBaCaML Implementation Details
 
-This document maps the HiBaCaML/ColBa ideas described in `hibacaml_agi26.pdf`
-and `HiBaCaML_v2.pdf` to the implementation under `hibacaml/` and the
-Split-MNIST experiment runner in `experiments/split_mnist.py`.
-
-Scope note: this analysis intentionally does not inspect or rely on `@runs/`
-or any experiment-output artifacts. It is based only on the papers, source code,
-and the experiment script.
+This document maps the HiBaCaML/ColBa ideas described in the papers to the implementation under `hibacaml/` and the Split-MNIST experiment runner in `experiments/split_mnist.py`.
 
 ## 1. Executive Mapping
 
@@ -35,7 +29,7 @@ while preserving the same controller and column semantics.
 
 ### 2.1 HiBaCaML Tuple: `H = (N, C, delta, pi, T)`
 
-**Paper purpose.** Both drafts define HiBaCaML as a family of structurally
+**Paper purpose.** The paper define HiBaCaML as a family of structurally
 restricted component learners `N`, a combiner `C`, internal probabilistic states
 `delta`, a top-level controller `pi`, and local counterfactual teachers `T`.
 The theoretical point is to make the causal-continual-learning assumptions
@@ -119,7 +113,7 @@ trigger recruitment.
 
 ### 2.3 Micro-Columns and Shell Semantics
 
-**Paper purpose.** The papers describe three typed micro-columns `K`, `L`, and
+**Paper purpose.** The paper describe three typed micro-columns `K`, `L`, and
 `B`: kernel center, lateral refinement, and bridge. Each carries a hard kernel
 plus concentric shells. Inner structure is reusable, middle structure is
 semi-general, and outer structure is task-local residue. Pruning is outside-in,
@@ -171,7 +165,7 @@ precision-weighted gradient scaling.
 
 ### 2.4 Internal Probabilistic State and Certificates
 
-**Paper purpose.** The papers argue that internal state should flow upward into
+**Paper purpose.** The paper argue that internal state should flow upward into
 selection. Certificates summarize reusable shared mass, specificity load,
 demotion pressure, saturation, and similarity signatures. The theorem on
 certificates states that informative internal certificates improve reuse-utility
@@ -278,7 +272,7 @@ can propose similar support candidates using a file-backed `SelectorBank`.
 
 ### 2.6 Local One-Swap Monotonicity
 
-**Paper purpose.** The papers prove a deliberately local theorem: if an exact
+**Paper purpose.** The paper prove a deliberately local theorem: if an exact
 one-swap teacher evaluates all neighbors and applies only an improving swap,
 the audited local objective cannot worsen.
 
@@ -693,7 +687,7 @@ for task in tasks:
 
 ## 8. Reader Guide
 
-To understand the code as a concrete realization of the papers, read in this
+To understand the code as a concrete realization of the paper, read in this
 order:
 
 1. `hibacaml/config/defaults.py` for the paper-scale architectural constants.
@@ -707,6 +701,6 @@ order:
    sequential training loop.
 7. `experiments/split_mnist.py` for the executable experiment orchestration.
 
-The shortest conceptual summary is: the papers propose two coupled probabilistic
+The shortest conceptual summary is: the paper propose two coupled probabilistic
 levels for continual learning, and the code realizes them as a sparse gated
 column graph plus an audited support/shell controller around that graph.
