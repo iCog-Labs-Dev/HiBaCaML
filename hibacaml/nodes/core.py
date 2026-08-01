@@ -229,7 +229,7 @@ class PatchTokenizerNode(NodeBase):
         inputs: Dict[str, jnp.ndarray],
         state: NodeState,
         node_info: NodeInfo,
-    ) -> Tuple[jax.Array, NodeState]:
+    ) -> NodeState:
         x = _sum_inputs(inputs)
         if x is None:
             raise ValueError(f"{node_info.name} requires an input image tensor")
@@ -259,9 +259,9 @@ class PatchTokenizerNode(NodeBase):
         pre_activation = jnp.concatenate([embedded, coords], axis=-1)
         z_mu = _apply_activation(node_info, pre_activation)
         error = state.z_latent - z_mu
-        state = state._replace(pre_activation=pre_activation, z_mu=z_mu, error=error)
+        state = state._replace(z_mu=z_mu, error=error)
         state = node_info.node_class.energy_functional(state, node_info)
-        return jnp.sum(state.energy), state
+        return state
 
 
 class ShellBankInputNode(NodeBase):
@@ -326,25 +326,22 @@ class ShellBankInputNode(NodeBase):
         inputs: Dict[str, jnp.ndarray],
         state: NodeState,
         node_info: NodeInfo,
-    ) -> Tuple[jax.Array, NodeState]:
+    ) -> NodeState:
         x = _sum_inputs(_slot_inputs(inputs, "in"))
         if x is None:
             raise ValueError(f"{node_info.name} requires at least one 'in' input")
 
         shell_parts = {}
-        pre_parts = {}
         for shell_name, shell_dim in _shell_dims(node_info.node_config).items():
             pre = jnp.matmul(x, params.weights[shell_name]) + params.biases[f"b_{shell_name}"]
             activated = _apply_activation(node_info, pre)
             shell_parts[shell_name] = activated * _precision_scale(params, shell_name)
-            pre_parts[shell_name] = pre
 
-        pre_activation = _shell_concat(pre_parts)
         z_mu = _shell_concat(shell_parts)
         error = state.z_latent - z_mu
-        state = state._replace(pre_activation=pre_activation, z_mu=z_mu, error=error)
+        state = state._replace(z_mu=z_mu, error=error)
         state = node_info.node_class.energy_functional(state, node_info)
-        return jnp.sum(state.energy), state
+        return state
 
 
 class ShellBankResidualNode(NodeBase):
@@ -423,28 +420,25 @@ class ShellBankResidualNode(NodeBase):
         inputs: Dict[str, jnp.ndarray],
         state: NodeState,
         node_info: NodeInfo,
-    ) -> Tuple[jax.Array, NodeState]:
+    ) -> NodeState:
         transformed_input = _sum_inputs(_slot_inputs(inputs, "in"))
         if transformed_input is None:
             raise ValueError(f"{node_info.name} requires an 'in' input")
 
         skip_input = _sum_inputs(_slot_inputs(inputs, "skip"))
         shell_parts = {}
-        pre_parts = {}
         for shell_name in _shell_dims(node_info.node_config):
             pre = jnp.matmul(transformed_input, params.weights[shell_name])
             pre = pre + params.biases[f"b_{shell_name}"]
             activated = _apply_activation(node_info, pre)
             shell_parts[shell_name] = activated * _precision_scale(params, shell_name)
-            pre_parts[shell_name] = pre
 
         projected = _shell_concat(shell_parts)
-        pre_activation = _shell_concat(pre_parts)
         z_mu = projected if skip_input is None else projected + skip_input
         error = state.z_latent - z_mu
-        state = state._replace(pre_activation=pre_activation, z_mu=z_mu, error=error)
+        state = state._replace(z_mu=z_mu, error=error)
         state = node_info.node_class.energy_functional(state, node_info)
-        return jnp.sum(state.energy), state
+        return state
 
 
 class ShellBankRecurrentNode(NodeBase):
@@ -513,13 +507,12 @@ class ShellBankRecurrentNode(NodeBase):
         inputs: Dict[str, jnp.ndarray],
         state: NodeState,
         node_info: NodeInfo,
-    ) -> Tuple[jax.Array, NodeState]:
+    ) -> NodeState:
         transformed_input = _sum_inputs(_slot_inputs(inputs, "in"))
         if transformed_input is None:
             raise ValueError(f"{node_info.name} requires an 'in' input")
 
         shell_parts = {}
-        pre_parts = {}
         shell_slices = _shell_slices(node_info.node_config)
         for shell_name in _shell_dims(node_info.node_config):
             latent_slice = state.z_latent[..., shell_slices[shell_name]]
@@ -528,14 +521,12 @@ class ShellBankRecurrentNode(NodeBase):
             pre = pre + params.biases[f"b_{shell_name}"]
             activated = _apply_activation(node_info, pre)
             shell_parts[shell_name] = activated * _precision_scale(params, shell_name)
-            pre_parts[shell_name] = pre
 
-        pre_activation = _shell_concat(pre_parts)
         z_mu = _shell_concat(shell_parts)
         error = state.z_latent - z_mu
-        state = state._replace(pre_activation=pre_activation, z_mu=z_mu, error=error)
+        state = state._replace(z_mu=z_mu, error=error)
         state = node_info.node_class.energy_functional(state, node_info)
-        return jnp.sum(state.energy), state
+        return state
 
 
 class ElementwiseGateNode(NodeBase):
@@ -582,7 +573,7 @@ class ElementwiseGateNode(NodeBase):
         inputs: Dict[str, jnp.ndarray],
         state: NodeState,
         node_info: NodeInfo,
-    ) -> Tuple[jax.Array, NodeState]:
+    ) -> NodeState:
         value = _sum_inputs(_slot_inputs(inputs, "value"))
         gate = _sum_inputs(_slot_inputs(inputs, "gate"))
         if value is None or gate is None:
@@ -596,9 +587,9 @@ class ElementwiseGateNode(NodeBase):
         pre_activation = value * gate_scalar
         z_mu = _apply_activation(node_info, pre_activation)
         error = state.z_latent - z_mu
-        state = state._replace(pre_activation=pre_activation, z_mu=z_mu, error=error)
+        state = state._replace(z_mu=z_mu, error=error)
         state = node_info.node_class.energy_functional(state, node_info)
-        return jnp.sum(state.energy), state
+        return state
 
 
 class ComposerStage2Node(NodeBase):
@@ -701,7 +692,7 @@ class ComposerStage2Node(NodeBase):
         inputs: Dict[str, jnp.ndarray],
         state: NodeState,
         node_info: NodeInfo,
-    ) -> Tuple[jax.Array, NodeState]:
+    ) -> NodeState:
         feature_edges = _slot_inputs(inputs, "feature")
         cert_edges = _slot_inputs(inputs, "cert")
         query = _sum_inputs(_slot_inputs(inputs, "query"))
@@ -722,9 +713,9 @@ class ComposerStage2Node(NodeBase):
         pre_activation = details["correction"]
         z_mu = _apply_activation(node_info, pre_activation)
         error = state.z_latent - z_mu
-        state = state._replace(pre_activation=pre_activation, z_mu=z_mu, error=error)
+        state = state._replace(z_mu=z_mu, error=error)
         state = node_info.node_class.energy_functional(state, node_info)
-        return jnp.sum(state.energy), state
+        return state
 
 
 class ScaledAddNode(NodeBase):
@@ -771,7 +762,7 @@ class ScaledAddNode(NodeBase):
         inputs: Dict[str, jnp.ndarray],
         state: NodeState,
         node_info: NodeInfo,
-    ) -> Tuple[jax.Array, NodeState]:
+    ) -> NodeState:
         base = _sum_inputs(_slot_inputs(inputs, "base"))
         correction = _sum_inputs(_slot_inputs(inputs, "correction"))
         if base is None:
@@ -782,6 +773,6 @@ class ScaledAddNode(NodeBase):
         pre_activation = base + node_info.node_config["correction_scale"] * correction
         z_mu = _apply_activation(node_info, pre_activation)
         error = state.z_latent - z_mu
-        state = state._replace(pre_activation=pre_activation, z_mu=z_mu, error=error)
+        state = state._replace(z_mu=z_mu, error=error)
         state = node_info.node_class.energy_functional(state, node_info)
-        return jnp.sum(state.energy), state
+        return state

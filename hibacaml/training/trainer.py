@@ -599,7 +599,6 @@ class HiBaCaMLTrainer:
             z_mu=jnp.zeros(shape, dtype=jnp.float32),
             error=jnp.zeros(shape, dtype=jnp.float32),
             energy=jnp.zeros((shape[0],), dtype=jnp.float32),
-            pre_activation=jnp.zeros(shape, dtype=jnp.float32),
             latent_grad=jnp.zeros(shape, dtype=jnp.float32),
         )
 
