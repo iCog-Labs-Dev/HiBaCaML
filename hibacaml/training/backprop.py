@@ -2,29 +2,19 @@
 
 from __future__ import annotations
 
-import copy
 from typing import Dict, List, Sequence
 
 import jax
 import jax.numpy as jnp
 
-from fabricpc.graph_initialization.state_initializer import FeedforwardStateInit, initialize_graph_state
+from fabricpc.graph_initialization.state_initializer import initialize_graph_state
+from fabricpc.training.train_backprop import validate_feedforward_init
 from hibacaml.training.trainer import (
     HiBaCaMLTrainer,
     _composer_details_from_runtime,
+    _cross_entropy_per_sample,
     _hierarchy_parent_child_penalty,
 )
-
-
-def _cross_entropy_from_probs(
-    probs: jnp.ndarray,
-    targets: jnp.ndarray,
-    weight: float = 1.0,
-) -> jnp.ndarray:
-    eps = 1e-7
-    safe = jnp.clip(probs, eps, 1.0)
-    axes = tuple(range(1, targets.ndim))
-    return weight * jnp.mean(-jnp.sum(targets * jnp.log(safe), axis=axes))
 
 
 class HiBaCaMLBackpropRunner(HiBaCaMLTrainer):
@@ -32,46 +22,7 @@ class HiBaCaMLBackpropRunner(HiBaCaMLTrainer):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        state_init = self.structure.config["graph_state_initializer"]
-        if not isinstance(state_init, FeedforwardStateInit):
-            raise ValueError(
-                "HiBaCaMLBackpropRunner requires FeedforwardStateInit on the graph structure"
-            )
-
-    def clone(self) -> "HiBaCaMLBackpropRunner":
-        ps = self.persistent_state
-        saved_ps_params = ps.params
-        saved_ps_opt = ps.opt_state
-        ps.params = None
-        ps.opt_state = None
-        try:
-            ps_clone = copy.deepcopy(ps)
-        finally:
-            ps.params = saved_ps_params
-            ps.opt_state = saved_ps_opt
-
-        cloned = HiBaCaMLBackpropRunner(
-            cfg=self.cfg,
-            structure=self.structure,
-            params=jax.tree_util.tree_map(lambda x: x, self.params),
-            tasks=list(self.tasks.values()),
-            optimizer=self.optimizer,
-            rng_key=self.rng_key,
-            persistent_state=ps_clone,
-            create_run_logger=False,
-            selector_bank=self.selector_bank,
-            run_id=self.run_id,
-        )
-        cloned.opt_state = jax.tree_util.tree_map(lambda x: x, self.opt_state)
-        cloned.persistent_state.params = cloned.params
-        cloned.persistent_state.opt_state = cloned.opt_state
-        cloned.current_phi = self.current_phi
-        cloned.current_nonshared = tuple(self.current_nonshared)
-        cloned._jit_run_batch_inference = self._jit_run_batch_inference
-        cloned._jit_compute_pc_gradients = self._jit_compute_pc_gradients
-        cloned._jit_eval_batch = self._jit_eval_batch
-        cloned._eval_cache = {}
-        return cloned
+        validate_feedforward_init(self.structure)
 
     def _build_clamps(
         self,
@@ -166,24 +117,17 @@ class HiBaCaMLBackpropRunner(HiBaCaMLTrainer):
         output_name = self.structure.task_map["y"]
         hier_mid_name = self.structure.task_map["hier_mid"]
         hier_global_name = self.structure.task_map["hier_global"]
-        eps = 1e-7
-
-        def _ce_per_sample(probs: jnp.ndarray, targets: jnp.ndarray, weight: float) -> jnp.ndarray:
-            safe = jnp.clip(probs, eps, 1.0)
-            axes = tuple(range(1, targets.ndim))
-            return weight * (-jnp.sum(targets * jnp.log(safe), axis=axes))
-
-        task = _ce_per_sample(
+        task = _cross_entropy_per_sample(
             final_state.nodes[output_name].z_mu,
             jnp.asarray(stacked_batch["y"], dtype=jnp.float32),
             1.0,
         )
-        hier_mid = _ce_per_sample(
+        hier_mid = _cross_entropy_per_sample(
             final_state.nodes[hier_mid_name].z_mu,
             jnp.asarray(stacked_batch["hier_mid"], dtype=jnp.float32),
             self.cfg.hierarchy.mid_loss_weight,
         )
-        hier_global = _ce_per_sample(
+        hier_global = _cross_entropy_per_sample(
             final_state.nodes[hier_global_name].z_mu,
             jnp.asarray(stacked_batch["hier_global"], dtype=jnp.float32),
             self.cfg.hierarchy.global_loss_weight,
@@ -224,13 +168,6 @@ class HiBaCaMLBackpropRunner(HiBaCaMLTrainer):
         )
         if update_cache:
             self._last_graph_state = state
-            self._last_clamps = clamps
-            self._last_task_id = task.task_id
-            self._last_targets = {
-                "y": jnp.asarray(batch["y"], dtype=jnp.float32),
-                "hier_mid": jnp.asarray(batch["hier_mid"], dtype=jnp.float32),
-                "hier_global": jnp.asarray(batch["hier_global"], dtype=jnp.float32),
-            }
         return state, clamps
 
     def run_batch_inference(
@@ -252,6 +189,21 @@ class HiBaCaMLBackpropRunner(HiBaCaMLTrainer):
             refresh_certificates=True,
         )
 
+    def run_batch_evaluation_inference(
+        self,
+        batch: Dict[str, jnp.ndarray],
+        task,
+        nonshared: Sequence[int],
+        params=None,
+    ):
+        """Run target-free evaluation with a single feedforward pass."""
+        return self.run_batch_inference(
+            batch,
+            task,
+            nonshared,
+            params=params,
+        )
+
     def _loss_components(
         self,
         final_state,
@@ -263,20 +215,26 @@ class HiBaCaMLBackpropRunner(HiBaCaMLTrainer):
         hier_mid_name = self.structure.task_map["hier_mid"]
         hier_global_name = self.structure.task_map["hier_global"]
 
-        task_loss = _cross_entropy_from_probs(
-            final_state.nodes[output_name].z_mu,
-            jnp.asarray(batch["y"], dtype=jnp.float32),
-            weight=1.0,
+        task_loss = jnp.mean(
+            _cross_entropy_per_sample(
+                final_state.nodes[output_name].z_mu,
+                jnp.asarray(batch["y"], dtype=jnp.float32),
+                weight=1.0,
+            )
         )
-        hier_mid = _cross_entropy_from_probs(
-            final_state.nodes[hier_mid_name].z_mu,
-            jnp.asarray(batch["hier_mid"], dtype=jnp.float32),
-            weight=self.cfg.hierarchy.mid_loss_weight,
+        hier_mid = jnp.mean(
+            _cross_entropy_per_sample(
+                final_state.nodes[hier_mid_name].z_mu,
+                jnp.asarray(batch["hier_mid"], dtype=jnp.float32),
+                weight=self.cfg.hierarchy.mid_loss_weight,
+            )
         )
-        hier_global = _cross_entropy_from_probs(
-            final_state.nodes[hier_global_name].z_mu,
-            jnp.asarray(batch["hier_global"], dtype=jnp.float32),
-            weight=self.cfg.hierarchy.global_loss_weight,
+        hier_global = jnp.mean(
+            _cross_entropy_per_sample(
+                final_state.nodes[hier_global_name].z_mu,
+                jnp.asarray(batch["hier_global"], dtype=jnp.float32),
+                weight=self.cfg.hierarchy.global_loss_weight,
+            )
         )
         composer_details = _composer_details_from_runtime(params, final_state, clamps, self.structure)
         composer = jnp.mean(composer_details["aux_penalty"])
@@ -296,14 +254,7 @@ class HiBaCaMLBackpropRunner(HiBaCaMLTrainer):
             "total": task_loss + hier_mid + hier_global + parent_child + composer,
         }
 
-    def _supervised_losses(self, final_state) -> Dict[str, float]:
-        targets = getattr(self, "_last_targets", None)
-        if targets is None:
-            raise RuntimeError("Backprop loss requested before any batch forward pass")
-        losses = self._loss_components(final_state, targets, self.params, self._last_clamps)
-        return {name: float(value) for name, value in losses.items()}
-
-    def compute_pc_gradients(
+    def compute_training_gradients(
         self,
         batch: Dict[str, jnp.ndarray],
         task,
@@ -328,23 +279,32 @@ class HiBaCaMLBackpropRunner(HiBaCaMLTrainer):
 
         (total_loss, final_state), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
         self._last_graph_state = final_state
-        self._last_clamps = self._build_clamps(
+        clamps = self._build_clamps(
             batch,
             task,
             nonshared,
             params=params,
             refresh_certificates=False,
         )
-        self._last_targets = {
-            "y": jnp.asarray(batch["y"], dtype=jnp.float32),
-            "hier_mid": jnp.asarray(batch["hier_mid"], dtype=jnp.float32),
-            "hier_global": jnp.asarray(batch["hier_global"], dtype=jnp.float32),
-        }
-        self._last_task_id = task.task_id
-        losses = self._loss_components(final_state, batch, params, self._last_clamps)
+        losses = self._loss_components(final_state, batch, params, clamps)
         losses = {name: float(value) for name, value in losses.items()}
         losses["total"] = float(total_loss)
         return grads, losses, final_state
+
+    def compute_pc_gradients(
+        self,
+        batch: Dict[str, jnp.ndarray],
+        task,
+        nonshared: Sequence[int],
+        params=None,
+    ):
+        """Compatibility wrapper for the former polymorphic method name."""
+        return self.compute_training_gradients(
+            batch,
+            task,
+            nonshared,
+            params=params,
+        )
 
     def evaluate_batch_outputs(
         self,

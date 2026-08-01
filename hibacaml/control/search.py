@@ -12,7 +12,6 @@ import jax.numpy as jnp
 
 from hibacaml.config import HiBaCaMLConfig, PhiConfig
 from hibacaml.control.replay_bank import (
-    ReplayRow,
     SelectorBank,
     build_context,
     make_replay_row,
@@ -676,7 +675,7 @@ class ExactSearchService:
         final_state = None
         for batch in bundle.train_batches:
             if self.cfg.exact_search.rollout_gradient_mode == "trainer":
-                grads, _, final_state = clone.compute_pc_gradients(
+                grads, _, final_state = clone.compute_training_gradients(
                     batch,
                     task,
                     support_cols,

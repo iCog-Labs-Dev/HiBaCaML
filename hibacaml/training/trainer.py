@@ -7,7 +7,7 @@ import itertools
 import pickle
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Optional, Sequence, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -336,7 +336,7 @@ class HiBaCaMLTrainer:
             ps.params = saved_ps_params
             ps.opt_state = saved_ps_opt
 
-        cloned = HiBaCaMLTrainer(
+        cloned = type(self)(
             cfg=self.cfg,                                               # frozen dataclass
             structure=self.structure,
             params=jax.tree_util.tree_map(lambda x: x, self.params),  # share immutable leaves
@@ -692,13 +692,35 @@ class HiBaCaMLTrainer:
         params=None,
     ):
         params = params if params is not None else self.params
-        clamps = self._build_clamps(batch, task, nonshared, params=params)
+        clamps = HiBaCaMLTrainer._build_clamps(
+            self,
+            batch,
+            task,
+            nonshared,
+            params=params,
+            include_targets=True,
+        )
         self.rng_key, state_key = jax.random.split(self.rng_key)
         grads, loss_vector, final_state = self._jit_compute_pc_gradients(
             params, clamps, state_key
         )
         self._last_graph_state = final_state
         return grads, _loss_dict_from_vector(loss_vector), final_state
+
+    def compute_training_gradients(
+        self,
+        batch: Dict[str, jnp.ndarray],
+        task: SplitMnistTask,
+        nonshared: Sequence[int],
+        params=None,
+    ):
+        """Compute gradients for the trainer's configured learning mode."""
+        return self.compute_pc_gradients(
+            batch,
+            task,
+            nonshared,
+            params=params,
+        )
 
     def _mask_grads(self, grads, nonshared: Sequence[int]):
         keep_columns = set(self.cfg.column_pool.shared_indices + tuple(nonshared))
@@ -789,7 +811,11 @@ class HiBaCaMLTrainer:
                     )
 
                 batch_started = time.perf_counter()
-                grads, losses, final_state = self.compute_pc_gradients(batch, task, nonshared)
+                grads, losses, final_state = self.compute_training_gradients(
+                    batch,
+                    task,
+                    nonshared,
+                )
                 jax.block_until_ready(final_state.nodes[self.structure.task_map["y"]].z_mu)
                 grads = self._mask_grads(grads, nonshared)
                 self._apply_grads(grads)
