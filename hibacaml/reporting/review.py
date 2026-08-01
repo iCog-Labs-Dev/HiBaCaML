@@ -7,6 +7,10 @@ from typing import Sequence
 from hibacaml.config import HiBaCaMLConfig
 
 
+def _cap_label(value: int | None) -> str:
+    return "full" if value is None else str(value)
+
+
 def print_pre_run_review(
     cfg: HiBaCaMLConfig,
     structure,
@@ -31,6 +35,15 @@ def print_pre_run_review(
     print(f"    mode              : {cfg.mode}")
     print(f"    learning          : {learning_label}")
     print(f"    batch_size        : {cfg.batch_size}")
+    print(
+        "    search batch caps : "
+        f"current={_cap_label(cfg.exact_search.boundary_current_data_batch_size)}, "
+        f"rollout={_cap_label(cfg.exact_search.rollout_train_data_batch_size)}, "
+        f"worst_old={_cap_label(cfg.exact_search.boundary_worst_old_data_batch_size)}, "
+        f"mixed_old={_cap_label(cfg.exact_search.boundary_mixed_old_data_batch_size)}, "
+        f"local_swap={_cap_label(cfg.exact_search.local_swap_audit_data_batch_size)}, "
+        f"demotion={_cap_label(cfg.exact_search.demotion_audit_data_batch_size)}"
+    )
     print(f"    epochs_per_task   : {cfg.epochs_per_task}")
     print(f"    infer_steps       : {cfg.infer_steps}")
     print(f"    eta_infer         : {cfg.eta_infer}")
