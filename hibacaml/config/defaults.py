@@ -96,6 +96,12 @@ class ExactSearchConfig:
     """Boundary and local support search settings."""
 
     enable_exact_search: bool = True
+    boundary_current_data_batch_size: int | None = None
+    rollout_train_data_batch_size: int | None = None
+    boundary_worst_old_data_batch_size: int | None = None
+    boundary_mixed_old_data_batch_size: int | None = None
+    local_swap_audit_data_batch_size: int | None = None
+    demotion_audit_data_batch_size: int | None = None
     boundary_current_batches: int = 2
     boundary_old_batches: int = 2
     boundary_rollout_steps: int = 4

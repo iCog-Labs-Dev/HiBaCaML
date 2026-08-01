@@ -34,6 +34,12 @@ RESUME_RUN_ID = None                   # optional explicit run_id; auto-detected
 # Memory-related inputs
 LOW_MEMORY_BATCH_SIZE_CAP = None       # e.g. 64, or None to disable
 BATCH_SIZE = 768                        # direct batch_size override, e.g. 64
+BOUNDARY_CURRENT_DATA_BATCH_SIZE = 128
+ROLLOUT_TRAIN_DATA_BATCH_SIZE = 128
+BOUNDARY_WORST_OLD_DATA_BATCH_SIZE = 128
+BOUNDARY_MIXED_OLD_DATA_BATCH_SIZE = 128
+LOCAL_SWAP_AUDIT_DATA_BATCH_SIZE = 128
+DEMOTION_AUDIT_DATA_BATCH_SIZE = 128
 
 
 # ------------------------------------------------------------
@@ -131,6 +137,17 @@ def _write_csv(path: Path, rows: Sequence[Dict[str, object]]) -> None:
         writer.writeheader()
         for row in rows:
             writer.writerow({key: _jsonable(row.get(key)) for key in fieldnames})
+
+
+def _validate_optional_positive_int(name: str, value: int | None) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be None or a positive integer, got {value!r}")
+    value = int(value)
+    if value <= 0:
+        raise ValueError(f"{name} must be None or a positive integer, got {value!r}")
+    return value
 
 
 # ------------------------------------------------------------
@@ -462,6 +479,12 @@ def apply_notebook_overrides(
     neighbor_support_batch_size: int | None = NEIGHBOR_SUPPORT_BATCH_SIZE,
     current_boundary_batches: int | None = CURRENT_BOUNDARY_BATCHES,
     old_boundary_batches: int | None = OLD_BOUNDARY_BATCHES,
+    boundary_current_data_batch_size: int | None = BOUNDARY_CURRENT_DATA_BATCH_SIZE,
+    rollout_train_data_batch_size: int | None = ROLLOUT_TRAIN_DATA_BATCH_SIZE,
+    boundary_worst_old_data_batch_size: int | None = BOUNDARY_WORST_OLD_DATA_BATCH_SIZE,
+    boundary_mixed_old_data_batch_size: int | None = BOUNDARY_MIXED_OLD_DATA_BATCH_SIZE,
+    local_swap_audit_data_batch_size: int | None = LOCAL_SWAP_AUDIT_DATA_BATCH_SIZE,
+    demotion_audit_data_batch_size: int | None = DEMOTION_AUDIT_DATA_BATCH_SIZE,
     train_batches_limit: int | None = TRAIN_BATCHES_LIMIT,
     test_batches_limit: int | None = TEST_BATCHES_LIMIT,
     exact_search: bool | None = EXACT_SEARCH,
@@ -496,6 +519,35 @@ def apply_notebook_overrides(
                 cfg.exact_search,
                 boundary_old_batches=old_boundary_batches,
             ),
+        )
+
+    search_data_overrides = {
+        "boundary_current_data_batch_size": boundary_current_data_batch_size,
+        "rollout_train_data_batch_size": rollout_train_data_batch_size,
+        "boundary_worst_old_data_batch_size": boundary_worst_old_data_batch_size,
+        "boundary_mixed_old_data_batch_size": boundary_mixed_old_data_batch_size,
+        "local_swap_audit_data_batch_size": local_swap_audit_data_batch_size,
+        "demotion_audit_data_batch_size": demotion_audit_data_batch_size,
+    }
+    search_data_overrides = {
+        key: _validate_optional_positive_int(key, value)
+        for key, value in search_data_overrides.items()
+        if value is not None
+    }
+    if search_data_overrides:
+        cfg = dataclasses.replace(
+            cfg,
+            exact_search=dataclasses.replace(
+                cfg.exact_search,
+                **search_data_overrides,
+            ),
+        )
+        log_progress(
+            "exact-search data batch overrides: "
+            + ", ".join(
+                f"{key}={value}" for key, value in sorted(search_data_overrides.items())
+            ),
+            component="runner",
         )
 
     if rollout_steps is not None:
@@ -619,6 +671,12 @@ def run_experiment_notebook(
     neighbor_support_batch_size: int | None = NEIGHBOR_SUPPORT_BATCH_SIZE,
     current_boundary_batches: int | None = CURRENT_BOUNDARY_BATCHES,
     old_boundary_batches: int | None = OLD_BOUNDARY_BATCHES,
+    boundary_current_data_batch_size: int | None = BOUNDARY_CURRENT_DATA_BATCH_SIZE,
+    rollout_train_data_batch_size: int | None = ROLLOUT_TRAIN_DATA_BATCH_SIZE,
+    boundary_worst_old_data_batch_size: int | None = BOUNDARY_WORST_OLD_DATA_BATCH_SIZE,
+    boundary_mixed_old_data_batch_size: int | None = BOUNDARY_MIXED_OLD_DATA_BATCH_SIZE,
+    local_swap_audit_data_batch_size: int | None = LOCAL_SWAP_AUDIT_DATA_BATCH_SIZE,
+    demotion_audit_data_batch_size: int | None = DEMOTION_AUDIT_DATA_BATCH_SIZE,
     train_batches_limit: int | None = TRAIN_BATCHES_LIMIT,
     test_batches_limit: int | None = TEST_BATCHES_LIMIT,
     exact_search: bool | None = EXACT_SEARCH,
@@ -647,6 +705,12 @@ def run_experiment_notebook(
         neighbor_support_batch_size=neighbor_support_batch_size,
         current_boundary_batches=current_boundary_batches,
         old_boundary_batches=old_boundary_batches,
+        boundary_current_data_batch_size=boundary_current_data_batch_size,
+        rollout_train_data_batch_size=rollout_train_data_batch_size,
+        boundary_worst_old_data_batch_size=boundary_worst_old_data_batch_size,
+        boundary_mixed_old_data_batch_size=boundary_mixed_old_data_batch_size,
+        local_swap_audit_data_batch_size=local_swap_audit_data_batch_size,
+        demotion_audit_data_batch_size=demotion_audit_data_batch_size,
         train_batches_limit=train_batches_limit,
         test_batches_limit=test_batches_limit,
         exact_search=exact_search,
@@ -748,6 +812,12 @@ if __name__ == "__main__":
         neighbor_support_batch_size=NEIGHBOR_SUPPORT_BATCH_SIZE,
         current_boundary_batches=CURRENT_BOUNDARY_BATCHES,
         old_boundary_batches=OLD_BOUNDARY_BATCHES,
+        boundary_current_data_batch_size=BOUNDARY_CURRENT_DATA_BATCH_SIZE,
+        rollout_train_data_batch_size=ROLLOUT_TRAIN_DATA_BATCH_SIZE,
+        boundary_worst_old_data_batch_size=BOUNDARY_WORST_OLD_DATA_BATCH_SIZE,
+        boundary_mixed_old_data_batch_size=BOUNDARY_MIXED_OLD_DATA_BATCH_SIZE,
+        local_swap_audit_data_batch_size=LOCAL_SWAP_AUDIT_DATA_BATCH_SIZE,
+        demotion_audit_data_batch_size=DEMOTION_AUDIT_DATA_BATCH_SIZE,
         train_batches_limit=TRAIN_BATCHES_LIMIT,
         test_batches_limit=TEST_BATCHES_LIMIT,
         exact_search=EXACT_SEARCH,

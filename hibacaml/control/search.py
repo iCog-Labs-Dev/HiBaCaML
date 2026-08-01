@@ -74,19 +74,86 @@ class ExactSearchService:
         self.run_id = run_id
         self._old_audit_cache: Dict[Tuple[int, int, int], Dict[str, float]] = {}
 
-    def make_bundle(self, task_id: int) -> BoundaryBundle:
+    def _normalize_data_batch_size(self, name: str, value: Optional[int]) -> Optional[int]:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            raise ValueError(f"{name} must be None or a positive integer, got {value!r}")
+        value = int(value)
+        if value <= 0:
+            raise ValueError(f"{name} must be None or a positive integer, got {value!r}")
+        return value
+
+    def _bundle_batch_caps(self, purpose: str) -> Dict[str, Optional[int] | bool]:
+        cfg = self.cfg.exact_search
+        if purpose == "boundary":
+            return {
+                "current": self._normalize_data_batch_size(
+                    "boundary_current_data_batch_size",
+                    cfg.boundary_current_data_batch_size,
+                ),
+                "rollout": self._normalize_data_batch_size(
+                    "rollout_train_data_batch_size",
+                    cfg.rollout_train_data_batch_size,
+                ),
+                "worst_old": self._normalize_data_batch_size(
+                    "boundary_worst_old_data_batch_size",
+                    cfg.boundary_worst_old_data_batch_size,
+                ),
+                "mixed_old": self._normalize_data_batch_size(
+                    "boundary_mixed_old_data_batch_size",
+                    cfg.boundary_mixed_old_data_batch_size,
+                ),
+                "include_rollout": True,
+            }
+        if purpose == "local_swap":
+            cap = self._normalize_data_batch_size(
+                "local_swap_audit_data_batch_size",
+                cfg.local_swap_audit_data_batch_size,
+            )
+            return {
+                "current": cap,
+                "rollout": None,
+                "worst_old": cap,
+                "mixed_old": cap,
+                "include_rollout": False,
+            }
+        if purpose == "demotion":
+            cap = self._normalize_data_batch_size(
+                "demotion_audit_data_batch_size",
+                cfg.demotion_audit_data_batch_size,
+            )
+            return {
+                "current": cap,
+                "rollout": None,
+                "worst_old": cap,
+                "mixed_old": cap,
+                "include_rollout": False,
+            }
+        raise ValueError(f"Unsupported boundary bundle purpose: {purpose!r}")
+
+    @staticmethod
+    def _slice_batch(batch: Dict[str, jnp.ndarray], max_examples: Optional[int]):
+        if max_examples is None:
+            return batch
+        return {key: value[:max_examples] for key, value in batch.items()}
+
+    def make_bundle(self, task_id: int, *, purpose: str = "boundary") -> BoundaryBundle:
         """Build the audit bundle: current eval batches + worst-old + mixed-old."""
+        caps = self._bundle_batch_caps(purpose)
         task = self.trainer.task(task_id)
         current_eval = tuple(
-            batch
+            self._slice_batch(batch, caps["current"])
             for idx, batch in enumerate(task.test_loader)
             if idx < self.cfg.exact_search.boundary_current_batches
         )
-        train_batches = tuple(
-            batch
-            for idx, batch in enumerate(task.train_loader)
-            if idx < self.cfg.exact_search.boundary_rollout_steps
-        )
+        train_batches = ()
+        if caps["include_rollout"]:
+            train_batches = tuple(
+                self._slice_batch(batch, caps["rollout"])
+                for idx, batch in enumerate(task.train_loader)
+                if idx < self.cfg.exact_search.boundary_rollout_steps
+            )
 
         worst_old = None
         worst_old_eval = None
@@ -100,10 +167,16 @@ class ExactSearchService:
                 worst_old_eval = self._concat_loader_prefix(
                     worst_old_task.test_loader,
                     self.cfg.exact_search.boundary_old_batches,
+                    batch_size=caps["worst_old"],
                 )
                 if worst_old_eval is not None:
                     worst_old_eval = (worst_old, worst_old_eval)
-            mixed_old_eval = list(self._build_mixed_old_fragments(task_id))
+            mixed_old_eval = list(
+                self._build_mixed_old_fragments(
+                    task_id,
+                    batch_size=caps["mixed_old"],
+                )
+            )
         return BoundaryBundle(
             current_eval=current_eval,
             train_batches=train_batches,
@@ -112,11 +185,23 @@ class ExactSearchService:
             worst_old=worst_old,
         )
 
-    def _concat_loader_prefix(self, loader, max_batches: int):
+    def _concat_loader_prefix(
+        self,
+        loader,
+        max_batches: int,
+        *,
+        batch_size: Optional[int] = None,
+    ):
         pieces = []
+        remaining = batch_size
         for idx, batch in enumerate(loader):
             if idx >= max_batches:
                 break
+            if remaining is not None:
+                if remaining <= 0:
+                    break
+                batch = self._slice_batch(batch, remaining)
+                remaining -= int(batch["x"].shape[0])
             pieces.append(batch)
         if not pieces:
             return None
@@ -130,6 +215,8 @@ class ExactSearchService:
     def _build_mixed_old_fragments(
         self,
         task_id: int,
+        *,
+        batch_size: Optional[int] = None,
     ) -> Tuple[Tuple[int, Dict[str, jnp.ndarray]], ...]:
         """Build one deterministic mixed-old batch from all prior tasks."""
         prior_batches: List[Tuple[int, Dict[str, jnp.ndarray]]] = []
@@ -141,6 +228,8 @@ class ExactSearchService:
             return ()
 
         target_size = min(int(batch["x"].shape[0]) for _, batch in prior_batches)
+        if batch_size is not None:
+            target_size = min(target_size, int(batch_size))
         target_size = max(1, target_size)
         per_source = max(1, target_size // len(prior_batches))
         remainder = max(0, target_size - per_source * len(prior_batches))
@@ -617,7 +706,11 @@ class ExactSearchService:
             clone.persistent_state.params = clone.params
             clone._bump_params_revision()
         if final_state is None and bundle.current_eval:
-            final_state, _ = clone.run_batch_inference(bundle.current_eval[0], task, support_cols)
+            final_state, _ = clone.run_batch_evaluation_inference(
+                bundle.current_eval[0],
+                task,
+                support_cols,
+            )
         objective = self.boundary_objective(
             task_id,
             support_cols,
@@ -973,7 +1066,7 @@ class ExactSearchService:
 
     def boundary_search(self, task_id: int) -> Tuple[Tuple[int, ...], PhiConfig]:
         search_started = time.perf_counter()
-        bundle = self.make_bundle(task_id)
+        bundle = self.make_bundle(task_id, purpose="boundary")
         support_candidates = tuple(enumerate_nonshared_supports(self.cfg))
         phi_candidates = self.phi_candidates()
         if getattr(self.trainer, "run_logger", None) is not None:
@@ -1130,7 +1223,7 @@ class ExactSearchService:
             return []
 
         started_at = time.perf_counter()
-        bundle = self.make_bundle(task_id)
+        bundle = self.make_bundle(task_id, purpose="demotion")
         current_support = tuple(sorted(nonshared))
         round_index = 1 + len(
             {row.round_index for row in self.trainer.persistent_state.demotion_swap_tables.get(task_id, [])}
@@ -1273,7 +1366,7 @@ class ExactSearchService:
         if task_id == 0:
             return self.trainer.current_nonshared
 
-        bundle = self.make_bundle(task_id)
+        bundle = self.make_bundle(task_id, purpose="local_swap")
         current_nonshared = tuple(
             sorted(
                 self.trainer.persistent_state.current_support.get(
