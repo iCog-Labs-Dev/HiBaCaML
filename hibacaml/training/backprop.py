@@ -81,7 +81,10 @@ class HiBaCaMLBackpropRunner(HiBaCaMLTrainer):
         *,
         params=None,
         refresh_certificates: bool = True,
+        include_targets: bool = False,
     ) -> Dict[str, jnp.ndarray]:
+        # Backprop losses are external, so targets are never graph clamps.
+        del include_targets
         meta = self.structure.config["hibacaml"]
         batch_size = int(batch["x"].shape[0])
         params = params if params is not None else self.params
@@ -114,7 +117,10 @@ class HiBaCaMLBackpropRunner(HiBaCaMLTrainer):
         *,
         params=None,
         refresh_certificates: bool = True,
+        include_targets: bool = False,
     ) -> Dict[str, jnp.ndarray]:
+        # Backprop losses are external, so targets are never graph clamps.
+        del include_targets
         batch_size = int(batch["x"].shape[0])
         params = params if params is not None else self.params
         if refresh_certificates:
@@ -340,7 +346,7 @@ class HiBaCaMLBackpropRunner(HiBaCaMLTrainer):
         losses["total"] = float(total_loss)
         return grads, losses, final_state
 
-    def evaluate_batch_loss(
+    def evaluate_batch_outputs(
         self,
         task,
         batch: Dict[str, jnp.ndarray],
@@ -348,7 +354,7 @@ class HiBaCaMLBackpropRunner(HiBaCaMLTrainer):
         params=None,
         *,
         refresh_certificates: bool = True,
-    ) -> float:
+    ):
         params = params if params is not None else self.params
         self.rng_key, state_key = jax.random.split(self.rng_key)
         final_state, clamps = self._forward_state(
@@ -360,8 +366,32 @@ class HiBaCaMLBackpropRunner(HiBaCaMLTrainer):
             update_cache=False,
             refresh_certificates=refresh_certificates,
         )
-        losses = self._loss_components(final_state, batch, params, clamps)
-        return float(losses["total"])
+        per_sample_total = self._per_sample_total(
+            final_state,
+            batch,
+            params,
+            clamps,
+        )
+        logits = final_state.nodes[self.structure.task_map["y"]].z_mu
+        return logits, per_sample_total
+
+    def evaluate_batch_loss(
+        self,
+        task,
+        batch: Dict[str, jnp.ndarray],
+        nonshared: Sequence[int],
+        params=None,
+        *,
+        refresh_certificates: bool = True,
+    ) -> float:
+        _, per_sample_total = self.evaluate_batch_outputs(
+            task,
+            batch,
+            nonshared,
+            params=params,
+            refresh_certificates=refresh_certificates,
+        )
+        return float(jnp.mean(per_sample_total))
 
     def evaluate_batch_losses(
         self,
