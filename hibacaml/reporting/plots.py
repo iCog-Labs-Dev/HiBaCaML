@@ -4,22 +4,11 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Mapping, Sequence
-
-
-def _ensure_matplotlib():
-    try:
-        import matplotlib.pyplot as plt  # noqa: F401
-    except ImportError as exc:
-        raise ImportError(
-            "matplotlib is required for plotting. Install it with: pip install matplotlib"
-        ) from exc
-
+import matplotlib.pyplot as plt
 
 def _save_fig(fig, path: Path, dpi: int = 150) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=dpi, bbox_inches="tight")
-    import matplotlib.pyplot as plt
-
     plt.close(fig)
 
 
@@ -31,9 +20,6 @@ def plot_accuracy_forgetting(
     title: str = "Accuracy And Forgetting",
 ) -> None:
     """Plot mean seen accuracy and mean forgetting curves across task boundaries."""
-    _ensure_matplotlib()
-    import matplotlib.pyplot as plt
-
     if not mean_seen_accuracy and not mean_forgetting:
         return
 
@@ -81,8 +67,6 @@ def plot_support_table(
     title: str = "Chosen Support Sequence",
 ) -> None:
     """Render the chosen full-support sequence as a compact table."""
-    _ensure_matplotlib()
-    import matplotlib.pyplot as plt
 
     if not support_sequence:
         return
@@ -124,8 +108,6 @@ def plot_swap_gains(
     title: str = "Best One-Swap Gain By Task",
 ) -> None:
     """Plot the best accepted one-swap gain per task."""
-    _ensure_matplotlib()
-    import matplotlib.pyplot as plt
 
     if not best_swap_gains:
         return

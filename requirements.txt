@@ -1,0 +1,7 @@
+fabricpc
+jax
+numpy
+optax
+tensorflow
+keras
+matplotlib
