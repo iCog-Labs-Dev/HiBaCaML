@@ -6,7 +6,7 @@ from __future__ import annotations
 # Script inputs: edit these directly, or import and call
 # run_experiment_notebook(...) from another script.
 # ------------------------------------------------------------
-MODE = "paper_faithful"               # "paper_faithful", "full", "smoke"
+MODE = "default"                       # "default" or "smoke"
 TASKS = None                           # e.g. 2, 5, or None for all
 SHORTLIST = None                       # e.g. 8 or None
 EPOCHS = None                          # e.g. 1, 5, or None
@@ -66,11 +66,9 @@ else:
     os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
     os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "platform")
 
-from jax_setup import set_jax_flags_before_importing_jax
+from fabricpc import setup_jax
 
-set_jax_flags_before_importing_jax(
-    jax_platforms=os.environ.get("JAX_PLATFORMS", "cuda")
-)
+setup_jax(platform=os.environ.get("JAX_PLATFORMS", "cuda"))
 
 import jax
 
@@ -687,8 +685,8 @@ def run_experiment_notebook(
 ):
     if learning not in ("pc", "backprop"):
         raise ValueError("learning must be 'pc' or 'backprop'")
-    if mode not in ("paper_faithful", "smoke"):
-        raise ValueError("mode must be 'paper_faithful' or 'smoke'")
+    if mode not in ("default", "smoke"):
+        raise ValueError("mode must be 'default' or 'smoke'")
 
     print("JAX backend:", jax.default_backend(), flush=True)
     print("JAX devices:", jax.devices(), flush=True)

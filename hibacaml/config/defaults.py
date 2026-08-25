@@ -166,7 +166,7 @@ class ReportingConfig:
 class HiBaCaMLConfig:
     """Top-level subsystem configuration."""
 
-    mode: str = "paper_faithful"
+    mode: str = "default"
     seed: int = 0
     input_shape: Tuple[int, int, int] = (28, 28, 1)
     patch_size: Tuple[int, int] = (7, 7)
@@ -222,9 +222,9 @@ class HiBaCaMLConfig:
         return Path(self.reporting.selector_state_root)
 
 
-def make_hibacaml_config(mode: str = "paper_faithful") -> HiBaCaMLConfig:
+def make_hibacaml_config(mode: str = "default") -> HiBaCaMLConfig:
     """Construct a HiBaCaML config for the given mode."""
-    if mode == "paper_faithful":
+    if mode == "default":
         return HiBaCaMLConfig(
             mode=mode,
             exact_search=ExactSearchConfig(
