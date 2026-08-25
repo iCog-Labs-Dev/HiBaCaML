@@ -199,7 +199,7 @@ The certificate vector used by the composer is constructed by
 `certificate_matrix`, masked by the active support. The static support scoring
 path also uses `_certificate_reuse_score`, which rewards `q_mean` and
 `shared_abstraction_mass` while penalizing specificity, demotion pressure, and
-saturation. In `paper_faithful` mode, `certificate_support_weight` is set to
+saturation. In `default` mode, `certificate_support_weight` is set to
 `0.05`.
 
 **Alignment status.** Faithful as a compact certificate channel. The
@@ -353,6 +353,84 @@ composer combines active columns.
 image mass in each quadrant. `hier_mid` receives shape
 `(mid_targets, output_dim)`, while `hier_global` receives the global task target.
 
+#### Hierarchy target construction and cross-entropy losses
+
+The hierarchy losses are auxiliary objectives for the current example. They are
+not losses from previous tasks. Previous-task quantities such as
+`old_worst_loss` and `old_mix_loss` belong to support search and
+continual-learning evaluation instead.
+
+The **global target** is the same task-local class target used by the main
+classifier. With the default task-local binary heads, a Split-MNIST task such as
+`(2, 3)` maps digit `2` to `[1, 0]` and digit `3` to `[0, 1]`. The
+`hier_global` head reads `active_feature_summary` directly and predicts this
+target. Here, "global" means global with respect to the aggregate active-column
+representation; it does not mean a ten-digit target or a target spanning
+previous tasks.
+
+The **mid-level targets** are quadrant-aware soft class targets. With the
+default `mid_targets = 4`, `_hierarchy_targets` splits each normalized image
+into four quadrants. For quadrant `q`, it computes
+
+```text
+m_q     = mean(abs(image_quadrant_q))
+alpha_q = m_q / max(max_r(m_r), 1e-6)
+```
+
+Let `y` be the example's one-hot task target and let `u` be the uniform class
+distribution. The target for quadrant `q` is
+
+```text
+y_mid_q = u + alpha_q * (y - u)
+```
+
+Thus a quadrant with greater mean absolute normalized activation receives a
+target closer to the hard class label, while a lower-activation quadrant
+receives a softer, less certain target. For a binary example with
+`y = [1, 0]`:
+
+| `alpha_q` | Mid-level target |
+|---:|:---|
+| `1.0` | `[1.00, 0.00]` |
+| `0.8` | `[0.90, 0.10]` |
+| `0.3` | `[0.65, 0.35]` |
+| `0.0` | `[0.50, 0.50]` |
+
+The `hier_mid` head produces one class distribution for each mid-level target,
+so its default output shape is `(4, output_dim)`. Its input is still the shared
+`active_feature_summary`; the quadrant information affects target construction,
+not the tensor fed directly into the head. If `mid_targets` is not `4`, the
+implementation falls back to repeating the hard class target that many times
+instead of constructing quadrant-aware targets.
+
+For one example, the supervised cross-entropy portion of the objective is
+
+```text
+L_CE = CE(y, p_task)
+     + lambda_mid * sum_q CE(y_mid_q, p_mid_q)
+     + lambda_global * CE(y, p_global)
+```
+
+The default weights are `lambda_mid = 0.06` and `lambda_global = 0.03`; the
+main task cross-entropy has weight `1.0`. The mid-level implementation sums over
+the four target distributions before the batch mean.
+
+The parent-child consistency term additionally encourages the average
+mid-level prediction to agree with the global prediction:
+
+```text
+p_mid_parent = mean_q(p_mid_q)
+L_parent_child = lambda_parent * mean_class(
+    (p_mid_parent - p_global) ** 2
+)
+```
+
+Its default weight is `lambda_parent = 0.04`. The complete training objective
+also includes the composer auxiliary penalty. In predictive-coding training,
+the weighted cross-entropies are graph energies on clamped target nodes. In
+backprop training, the targets remain outside the graph and the same terms are
+computed as external supervised losses.
+
 The graph adds:
 
 - `active_feature_summary` as the mean active column feature summary;
@@ -377,7 +455,7 @@ inside the column graph before feature pooling.
 
 `hibacaml/config/defaults.py`
 : Defines all public hyperparameters and mode presets. `make_hibacaml_config`
-  supports `paper_faithful` and `smoke`.
+  supports `default` and `smoke`.
 
 `hibacaml/data/split_mnist.py`
 : Builds deterministic task loaders for task-incremental Split-MNIST,
@@ -459,7 +537,8 @@ The experiment script accepts `learning = "pc"` or `"backprop"`.
 - `HiBaCaMLBackpropRunner` uses feedforward state initialization and JAX
   autodiff for supervised losses, while preserving support masks, certificate
   refresh, gradient masking, shell edits, boundary search, local swaps, and
-  evaluation semantics.
+  evaluation semantics. Its target-free evaluation path is also feedforward-only
+  and never falls through to iterative predictive-coding inference.
 
 The script default is `"backprop"`. This is a practical deviation from a purely
 predictive-coding training story, but it keeps the HiBaCaML controller and
@@ -552,6 +631,15 @@ For each task, `run_experiment` calls `trainer.train_task(task)`. Training:
 
 After each task, `run_experiment` calls `evaluate_all_saved_supports`, producing
 an accuracy matrix over all completed tasks under their frozen saved supports.
+Evaluation uses the `target_free_inference_external_supervision_v1` protocol:
+the graph is clamped only to the image, support mask, task query, and certificate
+inputs. The class target and the two class-derived hierarchy targets are kept
+outside inference and are used only afterward to compute external
+cross-entropies. This separation is essential for the predictive-coding runner,
+where clamping test targets during settling would leak the answer into the
+hidden-state trajectory. Per-task exports include evaluated/correct example
+counts and a task-local confusion matrix so aggregate accuracy can be audited.
+
 The script then derives:
 
 - mean seen accuracy;
@@ -568,7 +656,7 @@ actual run outputs.
 
 ## 5. Important Hyperparameters
 
-Default `paper_faithful` values are defined by `HiBaCaMLConfig` and nested
+The `default` mode's values are defined by `HiBaCaMLConfig` and nested
 configs:
 
 - seed: `0`
@@ -655,7 +743,7 @@ distinguish config defaults from script overrides.
 The implementation can be summarized as:
 
 ```text
-cfg = make_hibacaml_config("paper_faithful")
+cfg = make_hibacaml_config("default")
 tasks = build_split_mnist_tasks(cfg)
 structure = create_hibacaml_structure(cfg, inference)
 params = initialize_params(structure, seed)
@@ -672,7 +760,7 @@ for task in tasks:
         trainer.set_current_support(task, accepted_support, phi)
 
     for epoch, batch in task.train_loader:
-        grads, losses, state = trainer.compute_gradients(batch, support)
+        grads, losses, state = trainer.compute_training_gradients(batch, support)
         grads = zero inactive-column gradients
         params = optimizer_update(params, precision_weighted_grads)
         params = shell_controller.apply_structural_edits(params, state, support, phi)

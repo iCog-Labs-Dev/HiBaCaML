@@ -10,8 +10,7 @@ The experiments in this repository are implemented using [FabricPC](https://gith
 
 Supported Split-MNIST run modes are:
 
-- `paper_faithful`: the main implementation mode.
-- `full`: the expensive v18 baseline.
+- `default`: the main implementation mode.
 - `smoke`: a small developer sanity-check mode.
 
 The work in this repository focuses on experimenting with these ideas on standard continual learning benchmarks, with particular attention to:
@@ -21,12 +20,10 @@ The work in this repository focuses on experimenting with these ideas on standar
 
 The goal of this repo is to explore how a HiBaCaML/ColBa-style columnar, modular approach behaves on sequential task settings, and how effectively it supports continual learning without catastrophic forgetting.
 
-## Install FabricPC
+## Install dependencies
 
-Create a Python virtual environment, then install FabricPC in editable mode:
+From the  repo root:
 
 ```bash
-git clone https://github.com/trueagi-io/FabricPC.git
-cd FabricPC
-pip install -e ".[all]"
+pip install -r requirements.txt
 ```
