@@ -1,4 +1,4 @@
-"""Pre-run summary and confirmation for HiBaCaML experiments."""
+"""Pre-run summary for HiBaCaML experiments."""
 
 from __future__ import annotations
 
@@ -16,10 +16,8 @@ def print_pre_run_review(
     structure,
     tasks: Sequence,
     learning: str,
-    *,
-    confirm: bool = True,
 ) -> None:
-    """Print a pre-run summary and optionally wait for confirmation."""
+    """Print a pre-run summary."""
     sep = "=" * 72
     phi_candidates = 1 + 2 * 4
     learning_label = {
@@ -70,7 +68,7 @@ def print_pre_run_review(
     print(f"    weight_decay      : {cfg.weight_decay}")
     print(f"    seed              : {cfg.seed}")
     print(f"    experiment_root   : {cfg.reporting.experiment_root}")
-    print(f"    selector_state    : {cfg.reporting.selector_state_root}")
+    print(f"    selector_state    : {cfg.selector_state_path()}")
     print(
         "    reselection       : "
         f"replay_topk={cfg.exact_search.replay_topk}, "
@@ -132,13 +130,4 @@ def print_pre_run_review(
     print("    controller search : bounded local phi neighborhood around the current controller")
     print("    artifacts         : per-run tables and metrics written under experiment_root")
 
-    print(f"\n{sep}")
-    if confirm:
-        try:
-            input("  Press Enter to begin training, or Ctrl-C to abort... ")
-        except KeyboardInterrupt:
-            print("\n  Aborted by user.")
-            raise SystemExit(1)
-    else:
-        print("  Auto-proceeding (--no-confirm).")
-    print(sep + "\n")
+    print(f"\n{sep}\n")

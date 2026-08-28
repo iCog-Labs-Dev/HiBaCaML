@@ -2,14 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Dict, Tuple
 
 from hibacaml.types import PhiLike
-
-
-V20_SCHEMA_VERSION = "v20.2b"
 
 
 @dataclass(frozen=True)
@@ -150,8 +147,8 @@ class ExactSearchConfig:
 class ReportingConfig:
     """Export and checkpoint settings."""
 
-    experiment_root: str = "runs/experiments"
-    selector_state_root: str = "runs/selector_state"
+    experiment_root: str = "runs"
+    selector_state_root: str | None = None
     write_selector_state: bool = True
     checkpoint_filename: str = "hibacaml_checkpoint.pkl"
     selector_bank_filename: str = "bank.pkl"
@@ -219,6 +216,8 @@ class HiBaCaMLConfig:
         return Path(self.reporting.experiment_root)
 
     def selector_state_path(self) -> Path:
+        if self.reporting.selector_state_root is None:
+            return self.experiment_root_path() / "selector_state"
         return Path(self.reporting.selector_state_root)
 
 
@@ -265,3 +264,17 @@ def make_hibacaml_config(mode: str = "default") -> HiBaCaMLConfig:
         )
 
     raise ValueError(f"Unsupported HiBaCaML config mode: {mode}")
+
+
+def override(cfg, **kwargs):
+    """ Return a copy of cfg with the given fields replaced. """
+    top, nested = {}, {}
+    for key, value in kwargs.items():
+        if "__" in key:
+            section, field_name = key.split("__", 1)
+            nested.setdefault(section, {})[field_name] = value
+        else:
+            top[key] = value
+    for section, fields in nested.items():
+        top[section] = replace(getattr(cfg, section), **fields)
+    return replace(cfg, **top)

@@ -501,9 +501,9 @@ inside the column graph before feature pooling.
 The end-to-end flow is:
 
 ```text
-run_experiment_notebook(...)
-  -> make_hibacaml_config(mode)
-  -> apply_notebook_overrides(...)
+make_hibacaml_config(mode)
+override(cfg, ...)
+run_experiment(cfg, ...)
   -> build_split_mnist_tasks(cfg)
   -> create_hibacaml_structure(cfg, inference)
   -> initialize_params(...)
@@ -615,7 +615,7 @@ local readout head."
 - FabricPC `initialize_params` initializes graph parameters;
 - trainer class is selected from `learning`.
 
-For each task, `run_experiment` calls `trainer.train_task(task)`. Training:
+For each task, `_run_tasks` calls `trainer.train_task(task)`. Training:
 
 1. selects a support at the task boundary if no support is set;
 2. computes gradients on each training batch;
@@ -629,7 +629,7 @@ For each task, `run_experiment` calls `trainer.train_task(task)`. Training:
 
 ### 4.6 Evaluation Setup
 
-After each task, `run_experiment` calls `evaluate_all_saved_supports`, producing
+After each task, `_run_tasks` calls `evaluate_all_saved_supports`, producing
 an accuracy matrix over all completed tasks under their frozen saved supports.
 Evaluation uses the `target_free_inference_external_supervision_v1` protocol:
 the graph is clamped only to the image, support mask, task query, and certificate
@@ -664,7 +664,7 @@ configs:
 - patch size: `(7, 7)`
 - number of tasks: `5`
 - batch size in config: `256`
-- experiment script override: `BATCH_SIZE = 768`
+- experiment script override: `OVERRIDES["batch_size"] = 768`
 - epochs per task: `5`
 - inference steps: `8`
 - optimizer: AdamW with learning rate `0.001` and weight decay `0.05`

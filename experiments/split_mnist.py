@@ -1,89 +1,22 @@
 """Split-MNIST experiment runner for HiBaCaML."""
 
 from __future__ import annotations
-
-# ------------------------------------------------------------
-# Script inputs: edit these directly, or import and call
-# run_experiment_notebook(...) from another script.
-# ------------------------------------------------------------
-MODE = "default"                       # "default" or "smoke"
-TASKS = None                           # e.g. 2, 5, or None for all
-SHORTLIST = None                       # e.g. 8 or None
-EPOCHS = None                          # e.g. 1, 5, or None
-INFER_STEPS = None                     # e.g. 20 or None
-ROLLOUT_STEPS = None                   # e.g. 4 or None
-STATIC_SUPPORT_BATCH_SIZE = 16       # e.g. 2 or None
-NEIGHBOR_SUPPORT_BATCH_SIZE = 16     # e.g. 32 or None
-CURRENT_BOUNDARY_BATCHES = None        # e.g. 2 or None
-OLD_BOUNDARY_BATCHES = None            # e.g. 2 or None
-TRAIN_BATCHES_LIMIT = None             # e.g. 10 or None
-TEST_BATCHES_LIMIT = None              # e.g. 10 or None
-EXACT_SEARCH = None                    # True / False / None; leave None for config default
-LEARNING = "backprop"                  # "pc" or "backprop"
-CONFIRM = False                        # False is best for non-interactive runs
-CPU = False                            # True => force JAX CPU backend
-PLOTS_DIR = None                       
-EXPERIMENT_ROOT = None               
-SELECTOR_STATE_ROOT = None             
-RUN_ID = None                         
-
-# Resume controls
-RESUME_FROM_TASK = None                # e.g. 4 — next task to train; loads task_(N-1)/checkpoints/...
-RESUME_RUN_ID = None                   # optional explicit run_id; auto-detected if None
-
-# Memory-related inputs
-LOW_MEMORY_BATCH_SIZE_CAP = None       # e.g. 64, or None to disable
-BATCH_SIZE = 768                        # direct batch_size override, e.g. 64
-BOUNDARY_CURRENT_DATA_BATCH_SIZE = 128
-ROLLOUT_TRAIN_DATA_BATCH_SIZE = 128
-BOUNDARY_WORST_OLD_DATA_BATCH_SIZE = 128
-BOUNDARY_MIXED_OLD_DATA_BATCH_SIZE = 128
-LOCAL_SWAP_AUDIT_DATA_BATCH_SIZE = 128
-DEMOTION_AUDIT_DATA_BATCH_SIZE = 128
-
-
-# ------------------------------------------------------------
-# Early environment setup: must happen before `import jax`
-# ------------------------------------------------------------
 import csv
 import dataclasses
 import gc
-import importlib
 import json
-import os
 import sys
+import jax
 from pathlib import Path
 from typing import Dict, List, Sequence
 
-if "." not in sys.path:
-    sys.path.insert(0, ".")
-
-importlib.invalidate_caches()
-
-if CPU:
-    os.environ.setdefault("JAX_PLATFORMS", "cpu")
-else:
-    os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
-    os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "platform")
-
-from fabricpc import setup_jax
-
-setup_jax(platform=os.environ.get("JAX_PLATFORMS", "cuda"))
-
-import jax
-
-if "MPLCONFIGDIR" not in os.environ:
-    mpl_cache = Path(".mplconfig")
-    mpl_cache.mkdir(exist_ok=True)
-    os.environ["MPLCONFIGDIR"] = str(mpl_cache.resolve())
-
-
-# ------------------------------------------------------------
-# Project imports
-# ------------------------------------------------------------
 from fabricpc.core.inference import InferenceSGD
 from fabricpc.graph_initialization import initialize_params
 from fabricpc.graph_initialization.state_initializer import FeedforwardStateInit
+
+sys.path.append(".")
+
+from hibacaml.debug import log_progress
 from hibacaml import (
     HiBaCaMLBackpropRunner,
     HiBaCaMLTrainer,
@@ -91,8 +24,9 @@ from hibacaml import (
     create_hibacaml_structure,
     export_run_artifacts,
     make_hibacaml_config,
+    override,
 )
-from hibacaml.debug import log_progress
+
 from hibacaml.reporting import (
     plot_accuracy_forgetting,
     plot_support_table,
@@ -101,9 +35,25 @@ from hibacaml.reporting import (
 )
 
 
-# ------------------------------------------------------------
+MODE = "default"                       # "default" or "smoke"
+LEARNING = "backprop"                  # "pc" or "backprop"
+TASKS_LIMIT = None                     # e.g. 2, 5, or None for all
+
+# Any HiBaCaMLConfig field to override for this run.
+OVERRIDES = {
+    "batch_size": 768,
+    "exact_search__static_support_batch_size": 16,
+    "exact_search__neighbor_support_batch_size": 16,
+    "exact_search__boundary_current_data_batch_size": 128,
+    "exact_search__rollout_train_data_batch_size": 128,
+    "exact_search__boundary_worst_old_data_batch_size": 128,
+    "exact_search__boundary_mixed_old_data_batch_size": 128,
+    "exact_search__local_swap_audit_data_batch_size": 128,
+    "exact_search__demotion_audit_data_batch_size": 128,
+}
+
+
 # Helpers
-# ------------------------------------------------------------
 def _jsonable(value):
     if dataclasses.is_dataclass(value):
         return {key: _jsonable(val) for key, val in dataclasses.asdict(value).items()}
@@ -137,76 +87,7 @@ def _write_csv(path: Path, rows: Sequence[Dict[str, object]]) -> None:
             writer.writerow({key: _jsonable(row.get(key)) for key in fieldnames})
 
 
-def _validate_optional_positive_int(name: str, value: int | None) -> int | None:
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        raise ValueError(f"{name} must be None or a positive integer, got {value!r}")
-    value = int(value)
-    if value <= 0:
-        raise ValueError(f"{name} must be None or a positive integer, got {value!r}")
-    return value
-
-
-# ------------------------------------------------------------
-# Resume helpers
-# ------------------------------------------------------------
-def _load_task_evaluations(run_root: Path, task_id: int) -> Dict[int, Dict[str, float]]:
-    path = run_root / f"task_{task_id}" / "task_evaluations.json"
-    raw = json.loads(path.read_text())
-    return {int(k): v for k, v in raw.items()}
-
-
-def _reconstruct_task_summary(task, evaluations: Dict[int, Dict[str, float]], snapshot) -> Dict[str, object]:
-    own = evaluations[task.task_id]
-    return {
-        "task_id": task.task_id,
-        "classes": list(task.classes),
-        "support_indices": list(snapshot.full_support),
-        "accuracy": own["accuracy"],
-        "mean_loss": own["mean_loss"],
-        "best_old_accuracy": own["best_old_accuracy"],
-        "support_entropy": own["support_entropy"],
-    }
-
-
-def _infer_resume_run_id(experiment_root: Path, prev_task_id: int, checkpoint_filename: str) -> str:
-    if not experiment_root.is_dir():
-        raise FileNotFoundError(f"experiment_root not found: {experiment_root}")
-    candidates = [
-        d for d in experiment_root.iterdir()
-        if d.is_dir() and (d / f"task_{prev_task_id}" / "checkpoints" / checkpoint_filename).is_file()
-    ]
-    if not candidates:
-        raise FileNotFoundError(
-            f"No run directory under {experiment_root} contains "
-            f"task_{prev_task_id}/checkpoints/{checkpoint_filename}"
-        )
-    if len(candidates) > 1:
-        candidates.sort(key=lambda d: d.stat().st_mtime, reverse=True)
-        log_progress(
-            f"multiple resume candidates found; picking most recent: {candidates[0].name}",
-            component="runner",
-        )
-    return candidates[0].name
-
-
-def _resolve_resume_checkpoint(cfg, resume_from_task: int, explicit_run_id: str | None) -> tuple[str, Path]:
-    prev_task_id = resume_from_task - 1
-    if prev_task_id < 0:
-        raise ValueError(f"resume_from_task must be >= 1, got {resume_from_task}")
-    experiment_root = cfg.experiment_root_path()
-    checkpoint_filename = cfg.reporting.checkpoint_filename
-    run_id = explicit_run_id or _infer_resume_run_id(experiment_root, prev_task_id, checkpoint_filename)
-    checkpoint_path = experiment_root / run_id / f"task_{prev_task_id}" / "checkpoints" / checkpoint_filename
-    if not checkpoint_path.is_file():
-        raise FileNotFoundError(f"checkpoint not found: {checkpoint_path}")
-    return run_id, checkpoint_path
-
-
-# ------------------------------------------------------------
 # Trainer construction
-# ------------------------------------------------------------
 def build_trainer(cfg, tasks, learning: str, *, run_id: str = ""):
     """Construct the HiBaCaML trainer for one learning mode."""
     inference = InferenceSGD(eta_infer=cfg.eta_infer, infer_steps=cfg.infer_steps)
@@ -227,9 +108,7 @@ def build_trainer(cfg, tasks, learning: str, *, run_id: str = ""):
     return structure, trainer
 
 
-# ------------------------------------------------------------
 # Metric helpers
-# ------------------------------------------------------------
 def _mean_seen_accuracy(accuracy_matrix: Dict[int, Dict[int, float]]) -> List[float]:
     curve: List[float] = []
     for task_id in sorted(accuracy_matrix):
@@ -317,78 +196,24 @@ def _task_metric_rows(
     return rows
 
 
-# ------------------------------------------------------------
 # Core experiment loop
-# ------------------------------------------------------------
-def run_experiment(
+def _run_tasks(
     cfg,
     tasks,
     learning: str,
     run_root: Path,
     *,
     run_id: str = "",
-    resume_from: str | Path | None = None,
 ) -> dict:
-    """Run the HiBaCaML experiment for one learning mode."""
-    trainer_cfg = dataclasses.replace(
-        cfg,
-        reporting=dataclasses.replace(
-            cfg.reporting,
-            experiment_root=str(run_root),
-        ),
-    )
-    _, trainer = build_trainer(trainer_cfg, tasks, learning, run_id=run_id)
+    """Train and evaluate every task in sequence for one learning mode."""
+    _, trainer = build_trainer(cfg, tasks, learning, run_id=run_id)
 
     accuracy_matrix: Dict[int, Dict[int, float]] = {}
     task_summaries: List[Dict[str, object]] = []
     artifact_roots: Dict[int, str] = {}
     checkpoint_paths: Dict[int, str] = {}
-    completed_ids: set = set()
-
-    if resume_from is not None:
-        trainer.load_checkpoint(resume_from)
-        snapshots = trainer.persistent_state.task_support_snapshots
-        completed_ids = set(snapshots.keys())
-        if snapshots:
-            # load_checkpoint restores persistent_state/params/opt_state but leaves
-            # current_phi/current_nonshared at their constructor defaults. The next
-            # boundary_search builds phi_candidates() around trainer.current_phi, so
-            # without this the resumed controller would search a different neighborhood
-            # than an uninterrupted run.
-            last = snapshots[max(snapshots)]
-            trainer.current_phi = last.phi
-            trainer.current_nonshared = tuple(last.nonshared)
-            log_progress(
-                f"restored controller state from task={max(snapshots)} "
-                f"nonshared={trainer.current_nonshared}",
-                component="runner",
-            )
-        log_progress(
-            f"resumed from {resume_from}; completed tasks={sorted(completed_ids)}",
-            component="runner",
-        )
-        for task in tasks:
-            if task.task_id not in completed_ids:
-                continue
-            evals = _load_task_evaluations(run_root, task.task_id)
-            accuracy_matrix[task.task_id] = {
-                eval_id: metrics["accuracy"] for eval_id, metrics in evals.items()
-            }
-            task_summaries.append(
-                _reconstruct_task_summary(
-                    task,
-                    evals,
-                    trainer.persistent_state.task_support_snapshots[task.task_id],
-                )
-            )
-            artifact_roots[task.task_id] = str(run_root / f"task_{task.task_id}")
-            checkpoint_paths[task.task_id] = str(
-                run_root / f"task_{task.task_id}" / "checkpoints" / cfg.reporting.checkpoint_filename
-            )
 
     for task in tasks:
-        if task.task_id in completed_ids:
-            continue
         log_progress(f"task={task.task_id} train start", component="runner")
         summary = trainer.train_task(task)
         eval_results = trainer.evaluate_all_saved_supports()
@@ -463,171 +288,7 @@ def run_experiment(
     return results
 
 
-# ------------------------------------------------------------
-# Config preparation
-# ------------------------------------------------------------
-def apply_notebook_overrides(
-    cfg,
-    *,
-    shortlist: int | None = SHORTLIST,
-    epochs: int | None = EPOCHS,
-    infer_steps: int | None = INFER_STEPS,
-    rollout_steps: int | None = ROLLOUT_STEPS,
-    static_support_batch_size: int | None = STATIC_SUPPORT_BATCH_SIZE,
-    neighbor_support_batch_size: int | None = NEIGHBOR_SUPPORT_BATCH_SIZE,
-    current_boundary_batches: int | None = CURRENT_BOUNDARY_BATCHES,
-    old_boundary_batches: int | None = OLD_BOUNDARY_BATCHES,
-    boundary_current_data_batch_size: int | None = BOUNDARY_CURRENT_DATA_BATCH_SIZE,
-    rollout_train_data_batch_size: int | None = ROLLOUT_TRAIN_DATA_BATCH_SIZE,
-    boundary_worst_old_data_batch_size: int | None = BOUNDARY_WORST_OLD_DATA_BATCH_SIZE,
-    boundary_mixed_old_data_batch_size: int | None = BOUNDARY_MIXED_OLD_DATA_BATCH_SIZE,
-    local_swap_audit_data_batch_size: int | None = LOCAL_SWAP_AUDIT_DATA_BATCH_SIZE,
-    demotion_audit_data_batch_size: int | None = DEMOTION_AUDIT_DATA_BATCH_SIZE,
-    train_batches_limit: int | None = TRAIN_BATCHES_LIMIT,
-    test_batches_limit: int | None = TEST_BATCHES_LIMIT,
-    exact_search: bool | None = EXACT_SEARCH,
-    experiment_root: str | None = EXPERIMENT_ROOT,
-    selector_state_root: str | None = SELECTOR_STATE_ROOT,
-    low_memory_batch_size_cap: int | None = LOW_MEMORY_BATCH_SIZE_CAP,
-    batch_size: int | None = BATCH_SIZE,
-):
-    """Apply script overrides in one place."""
-    if shortlist is not None:
-        cfg = dataclasses.replace(
-            cfg,
-            exact_search=dataclasses.replace(
-                cfg.exact_search,
-                boundary_shortlist=shortlist,
-            ),
-        )
-
-    if current_boundary_batches is not None:
-        cfg = dataclasses.replace(
-            cfg,
-            exact_search=dataclasses.replace(
-                cfg.exact_search,
-                boundary_current_batches=current_boundary_batches,
-            ),
-        )
-
-    if old_boundary_batches is not None:
-        cfg = dataclasses.replace(
-            cfg,
-            exact_search=dataclasses.replace(
-                cfg.exact_search,
-                boundary_old_batches=old_boundary_batches,
-            ),
-        )
-
-    search_data_overrides = {
-        "boundary_current_data_batch_size": boundary_current_data_batch_size,
-        "rollout_train_data_batch_size": rollout_train_data_batch_size,
-        "boundary_worst_old_data_batch_size": boundary_worst_old_data_batch_size,
-        "boundary_mixed_old_data_batch_size": boundary_mixed_old_data_batch_size,
-        "local_swap_audit_data_batch_size": local_swap_audit_data_batch_size,
-        "demotion_audit_data_batch_size": demotion_audit_data_batch_size,
-    }
-    search_data_overrides = {
-        key: _validate_optional_positive_int(key, value)
-        for key, value in search_data_overrides.items()
-        if value is not None
-    }
-    if search_data_overrides:
-        cfg = dataclasses.replace(
-            cfg,
-            exact_search=dataclasses.replace(
-                cfg.exact_search,
-                **search_data_overrides,
-            ),
-        )
-        log_progress(
-            "exact-search data batch overrides: "
-            + ", ".join(
-                f"{key}={value}" for key, value in sorted(search_data_overrides.items())
-            ),
-            component="runner",
-        )
-
-    if rollout_steps is not None:
-        cfg = dataclasses.replace(
-            cfg,
-            exact_search=dataclasses.replace(
-                cfg.exact_search,
-                boundary_rollout_steps=rollout_steps,
-            ),
-        )
-
-    if static_support_batch_size is not None:
-        cfg = dataclasses.replace(
-            cfg,
-            exact_search=dataclasses.replace(
-                cfg.exact_search,
-                static_support_batch_size=static_support_batch_size,
-            ),
-        )
-
-    if neighbor_support_batch_size is not None:
-        cfg = dataclasses.replace(
-            cfg,
-            exact_search=dataclasses.replace(
-                cfg.exact_search,
-                neighbor_support_batch_size=neighbor_support_batch_size,
-            ),
-        )
-
-    if exact_search is not None:
-        cfg = dataclasses.replace(
-            cfg,
-            exact_search=dataclasses.replace(
-                cfg.exact_search,
-                enable_exact_search=exact_search,
-            ),
-        )
-
-    if epochs is not None:
-        cfg = dataclasses.replace(cfg, epochs_per_task=epochs)
-
-    if infer_steps is not None:
-        cfg = dataclasses.replace(cfg, infer_steps=infer_steps)
-
-    if train_batches_limit is not None:
-        cfg = dataclasses.replace(cfg, train_batches_limit=train_batches_limit)
-
-    if test_batches_limit is not None:
-        cfg = dataclasses.replace(cfg, test_batches_limit=test_batches_limit)
-
-    if experiment_root is not None:
-        cfg = dataclasses.replace(
-            cfg,
-            reporting=dataclasses.replace(cfg.reporting, experiment_root=experiment_root),
-        )
-
-    if selector_state_root is not None:
-        cfg = dataclasses.replace(
-            cfg,
-            reporting=dataclasses.replace(cfg.reporting, selector_state_root=selector_state_root),
-        )
-
-    if low_memory_batch_size_cap is not None:
-        cfg = dataclasses.replace(
-            cfg,
-            batch_size=min(cfg.batch_size, low_memory_batch_size_cap),
-        )
-        log_progress(
-            f"low-memory batch cap active: batch_size <= {low_memory_batch_size_cap}",
-            component="runner",
-        )
-
-    if batch_size is not None:
-        cfg = dataclasses.replace(cfg, batch_size=batch_size)
-        log_progress(f"batch_size override: {batch_size}", component="runner")
-
-    return cfg
-
-
-# ------------------------------------------------------------
 # Plot generation
-# ------------------------------------------------------------
 def generate_plots(results: dict, plots_dir: Path) -> None:
     """Generate accuracy, support, and swap-gain figures."""
     plots_dir.mkdir(parents=True, exist_ok=True)
@@ -649,74 +310,22 @@ def generate_plots(results: dict, plots_dir: Path) -> None:
     log_progress(f"plots saved to {plots_dir}", component="runner")
 
 
-# ------------------------------------------------------------
-# Main entry point
-# ------------------------------------------------------------
-def run_experiment_notebook(
-    mode: str = MODE,
-    tasks_limit: int | None = TASKS,
+
+## Main entry point
+def run_experiment(
+    cfg,
+    *,
     learning: str = LEARNING,
-    confirm: bool = CONFIRM,
-    plots_dir: str | None = PLOTS_DIR,
-    experiment_root: str | None = EXPERIMENT_ROOT,
-    selector_state_root: str | None = SELECTOR_STATE_ROOT,
-    run_id: str | None = RUN_ID,
-    shortlist: int | None = SHORTLIST,
-    epochs: int | None = EPOCHS,
-    infer_steps: int | None = INFER_STEPS,
-    rollout_steps: int | None = ROLLOUT_STEPS,
-    static_support_batch_size: int | None = STATIC_SUPPORT_BATCH_SIZE,
-    neighbor_support_batch_size: int | None = NEIGHBOR_SUPPORT_BATCH_SIZE,
-    current_boundary_batches: int | None = CURRENT_BOUNDARY_BATCHES,
-    old_boundary_batches: int | None = OLD_BOUNDARY_BATCHES,
-    boundary_current_data_batch_size: int | None = BOUNDARY_CURRENT_DATA_BATCH_SIZE,
-    rollout_train_data_batch_size: int | None = ROLLOUT_TRAIN_DATA_BATCH_SIZE,
-    boundary_worst_old_data_batch_size: int | None = BOUNDARY_WORST_OLD_DATA_BATCH_SIZE,
-    boundary_mixed_old_data_batch_size: int | None = BOUNDARY_MIXED_OLD_DATA_BATCH_SIZE,
-    local_swap_audit_data_batch_size: int | None = LOCAL_SWAP_AUDIT_DATA_BATCH_SIZE,
-    demotion_audit_data_batch_size: int | None = DEMOTION_AUDIT_DATA_BATCH_SIZE,
-    train_batches_limit: int | None = TRAIN_BATCHES_LIMIT,
-    test_batches_limit: int | None = TEST_BATCHES_LIMIT,
-    exact_search: bool | None = EXACT_SEARCH,
-    low_memory_batch_size_cap: int | None = LOW_MEMORY_BATCH_SIZE_CAP,
-    batch_size: int | None = BATCH_SIZE,
-    resume_from_task: int | None = RESUME_FROM_TASK,
-    resume_run_id: str | None = RESUME_RUN_ID,
+    tasks_limit: int | None = TASKS_LIMIT,
+    plots_dir: str | None = None,
+    run_id: str | None = None,
 ):
     if learning not in ("pc", "backprop"):
         raise ValueError("learning must be 'pc' or 'backprop'")
-    if mode not in ("default", "smoke"):
-        raise ValueError("mode must be 'default' or 'smoke'")
 
     print("JAX backend:", jax.default_backend(), flush=True)
     print("JAX devices:", jax.devices(), flush=True)
     print("starting HiBaCaML experiment.")
-
-    cfg = make_hibacaml_config(mode)
-    cfg = apply_notebook_overrides(
-        cfg,
-        shortlist=shortlist,
-        epochs=epochs,
-        infer_steps=infer_steps,
-        rollout_steps=rollout_steps,
-        static_support_batch_size=static_support_batch_size,
-        neighbor_support_batch_size=neighbor_support_batch_size,
-        current_boundary_batches=current_boundary_batches,
-        old_boundary_batches=old_boundary_batches,
-        boundary_current_data_batch_size=boundary_current_data_batch_size,
-        rollout_train_data_batch_size=rollout_train_data_batch_size,
-        boundary_worst_old_data_batch_size=boundary_worst_old_data_batch_size,
-        boundary_mixed_old_data_batch_size=boundary_mixed_old_data_batch_size,
-        local_swap_audit_data_batch_size=local_swap_audit_data_batch_size,
-        demotion_audit_data_batch_size=demotion_audit_data_batch_size,
-        train_batches_limit=train_batches_limit,
-        test_batches_limit=test_batches_limit,
-        exact_search=exact_search,
-        experiment_root=experiment_root,
-        selector_state_root=selector_state_root,
-        low_memory_batch_size_cap=low_memory_batch_size_cap,
-        batch_size=batch_size,
-    )
 
     tasks = build_split_mnist_tasks(cfg)
     if tasks_limit is not None:
@@ -730,42 +339,44 @@ def run_experiment_notebook(
     )
     review_structure = create_hibacaml_structure(cfg, review_inference)
 
-    confirm_flag = bool(confirm) and sys.stdin.isatty()
     print_pre_run_review(
         cfg,
         review_structure,
         tasks,
         learning,
-        confirm=confirm_flag,
     )
 
     del review_structure
     gc.collect()
 
-    resume_checkpoint_path: Path | None = None
-    if resume_from_task is not None:
-        resolved_run_id, resume_checkpoint_path = _resolve_resume_checkpoint(
-            cfg, resume_from_task, resume_run_id
-        )
-        run_id = resolved_run_id
-        log_progress(
-            f"resume mode: run_id={run_id} checkpoint={resume_checkpoint_path}",
-            component="runner",
-        )
-    elif run_id is None:
+    if run_id is None:
         from datetime import datetime, timezone
-        run_id = f"{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}_seed{cfg.seed}"
+        run_id = f"SMNIST_{learning}_{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
     run_output_root = cfg.experiment_root_path() / run_id
-    run_output_root.mkdir(parents=True, exist_ok=True)
+    if run_output_root.exists():
+        raise FileExistsError(
+            f"run directory already exists: {run_output_root} "
+            "(choose a different run_id, or remove the existing directory)"
+        )
+    run_output_root.mkdir(parents=True)
     run_plots_dir = Path(plots_dir) if plots_dir else run_output_root / "plots"
 
-    results = run_experiment(
+    selector_state_root = cfg.reporting.selector_state_root or str(run_output_root / "selector_state")
+    cfg = dataclasses.replace(
+        cfg,
+        reporting=dataclasses.replace(
+            cfg.reporting,
+            experiment_root=str(run_output_root),
+            selector_state_root=selector_state_root,
+        ),
+    )
+
+    results = _run_tasks(
         cfg,
         tasks,
         learning,
         run_output_root,
         run_id=run_id,
-        resume_from=resume_checkpoint_path,
     )
     generate_plots(results, run_plots_dir)
 
@@ -789,38 +400,7 @@ def run_experiment_notebook(
     }
 
 
-# ------------------------------------------------------------
-# Execute only when run as a script
-# ------------------------------------------------------------
 if __name__ == "__main__":
-    run_output = run_experiment_notebook(
-        mode=MODE,
-        tasks_limit=TASKS,
-        learning=LEARNING,
-        confirm=CONFIRM,
-        plots_dir=PLOTS_DIR,
-        experiment_root=EXPERIMENT_ROOT,
-        selector_state_root=SELECTOR_STATE_ROOT,
-        run_id=RUN_ID,
-        shortlist=SHORTLIST,
-        epochs=EPOCHS,
-        infer_steps=INFER_STEPS,
-        rollout_steps=ROLLOUT_STEPS,
-        static_support_batch_size=STATIC_SUPPORT_BATCH_SIZE,
-        neighbor_support_batch_size=NEIGHBOR_SUPPORT_BATCH_SIZE,
-        current_boundary_batches=CURRENT_BOUNDARY_BATCHES,
-        old_boundary_batches=OLD_BOUNDARY_BATCHES,
-        boundary_current_data_batch_size=BOUNDARY_CURRENT_DATA_BATCH_SIZE,
-        rollout_train_data_batch_size=ROLLOUT_TRAIN_DATA_BATCH_SIZE,
-        boundary_worst_old_data_batch_size=BOUNDARY_WORST_OLD_DATA_BATCH_SIZE,
-        boundary_mixed_old_data_batch_size=BOUNDARY_MIXED_OLD_DATA_BATCH_SIZE,
-        local_swap_audit_data_batch_size=LOCAL_SWAP_AUDIT_DATA_BATCH_SIZE,
-        demotion_audit_data_batch_size=DEMOTION_AUDIT_DATA_BATCH_SIZE,
-        train_batches_limit=TRAIN_BATCHES_LIMIT,
-        test_batches_limit=TEST_BATCHES_LIMIT,
-        exact_search=EXACT_SEARCH,
-        low_memory_batch_size_cap=LOW_MEMORY_BATCH_SIZE_CAP,
-        batch_size=BATCH_SIZE,
-        resume_from_task=RESUME_FROM_TASK,
-        resume_run_id=RESUME_RUN_ID,
-    )
+    cfg = make_hibacaml_config(MODE)
+    cfg = override(cfg, **OVERRIDES)
+    run_output = run_experiment(cfg)

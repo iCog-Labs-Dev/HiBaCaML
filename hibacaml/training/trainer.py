@@ -16,7 +16,7 @@ import optax
 from fabricpc.core.inference import run_inference
 from fabricpc.core.learning import compute_local_weight_gradients
 from fabricpc.graph_initialization.state_initializer import initialize_graph_state
-from hibacaml.config import V20_SCHEMA_VERSION, HiBaCaMLConfig
+from hibacaml.config import HiBaCaMLConfig
 from hibacaml.control.replay_bank import SelectorBank
 from hibacaml.control.search import ExactSearchService
 from hibacaml.control.shells import ShellController
@@ -1183,7 +1183,6 @@ class HiBaCaMLTrainer:
             "composer_diagnostics": self.persistent_state.composer_diagnostics,
             "selector_bank_summary": self.selector_bank.summary(),
             "run_id": self.run_id,
-            "schema_version": V20_SCHEMA_VERSION,
             "evaluation_protocol": "target_free_inference_external_supervision_v1",
         }
 
@@ -1192,7 +1191,6 @@ class HiBaCaMLTrainer:
         checkpoint_root.mkdir(parents=True, exist_ok=True)
         path = checkpoint_root / self.cfg.reporting.checkpoint_filename
         payload = {
-            "schema_version": V20_SCHEMA_VERSION,
             "task_id": task_id,
             "persistent_state": self.persistent_state,
             "params": self.params,
@@ -1203,30 +1201,3 @@ class HiBaCaMLTrainer:
         if self.run_logger is not None:
             self.run_logger.event("checkpoint_saved", task_id=task_id, path=str(path))
         return path
-
-    def load_checkpoint(self, path: str | Path) -> None:
-        try:
-            with Path(path).open("rb") as fh:
-                payload = pickle.load(fh)
-        except (
-            AttributeError,
-            ModuleNotFoundError,
-            ImportError,
-            pickle.UnpicklingError,
-        ) as exc:
-            raise ValueError(
-                "Checkpoint could not be loaded for V20 schema validation; "
-                "V18 checkpoints are not supported by V20.2b. Start a fresh run."
-            ) from exc
-        schema = payload.get("schema_version") if isinstance(payload, dict) else None
-        if schema != V20_SCHEMA_VERSION:
-            raise ValueError(
-                f"Checkpoint schema {schema!r} is not {V20_SCHEMA_VERSION!r}; "
-                "V18 checkpoints are not supported by V20.2b. Start a fresh run."
-            )
-        self.persistent_state = payload["persistent_state"]
-        self.params = payload["params"]
-        self.opt_state = payload["opt_state"]
-        self.persistent_state.params = self.params
-        self.persistent_state.opt_state = self.opt_state
-        self._invalidate_eval_cache()
