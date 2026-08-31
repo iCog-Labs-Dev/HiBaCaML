@@ -173,7 +173,7 @@ class HiBaCaMLConfig:
     num_tasks: int = 5
     batch_size: int = 256
     epochs_per_task: int = 5
-    infer_steps: int = 8
+    infer_steps: int = 16
     eta_infer: float = 0.05
     optimizer_lr: float = 0.001
     weight_decay: float = 0.05

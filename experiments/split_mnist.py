@@ -91,7 +91,7 @@ def _write_csv(path: Path, rows: Sequence[Dict[str, object]]) -> None:
 def build_trainer(cfg, tasks, learning: str, *, run_id: str = ""):
     """Construct the HiBaCaML trainer for one learning mode."""
     inference = InferenceSGD(eta_infer=cfg.eta_infer, infer_steps=cfg.infer_steps)
-    graph_state_initializer = FeedforwardStateInit() if learning == "backprop" else None
+    graph_state_initializer = FeedforwardStateInit()
     structure = create_hibacaml_structure(
         cfg,
         inference,
@@ -198,15 +198,12 @@ def _task_metric_rows(
 
 # Core experiment loop
 def _run_tasks(
-    cfg,
+    trainer,
     tasks,
     learning: str,
     run_root: Path,
-    *,
-    run_id: str = "",
 ) -> dict:
     """Train and evaluate every task in sequence for one learning mode."""
-    _, trainer = build_trainer(cfg, tasks, learning, run_id=run_id)
 
     accuracy_matrix: Dict[int, Dict[int, float]] = {}
     task_summaries: List[Dict[str, object]] = []
@@ -327,27 +324,9 @@ def run_experiment(
     print("JAX devices:", jax.devices(), flush=True)
     print("starting HiBaCaML experiment.")
 
-    tasks = build_split_mnist_tasks(cfg)
-    if tasks_limit is not None:
-        tasks = tasks[:tasks_limit]
+    tasks = build_split_mnist_tasks(cfg, limit=tasks_limit)
 
     log_progress(f"loaded {len(tasks)} Split-MNIST tasks", component="runner")
-
-    review_inference = InferenceSGD(
-        eta_infer=cfg.eta_infer,
-        infer_steps=cfg.infer_steps,
-    )
-    review_structure = create_hibacaml_structure(cfg, review_inference)
-
-    print_pre_run_review(
-        cfg,
-        review_structure,
-        tasks,
-        learning,
-    )
-
-    del review_structure
-    gc.collect()
 
     if run_id is None:
         from datetime import datetime, timezone
@@ -371,12 +350,14 @@ def run_experiment(
         ),
     )
 
+    structure, trainer = build_trainer(cfg, tasks, learning, run_id=run_id)
+    print_pre_run_review(cfg, structure, tasks, learning)
+
     results = _run_tasks(
-        cfg,
+        trainer,
         tasks,
         learning,
         run_output_root,
-        run_id=run_id,
     )
     generate_plots(results, run_plots_dir)
 

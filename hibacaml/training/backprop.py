@@ -8,7 +8,6 @@ import jax
 import jax.numpy as jnp
 
 from fabricpc.graph_initialization.state_initializer import initialize_graph_state
-from fabricpc.training.train_backprop import validate_feedforward_init
 from hibacaml.training.trainer import (
     HiBaCaMLTrainer,
     _composer_details_from_runtime,
@@ -19,10 +18,6 @@ from hibacaml.training.trainer import (
 
 class HiBaCaMLBackpropRunner(HiBaCaMLTrainer):
     """End-to-end autodiff runner that preserves HiBaCaML control semantics."""
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        validate_feedforward_init(self.structure)
 
     def _build_clamps(
         self,
@@ -77,8 +72,10 @@ class HiBaCaMLBackpropRunner(HiBaCaMLTrainer):
         if refresh_certificates:
             self._refresh_certificates(batch_size, params=params)
         support_masks = [self.build_support_mask(nonshared) for nonshared in supports]
+        # The unmasked vectors are identical for every support; only the mask differs.
+        cert_base = self.shell_controller.certificate_vectors(self.persistent_state)
         cert_matrices = [
-            self.shell_controller.certificate_matrix(self.persistent_state, mask)
+            self.shell_controller.mask_certificate_vectors(cert_base, mask)
             for mask in support_masks
         ]
         meta = self.structure.config["hibacaml"]
@@ -275,18 +272,14 @@ class HiBaCaMLBackpropRunner(HiBaCaMLTrainer):
                 refresh_certificates=False,
             )
             losses = self._loss_components(final_state, batch, p, clamps)
-            return losses["total"], final_state
+            # Report the components computed here rather than recomputing them
+            # eagerly afterwards on the same state and params.
+            return losses["total"], (final_state, losses)
 
-        (total_loss, final_state), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
+        (total_loss, (final_state, losses)), grads = jax.value_and_grad(
+            loss_fn, has_aux=True
+        )(params)
         self._last_graph_state = final_state
-        clamps = self._build_clamps(
-            batch,
-            task,
-            nonshared,
-            params=params,
-            refresh_certificates=False,
-        )
-        losses = self._loss_components(final_state, batch, params, clamps)
         losses = {name: float(value) for name, value in losses.items()}
         losses["total"] = float(total_loss)
         return grads, losses, final_state

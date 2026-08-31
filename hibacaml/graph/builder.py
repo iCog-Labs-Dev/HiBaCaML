@@ -9,7 +9,7 @@ from fabricpc.graph_assembly import graph, TaskMap
 from fabricpc.nodes import IdentityNode, Linear
 from fabricpc.core.activations import IdentityActivation, SoftmaxActivation, TanhActivation
 from fabricpc.core.inference import InferenceBase
-from fabricpc.graph_initialization.state_initializer import NodeDistributionStateInit, StateInitBase
+from fabricpc.graph_initialization.state_initializer import StateInitBase
 from hibacaml.config import HiBaCaMLConfig
 from hibacaml.nodes import (
     ComposerStage2Node,
@@ -21,16 +21,24 @@ from hibacaml.nodes import (
     ShellBankResidualNode,
     WeightedCrossEntropyEnergy,
 )
-from hibacaml.types import ColumnCertificate, PersistentHiBaCaMLState, ShellStats
+from hibacaml.types import (
+    ColumnCertificate,
+    PersistentHiBaCaMLState,
+    ShellStats
+    )
 
 
 
 def create_hibacaml_structure(
     cfg: HiBaCaMLConfig,
     inference: InferenceBase,
-    graph_state_initializer: StateInitBase | None = None,
+    graph_state_initializer: StateInitBase,
 ):
-    """Create the full static column-bank graph."""
+    """Create the full static column-bank graph.
+
+    Any ``StateInitBase`` is accepted here so the builder stays independent of
+    training concerns, but both HiBaCaML runners require ``FeedforwardStateInit``.
+    """
     nodes = []
     edges = []
     column_metadata: List[Dict[str, str]] = []
@@ -256,7 +264,7 @@ def create_hibacaml_structure(
             hier_global=hier_global,
         ),
         inference=inference,
-        graph_state_initializer=graph_state_initializer or NodeDistributionStateInit(),
+        graph_state_initializer=graph_state_initializer,
     )
 
     hibacaml_meta = {
@@ -286,7 +294,6 @@ def create_hibacaml_structure(
 
 
 def initialize_hibacaml_state(
-    structure,
     params,
     cfg: HiBaCaMLConfig,
 ) -> PersistentHiBaCaMLState:

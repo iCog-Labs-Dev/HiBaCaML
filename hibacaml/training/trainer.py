@@ -15,7 +15,10 @@ import optax
 
 from fabricpc.core.inference import run_inference
 from fabricpc.core.learning import compute_local_weight_gradients
-from fabricpc.graph_initialization.state_initializer import initialize_graph_state
+from fabricpc.graph_initialization.state_initializer import (
+    FeedforwardStateInit,
+    initialize_graph_state,
+)
 from hibacaml.config import HiBaCaMLConfig
 from hibacaml.control.replay_bank import SelectorBank
 from hibacaml.control.search import ExactSearchService
@@ -254,6 +257,9 @@ def _make_jitted_runtime(structure):
     return jit_inference, jit_pc_gradients, jit_eval_batch
 
 
+_TRAINER_INSTANCE_COUNTER = itertools.count()
+
+
 class HiBaCaMLTrainer:
     """Sequential trainer for HiBaCaML."""
 
@@ -270,14 +276,31 @@ class HiBaCaMLTrainer:
         create_run_logger: bool = True,
         selector_bank: Optional[SelectorBank] = None,
         run_id: str = "",
+        opt_state=None,
     ):
         self.cfg = cfg
         self.structure = structure
+        # Unique identifier for this trainer instance.
+        self.instance_id = next(_TRAINER_INSTANCE_COUNTER)
+        # Parsed once: _mask_grads would otherwise re-split every node name each step.
+        self._node_column_index = {
+            name: int(name.split("/")[0][3:])
+            for name in structure.nodes
+            if name.startswith("col")
+        }
+        graph_state_initializer = structure.config.get("graph_state_initializer")
+        if not isinstance(graph_state_initializer, FeedforwardStateInit):
+            raise ValueError(
+                "HiBaCaML training requires FeedforwardStateInit; got "
+                f"{type(graph_state_initializer).__name__}"
+            )
         self.params = params
         self.rng_key = rng_key if rng_key is not None else jax.random.PRNGKey(cfg.seed)
         self.optimizer = optimizer or optax.adamw(cfg.optimizer_lr, weight_decay=cfg.weight_decay)
-        self.opt_state = self.optimizer.init(params)
-        self.persistent_state = persistent_state or initialize_hibacaml_state(structure, params, cfg)
+        # Rollout clones supply the parent's state; initializing here would allocate a
+        # full zeros tree (adamw mu + nu) only to have it overwritten.
+        self.opt_state = opt_state if opt_state is not None else self.optimizer.init(params)
+        self.persistent_state = persistent_state or initialize_hibacaml_state(params, cfg)
         self.persistent_state.params = self.params
         self.persistent_state.opt_state = self.opt_state
         self.tasks: Dict[int, SplitMnistTask] = {}
@@ -347,8 +370,8 @@ class HiBaCaMLTrainer:
             create_run_logger=False,
             selector_bank=self.selector_bank,  # rollout clones share the bank for proposal scoring
             run_id=self.run_id,
+            opt_state=jax.tree_util.tree_map(lambda x: x, self.opt_state),  # share immutable leaves
         )
-        cloned.opt_state = jax.tree_util.tree_map(lambda x: x, self.opt_state)
         cloned.persistent_state.params = cloned.params
         cloned.persistent_state.opt_state = cloned.opt_state
         cloned.current_phi = self.current_phi                          # frozen dataclass
@@ -502,7 +525,7 @@ class HiBaCaMLTrainer:
         *,
         params=None,
         refresh_certificates: bool = True,
-        include_targets: bool = True,
+        include_targets: bool = False,
     ) -> Dict[str, jnp.ndarray]:
         """Build PC clamps; supervised training includes target nodes."""
         batch_size = int(batch["x"].shape[0])
@@ -526,14 +549,16 @@ class HiBaCaMLTrainer:
         *,
         params=None,
         refresh_certificates: bool = True,
-        include_targets: bool = True,
+        include_targets: bool = False,
     ) -> Dict[str, jnp.ndarray]:
         batch_size = int(batch["x"].shape[0])
         if refresh_certificates:
             self._refresh_certificates(batch_size, params=params)
         support_masks = [self.build_support_mask(nonshared) for nonshared in supports]
+        # The unmasked vectors are identical for every support; only the mask differs.
+        cert_base = self.shell_controller.certificate_vectors(self.persistent_state)
         cert_matrices = [
-            self.shell_controller.certificate_matrix(self.persistent_state, support_mask)
+            self.shell_controller.mask_certificate_vectors(cert_base, support_mask)
             for support_mask in support_masks
         ]
         meta = self.structure.config["hibacaml"]
@@ -601,20 +626,6 @@ class HiBaCaMLTrainer:
             energy=jnp.zeros((shape[0],), dtype=jnp.float32),
             latent_grad=jnp.zeros(shape, dtype=jnp.float32),
         )
-
-    def run_batch_inference(
-        self,
-        batch: Dict[str, jnp.ndarray],
-        task: SplitMnistTask,
-        nonshared: Sequence[int],
-        params=None,
-    ):
-        params = params if params is not None else self.params
-        clamps = self._build_clamps(batch, task, nonshared, params=params)
-        self.rng_key, state_key = jax.random.split(self.rng_key)
-        final_state = self._jit_run_batch_inference(params, clamps, state_key)
-        self._last_graph_state = final_state
-        return final_state, clamps
 
     def run_batch_evaluation_inference(
         self,
@@ -726,8 +737,8 @@ class HiBaCaMLTrainer:
         keep_columns = set(self.cfg.column_pool.shared_indices + tuple(nonshared))
         masked_nodes = {}
         for node_name, node_grads in grads.nodes.items():
-            if node_name.startswith("col"):
-                column_index = int(node_name.split("/")[0][3:])
+            column_index = self._node_column_index.get(node_name)
+            if column_index is not None:
                 if column_index not in keep_columns:
                     masked_nodes[node_name] = jax.tree_util.tree_map(jnp.zeros_like, node_grads)
                     continue

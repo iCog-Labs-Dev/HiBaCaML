@@ -21,8 +21,8 @@ def print_pre_run_review(
     sep = "=" * 72
     phi_candidates = 1 + 2 * 4
     learning_label = {
-        "backprop": "predictive-coding inference + backprop",
-        "pc": "predictive-coding inference + local PC gradients",
+        "backprop": "feedforward pass + end-to-end backprop",
+        "pc": "feedforward initialization + PC settling + local PC gradients",
     }.get(learning, learning)
 
     print(f"\n{sep}")
