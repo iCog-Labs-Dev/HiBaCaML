@@ -187,17 +187,22 @@ estimation compared with external fit scores alone.
 - `q_mean`, derived from sigmoid shell precisions;
 - `prec_mean`, derived from exponentiated shell precision parameters;
 - `pred_mean`, from mean predicted activation magnitude;
-- `live_frac`, `tier_q`, and `tier_occ`;
+- `live_frac`, the kernel shell's occupancy only — not the all-shell mean;
+- `tier_q` and `tier_occ`, the per-tier precision and occupancy means;
 - `shared_abstraction_mass`;
 - `specificity_load`;
 - `demotion_pressure`;
-- `saturation`;
+- `saturation`, the mean occupancy across all shells (kernel plus all tiers),
+  which is the all-shell figure `live_frac` is easily mistaken for;
 - `similarity_signature`, computed as cosine similarity between certificate
   vectors.
 
 The certificate vector used by the composer is constructed by
-`certificate_matrix`, masked by the active support. The static support scoring
-path also uses `_certificate_reuse_score`, which rewards `q_mean` and
+`certificate_matrix`, masked by the active support. `certificate_vectors` builds
+the unmasked vectors and `mask_certificate_vectors` applies one mask, so paths
+that score many supports against one certificate state build the vectors once.
+The static support scoring path also uses `_certificate_reuse_score`, which
+rewards `q_mean` and
 `shared_abstraction_mass` while penalizing specificity, demotion pressure, and
 saturation. In `default` mode, `certificate_support_weight` is set to
 `0.05`.
@@ -260,6 +265,15 @@ current_first_loss
 same gradient masking and shell edits as training, and re-evaluates the boundary
 objective. The phi neighborhood is deterministic: the current four-value
 `PhiConfig` plus bounded +/- perturbations of each coordinate.
+
+The old-task audit terms (`old_worst_loss`, `old_mix_loss`) are memoized in
+`ExactSearchService._old_audit_cache`, keyed by trainer identity, bundle
+identity, and `params_revision`. Trainer identity must come from
+`HiBaCaMLTrainer.instance_id`, a monotonic counter, and **not** from `id(trainer)`:
+every rollout clone reaches the same `params_revision` and is freed with an
+explicit `gc.collect()` before the next clone is allocated, so CPython reuses the
+address and distinct candidates would collide on one cache entry and silently
+share each other's old-task losses.
 
 During training, `HiBaCaMLTrainer.train_task` runs `local_one_swap` every
 `maintenance_interval` steps for tasks after task 0. It also runs
@@ -425,11 +439,14 @@ L_parent_child = lambda_parent * mean_class(
 )
 ```
 
-Its default weight is `lambda_parent = 0.04`. The complete training objective
-also includes the composer auxiliary penalty. In predictive-coding training,
-the weighted cross-entropies are graph energies on clamped target nodes. In
-backprop training, the targets remain outside the graph and the same terms are
-computed as external supervised losses.
+Its default weight is `lambda_parent = 0.04`. The reported composite also
+includes the composer auxiliary penalty. In predictive-coding training, the
+weighted cross-entropies are graph energies on clamped target nodes, but the
+parent-child and composer terms are calculated only after FabricPC local
+gradients and therefore do not currently affect the PC update. In backprop
+training, targets remain outside the graph and all five named terms are
+differentiated end to end. The graph-native auxiliary-gradient comparison is
+tracked separately in `PC_AUXILIARY_GRADIENT_EXPERIMENT_TODO.md`.
 
 The graph adds:
 
@@ -443,6 +460,16 @@ The graph adds:
 builds a certificate-derived prior, applies query-conditioned residual attention
 over active columns, and produces a correction vector. `ScaledAddNode` combines
 stage-1 logits with this correction.
+
+The composer has two entry points over a shared core. The node's `forward` calls
+`composer_stage2_correction`, which stops at the correction vector, because that
+is all the graph needs. `composer_stage2_details` continues on to the gate
+auxiliary penalty (`aux_penalty`, part of the objective) and the reported
+diagnostics (`gate_entropy`, `prior_kl`, `gate_dev`, `top1_mass`,
+`effective_k`); it is called separately from the settled state by
+`_composer_details_from_runtime`. Keep new diagnostics out of the forward path:
+the backprop runner does not execute the graph under `jax.jit`, so anything
+added there is computed on every forward whether or not it is read.
 
 **Alignment status.** Faithful in purpose. The implementation's composer works
 over per-column feature vectors and certificates rather than an explicitly
@@ -504,10 +531,13 @@ The end-to-end flow is:
 make_hibacaml_config(mode)
 override(cfg, ...)
 run_experiment(cfg, ...)
-  -> build_split_mnist_tasks(cfg)
-  -> create_hibacaml_structure(cfg, inference)
-  -> initialize_params(...)
-  -> HiBaCaMLBackpropRunner or HiBaCaMLTrainer
+  -> build_split_mnist_tasks(cfg, limit=tasks_limit)
+  -> build_trainer(cfg, tasks, learning)
+       -> create_hibacaml_structure(cfg, inference, graph_state_initializer)
+       -> initialize_params(...)
+       -> HiBaCaMLBackpropRunner or HiBaCaMLTrainer
+  -> print_pre_run_review(cfg, structure, tasks, learning)
+  -> _run_tasks(trainer, ...)
   -> for each task:
        train_task(task)
          -> boundary support search if needed
@@ -564,8 +594,14 @@ interference.
 
 `build_split_mnist_tasks` implements the five tasks from `_TASK_CLASS_PAIRS`.
 It loads MNIST via TensorFlow/Keras when available, otherwise a cached
-`mnist.npz` fallback. Images are normalized by MNIST mean/std and reshaped to
-`28 x 28 x 1`.
+`mnist.npz` fallback. Images are filtered to each task's two classes first and
+then normalized by MNIST mean/std and reshaped to `28 x 28 x 1`, so no float32
+copy of the full dataset is held alongside the per-task copies.
+
+The optional `limit` argument caps how many tasks are built and is what
+`run_experiment`'s `tasks_limit` forwards. It deliberately does not go through
+`cfg.num_tasks`, because that value also sizes the task one-hot in the
+replay-bank context vector (`hibacaml/control/replay_bank.py`).
 
 For each task:
 
@@ -607,13 +643,25 @@ local readout head."
 
 ### 4.5 Training Procedure
 
-`experiments/split_mnist.py` constructs the trainer in `build_trainer`:
+`experiments/split_mnist.py` constructs the trainer in `build_trainer`, which
+`run_experiment` calls once and then passes to `_run_tasks`. The pre-run review
+is printed from that same structure rather than from a separate throwaway graph:
 
 - `InferenceSGD` is always configured for graph inference;
-- `FeedforwardStateInit` is used for the backprop runner;
+- `FeedforwardStateInit` is used explicitly for both runners;
 - `create_hibacaml_structure` builds the graph;
 - FabricPC `initialize_params` initializes graph parameters;
 - trainer class is selected from `learning`.
+
+For predictive coding, feedforward initialization only supplies a coherent
+starting state. Supervised targets are then clamped, FabricPC performs the
+configured iterative settling, and `compute_local_weight_gradients` computes
+local graph-energy gradients. Backprop uses the same initializer but skips PC
+settling and differentiates its external objective end to end.
+
+The graph builder requires an explicit initializer and the HiBaCaML trainer
+rejects non-feedforward initialization. This prevents the former silent
+fallback to independently sampled hidden states.
 
 For each task, `_run_tasks` calls `trainer.train_task(task)`. Training:
 
@@ -626,6 +674,42 @@ For each task, `_run_tasks` calls `trainer.train_task(task)`. Training:
 7. periodically performs demotion and local one-swap audits;
 8. freezes the task support as a `SupportSnapshot`;
 9. evaluates the task using its saved support.
+
+#### Predictive-coding clamping contract
+
+The runner implements standard discriminative predictive coding. Clamped nodes are
+held fixed for the whole settling process; every non-clamped node is updated by
+`InferenceBase.update_latents`, which applies `z_latent -= eta_infer * latent_grad`
+once per iteration for `infer_steps` iterations under `jax.lax.fori_loop`.
+
+During **training**, `compute_pc_gradients` clamps:
+
+- the input image `x`;
+- the HiBaCaML control inputs: `support_mask`, `task_query`, and the per-column
+  certificate inputs;
+- the supervised outputs `y`, `hier_mid`, and `hier_global`.
+
+Everything between them settles. `FeedforwardStateInit` sets each clamped node's
+`z_latent` to its clamp value while still computing `z_mu`, `error`, and `energy`
+from the forward pass, so the output-layer prediction error exists at step 0 and is
+what drives the settling. `compute_local_weight_gradients` then reads the settled
+state.
+
+During **evaluation**, the target clamps are dropped. Only the image and the control
+inputs stay clamped, so `y` settles freely and the prediction is read from its `z_mu`.
+This is the `target_free_inference_external_supervision_v1` protocol described in
+section 4.6; the class target is applied afterward as an external cross-entropy and
+never enters the hidden-state trajectory.
+
+The clamp policy is expressed by the `include_targets` flag on
+`HiBaCaMLTrainer._build_clamps`. It defaults to `False`, so target-free is the
+default behavior and supervised training opts in explicitly. `HiBaCaMLBackpropRunner`
+overrides `_build_clamps` to discard the flag entirely, because backprop keeps its
+targets outside the graph in all cases.
+
+Note that the parent-child and composer auxiliary terms are computed from the settled
+state but do not enter the predictive-coding weight update; see section 2.8 and
+`PC_AUXILIARY_GRADIENT_EXPERIMENT_TODO.md`.
 
 ### 4.6 Evaluation Setup
 
@@ -666,7 +750,8 @@ configs:
 - batch size in config: `256`
 - experiment script override: `OVERRIDES["batch_size"] = 768`
 - epochs per task: `5`
-- inference steps: `8`
+- inference steps: `16` in normal mode and `4` in smoke mode
+- inference rate: `0.05`
 - optimizer: AdamW with learning rate `0.001` and weight decay `0.05`
 - columns: `20 = 2 shared + 15 adaptive + 3 reserve`
 - active nonshared columns: `3`
@@ -675,12 +760,21 @@ configs:
 - composer top-k: `3`
 - exact boundary shortlist: config default `8`
 - experiment script static/neighbor support batch sizes: `16`
+- experiment script audit data batch caps: `128` for all six of
+  `boundary_current`, `rollout_train`, `boundary_worst_old`,
+  `boundary_mixed_old`, `local_swap_audit`, and `demotion_audit`
+  (`*_data_batch_size`); these bound how many examples each audit bundle draws,
+  and the pre-run banner prints them as "search batch caps"
 - maintenance interval: `64`
 - demotion audit interval: `64`
 
 The script-level constants at the top of `experiments/split_mnist.py` override
 some config defaults for notebook/script runs. Documentation readers should
 distinguish config defaults from script overrides.
+
+`infer_steps` and `eta_infer` remain ordinary configuration hyperparameters.
+The value 16 is the corrected normal-mode starting point, not a claim that it
+is optimal for every graph or accelerator configuration.
 
 ## 6. Exact Matches, Deviations, and Missing Ideas
 
@@ -744,8 +838,8 @@ The implementation can be summarized as:
 
 ```text
 cfg = make_hibacaml_config("default")
-tasks = build_split_mnist_tasks(cfg)
-structure = create_hibacaml_structure(cfg, inference)
+tasks = build_split_mnist_tasks(cfg, limit=None)
+structure = create_hibacaml_structure(cfg, inference, FeedforwardStateInit())
 params = initialize_params(structure, seed)
 trainer = HiBaCaMLBackpropRunner or HiBaCaMLTrainer(cfg, structure, params, tasks)
 

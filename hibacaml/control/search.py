@@ -6,6 +6,7 @@ import gc
 import math
 import time
 from dataclasses import dataclass
+from itertools import islice
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import jax.numpy as jnp
@@ -73,43 +74,18 @@ class ExactSearchService:
         self.run_id = run_id
         self._old_audit_cache: Dict[Tuple[int, int, int], Dict[str, float]] = {}
 
-    def _normalize_data_batch_size(self, name: str, value: Optional[int]) -> Optional[int]:
-        if value is None:
-            return None
-        if isinstance(value, bool):
-            raise ValueError(f"{name} must be None or a positive integer, got {value!r}")
-        value = int(value)
-        if value <= 0:
-            raise ValueError(f"{name} must be None or a positive integer, got {value!r}")
-        return value
-
     def _bundle_batch_caps(self, purpose: str) -> Dict[str, Optional[int] | bool]:
         cfg = self.cfg.exact_search
         if purpose == "boundary":
             return {
-                "current": self._normalize_data_batch_size(
-                    "boundary_current_data_batch_size",
-                    cfg.boundary_current_data_batch_size,
-                ),
-                "rollout": self._normalize_data_batch_size(
-                    "rollout_train_data_batch_size",
-                    cfg.rollout_train_data_batch_size,
-                ),
-                "worst_old": self._normalize_data_batch_size(
-                    "boundary_worst_old_data_batch_size",
-                    cfg.boundary_worst_old_data_batch_size,
-                ),
-                "mixed_old": self._normalize_data_batch_size(
-                    "boundary_mixed_old_data_batch_size",
-                    cfg.boundary_mixed_old_data_batch_size,
-                ),
+                "current": cfg.boundary_current_data_batch_size,
+                "rollout": cfg.rollout_train_data_batch_size,
+                "worst_old": cfg.boundary_worst_old_data_batch_size,
+                "mixed_old": cfg.boundary_mixed_old_data_batch_size,
                 "include_rollout": True,
             }
         if purpose == "local_swap":
-            cap = self._normalize_data_batch_size(
-                "local_swap_audit_data_batch_size",
-                cfg.local_swap_audit_data_batch_size,
-            )
+            cap = cfg.local_swap_audit_data_batch_size
             return {
                 "current": cap,
                 "rollout": None,
@@ -118,10 +94,7 @@ class ExactSearchService:
                 "include_rollout": False,
             }
         if purpose == "demotion":
-            cap = self._normalize_data_batch_size(
-                "demotion_audit_data_batch_size",
-                cfg.demotion_audit_data_batch_size,
-            )
+            cap = cfg.demotion_audit_data_batch_size
             return {
                 "current": cap,
                 "rollout": None,
@@ -143,15 +116,17 @@ class ExactSearchService:
         task = self.trainer.task(task_id)
         current_eval = tuple(
             self._slice_batch(batch, caps["current"])
-            for idx, batch in enumerate(task.test_loader)
-            if idx < self.cfg.exact_search.boundary_current_batches
+            for batch in islice(
+                task.test_loader, self.cfg.exact_search.boundary_current_batches
+            )
         )
         train_batches = ()
         if caps["include_rollout"]:
             train_batches = tuple(
                 self._slice_batch(batch, caps["rollout"])
-                for idx, batch in enumerate(task.train_loader)
-                if idx < self.cfg.exact_search.boundary_rollout_steps
+                for batch in islice(
+                    task.train_loader, self.cfg.exact_search.boundary_rollout_steps
+                )
             )
 
         worst_old = None
@@ -318,8 +293,6 @@ class ExactSearchService:
     def _rank_support_rows(
         self,
         rows: Sequence[SupportSearchRow],
-        *,
-        reserve_recruitment_triggered: bool = False,
     ) -> List[SupportSearchRow]:
         if not rows:
             return []
@@ -500,7 +473,10 @@ class ExactSearchService:
     def _old_audit_terms(self, trainer, bundle: BoundaryBundle) -> Dict[str, float]:
         """Compute old-task audit losses under their frozen saved supports."""
         cache_key = (
-            id(trainer),
+            # Not id(trainer): every rollout clone reaches the same params_revision
+            # and is freed before the next is allocated, so reused addresses would
+            # make distinct candidates collide and share old-task audit losses.
+            getattr(trainer, "instance_id", id(trainer)),
             id(bundle),
             int(getattr(trainer.persistent_state, "params_revision", 0)),
         )
@@ -552,24 +528,14 @@ class ExactSearchService:
         *,
         refresh_certificates: bool,
     ) -> List[float]:
-        if hasattr(trainer, "evaluate_batch_losses"):
-            return list(
-                trainer.evaluate_batch_losses(
-                    task,
-                    batch,
-                    supports,
-                    refresh_certificates=refresh_certificates,
-                )
-            )
-        return [
-            trainer.evaluate_batch_loss(
+        return list(
+            trainer.evaluate_batch_losses(
                 task,
                 batch,
-                support,
-                refresh_certificates=refresh_certificates and idx == 0,
+                supports,
+                refresh_certificates=refresh_certificates,
             )
-            for idx, support in enumerate(supports)
-        ]
+        )
 
     def static_support_score(
         self,
@@ -725,7 +691,7 @@ class ExactSearchService:
             phi,
             self.cfg.phi,
         )
-        if final_state is not None and hasattr(clone, "composer_diagnostics_from_state"):
+        if final_state is not None:
             composer_diag = clone.composer_diagnostics_from_state(final_state, task, support_cols)
         else:
             composer_diag = {
@@ -1093,10 +1059,7 @@ class ExactSearchService:
                 bundle,
                 reserve_recruitment_candidate=True,
             )
-            support_rows = self._rank_support_rows(
-                [*support_rows, *reserve_rows],
-                reserve_recruitment_triggered=True,
-            )
+            support_rows = self._rank_support_rows([*support_rows, *reserve_rows])
 
         support_rows.sort(key=lambda row: row.posterior_energy)
         shortlisted = support_rows[: self.cfg.exact_search.boundary_shortlist]
@@ -1136,7 +1099,6 @@ class ExactSearchService:
             "boundary_total_seconds",
             time.perf_counter() - search_started,
         )
-        self._ensure_persistent_tables()
         self.trainer.persistent_state.support_tables[task_id] = support_rows
         self.trainer.persistent_state.support_posterior_tables[task_id] = self._posterior_summary(
             task_id,
@@ -1210,7 +1172,6 @@ class ExactSearchService:
         """Audit a small set of internal demotion swaps before mutating shells."""
         if not self.cfg.exact_search.enable_demotion_swap_audit:
             return []
-        self._ensure_persistent_tables()
         candidates = self.trainer.shell_controller.demotion_swap_candidates(
             self.trainer.params,
             final_state,
@@ -1339,21 +1300,6 @@ class ExactSearchService:
         gc.collect()
         return rows
 
-    def _ensure_persistent_tables(self) -> None:
-        defaults = {
-            "support_posterior_tables": {},
-            "reserve_recruitment_tables": {},
-            "controller_tables": {},
-            "local_swap_tables": {},
-            "demotion_swap_tables": {},
-            "last_demotion_audit_step": {},
-            "replay_proposals": {},
-            "recently_demoted": {},
-        }
-        for name, value in defaults.items():
-            if not hasattr(self.trainer.persistent_state, name):
-                setattr(self.trainer.persistent_state, name, value)
-
     def local_one_swap(self, task_id: int) -> Tuple[int, ...]:
         """V20.2b in-task support refinement.
 
@@ -1361,7 +1307,6 @@ class ExactSearchService:
         `replay_overlap_floor`, scores the union under the penalised objective,
         and accepts the best candidate if it beats current by `local_swap_margin`.
         """
-        self._ensure_persistent_tables()
         if task_id == 0:
             return self.trainer.current_nonshared
 
