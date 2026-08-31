@@ -9,6 +9,7 @@ from hibacaml.config import (
     PhiConfig,
     ReportingConfig,
     make_hibacaml_config,
+    override,
 )
 from hibacaml.control import ExactSearchService, ShellController
 from hibacaml.data import build_split_mnist_tasks
@@ -50,6 +51,7 @@ __all__ = [
     "HierarchyConfig",
     "initialize_hibacaml_state",
     "LocalSwapRow",
+    "override",
     "PersistentHiBaCaMLState",
     "PhiConfig",
     "PhiLike",

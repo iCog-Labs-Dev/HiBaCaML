@@ -164,19 +164,30 @@ def _hierarchy_targets(
     return mid.astype(np.float32), targets.astype(np.float32)
 
 
-def build_split_mnist_tasks(cfg: HiBaCaMLConfig) -> Tuple[SplitMnistTask, ...]:
-    """Build the five task-incremental Split-MNIST tasks."""
-    train_x, train_y, test_x, test_y = _load_mnist_arrays()
-    train_x = _normalize_images(train_x)
-    test_x = _normalize_images(test_x)
+def build_split_mnist_tasks(
+    cfg: HiBaCaMLConfig,
+    *,
+    limit: int | None = None,
+) -> Tuple[SplitMnistTask, ...]:
+    """Build the task-incremental Split-MNIST tasks.
 
+    `limit` caps how many tasks are built. It deliberately does not go through
+    `cfg.num_tasks`, which also sizes the replay-bank context vector's task
+    one-hot (see `hibacaml/control/replay_bank.py`).
+    """
+    train_x, train_y, test_x, test_y = _load_mnist_arrays()
+
+    task_count = cfg.num_tasks if limit is None else min(cfg.num_tasks, limit)
     tasks = []
-    for task_id, classes in enumerate(_TASK_CLASS_PAIRS[: cfg.num_tasks]):
+    for task_id, classes in enumerate(_TASK_CLASS_PAIRS[:task_count]):
         train_mask = np.isin(train_y, np.asarray(classes))
         test_mask = np.isin(test_y, np.asarray(classes))
 
-        task_train_x = train_x[train_mask]
-        task_test_x = test_x[test_mask]
+        # Filter on uint8 and normalize per task: _normalize_images is elementwise,
+        # so this is identical per element but avoids holding a float32 copy of the
+        # whole dataset alongside every per-task copy.
+        task_train_x = _normalize_images(train_x[train_mask])
+        task_test_x = _normalize_images(test_x[test_mask])
         task_train_targets = _task_targets(
             train_y[train_mask],
             classes,

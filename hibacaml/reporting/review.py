@@ -1,4 +1,4 @@
-"""Pre-run summary and confirmation for HiBaCaML experiments."""
+"""Pre-run summary for HiBaCaML experiments."""
 
 from __future__ import annotations
 
@@ -7,20 +7,22 @@ from typing import Sequence
 from hibacaml.config import HiBaCaMLConfig
 
 
+def _cap_label(value: int | None) -> str:
+    return "full" if value is None else str(value)
+
+
 def print_pre_run_review(
     cfg: HiBaCaMLConfig,
     structure,
     tasks: Sequence,
     learning: str,
-    *,
-    confirm: bool = True,
 ) -> None:
-    """Print a pre-run summary and optionally wait for confirmation."""
+    """Print a pre-run summary."""
     sep = "=" * 72
     phi_candidates = 1 + 2 * 4
     learning_label = {
-        "backprop": "predictive-coding inference + backprop",
-        "pc": "predictive-coding inference + local PC gradients",
+        "backprop": "feedforward pass + end-to-end backprop",
+        "pc": "feedforward initialization + PC settling + local PC gradients",
     }.get(learning, learning)
 
     print(f"\n{sep}")
@@ -31,6 +33,15 @@ def print_pre_run_review(
     print(f"    mode              : {cfg.mode}")
     print(f"    learning          : {learning_label}")
     print(f"    batch_size        : {cfg.batch_size}")
+    print(
+        "    search batch caps : "
+        f"current={_cap_label(cfg.exact_search.boundary_current_data_batch_size)}, "
+        f"rollout={_cap_label(cfg.exact_search.rollout_train_data_batch_size)}, "
+        f"worst_old={_cap_label(cfg.exact_search.boundary_worst_old_data_batch_size)}, "
+        f"mixed_old={_cap_label(cfg.exact_search.boundary_mixed_old_data_batch_size)}, "
+        f"local_swap={_cap_label(cfg.exact_search.local_swap_audit_data_batch_size)}, "
+        f"demotion={_cap_label(cfg.exact_search.demotion_audit_data_batch_size)}"
+    )
     print(f"    epochs_per_task   : {cfg.epochs_per_task}")
     print(f"    infer_steps       : {cfg.infer_steps}")
     print(f"    eta_infer         : {cfg.eta_infer}")
@@ -57,7 +68,7 @@ def print_pre_run_review(
     print(f"    weight_decay      : {cfg.weight_decay}")
     print(f"    seed              : {cfg.seed}")
     print(f"    experiment_root   : {cfg.reporting.experiment_root}")
-    print(f"    selector_state    : {cfg.reporting.selector_state_root}")
+    print(f"    selector_state    : {cfg.selector_state_path()}")
     print(
         "    reselection       : "
         f"replay_topk={cfg.exact_search.replay_topk}, "
@@ -119,13 +130,4 @@ def print_pre_run_review(
     print("    controller search : bounded local phi neighborhood around the current controller")
     print("    artifacts         : per-run tables and metrics written under experiment_root")
 
-    print(f"\n{sep}")
-    if confirm:
-        try:
-            input("  Press Enter to begin training, or Ctrl-C to abort... ")
-        except KeyboardInterrupt:
-            print("\n  Aborted by user.")
-            raise SystemExit(1)
-    else:
-        print("  Auto-proceeding (--no-confirm).")
-    print(sep + "\n")
+    print(f"\n{sep}\n")

@@ -2,14 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Dict, Tuple
 
 from hibacaml.types import PhiLike
-
-
-V20_SCHEMA_VERSION = "v20.2b"
 
 
 @dataclass(frozen=True)
@@ -96,6 +93,12 @@ class ExactSearchConfig:
     """Boundary and local support search settings."""
 
     enable_exact_search: bool = True
+    boundary_current_data_batch_size: int | None = None
+    rollout_train_data_batch_size: int | None = None
+    boundary_worst_old_data_batch_size: int | None = None
+    boundary_mixed_old_data_batch_size: int | None = None
+    local_swap_audit_data_batch_size: int | None = None
+    demotion_audit_data_batch_size: int | None = None
     boundary_current_batches: int = 2
     boundary_old_batches: int = 2
     boundary_rollout_steps: int = 4
@@ -144,8 +147,8 @@ class ExactSearchConfig:
 class ReportingConfig:
     """Export and checkpoint settings."""
 
-    experiment_root: str = "runs/experiments"
-    selector_state_root: str = "runs/selector_state"
+    experiment_root: str = "runs"
+    selector_state_root: str | None = None
     write_selector_state: bool = True
     checkpoint_filename: str = "hibacaml_checkpoint.pkl"
     selector_bank_filename: str = "bank.pkl"
@@ -160,7 +163,7 @@ class ReportingConfig:
 class HiBaCaMLConfig:
     """Top-level subsystem configuration."""
 
-    mode: str = "paper_faithful"
+    mode: str = "default"
     seed: int = 0
     input_shape: Tuple[int, int, int] = (28, 28, 1)
     patch_size: Tuple[int, int] = (7, 7)
@@ -170,7 +173,7 @@ class HiBaCaMLConfig:
     num_tasks: int = 5
     batch_size: int = 256
     epochs_per_task: int = 5
-    infer_steps: int = 8
+    infer_steps: int = 16
     eta_infer: float = 0.05
     optimizer_lr: float = 0.001
     weight_decay: float = 0.05
@@ -213,12 +216,14 @@ class HiBaCaMLConfig:
         return Path(self.reporting.experiment_root)
 
     def selector_state_path(self) -> Path:
+        if self.reporting.selector_state_root is None:
+            return self.experiment_root_path() / "selector_state"
         return Path(self.reporting.selector_state_root)
 
 
-def make_hibacaml_config(mode: str = "paper_faithful") -> HiBaCaMLConfig:
+def make_hibacaml_config(mode: str = "default") -> HiBaCaMLConfig:
     """Construct a HiBaCaML config for the given mode."""
-    if mode == "paper_faithful":
+    if mode == "default":
         return HiBaCaMLConfig(
             mode=mode,
             exact_search=ExactSearchConfig(
@@ -259,3 +264,17 @@ def make_hibacaml_config(mode: str = "paper_faithful") -> HiBaCaMLConfig:
         )
 
     raise ValueError(f"Unsupported HiBaCaML config mode: {mode}")
+
+
+def override(cfg, **kwargs):
+    """ Return a copy of cfg with the given fields replaced. """
+    top, nested = {}, {}
+    for key, value in kwargs.items():
+        if "__" in key:
+            section, field_name = key.split("__", 1)
+            nested.setdefault(section, {})[field_name] = value
+        else:
+            top[key] = value
+    for section, fields in nested.items():
+        top[section] = replace(getattr(cfg, section), **fields)
+    return replace(cfg, **top)

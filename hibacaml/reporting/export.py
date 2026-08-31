@@ -80,8 +80,8 @@ def export_run_artifacts(snapshot: Dict[str, object], root: str | Path) -> None:
             "cfg": snapshot["cfg"],
             "global_step": snapshot["global_step"],
             "params_revision": snapshot["params_revision"],
-            "schema_version": snapshot.get("schema_version"),
             "run_id": snapshot.get("run_id"),
+            "evaluation_protocol": snapshot.get("evaluation_protocol"),
         },
     )
     _write_json(root / "task_evaluations.json", snapshot["evaluations"])

@@ -123,19 +123,22 @@ class ShellController:
         persistent_state.certificates = certificates
         return certificates
 
-    def certificate_matrix(
+    def certificate_vectors(
         self,
         persistent_state: PersistentHiBaCaMLState,
-        support_mask: jnp.ndarray,
     ) -> Dict[int, jnp.ndarray]:
-        """Return per-column certificate vectors masked by active support."""
-        matrix = {}
+        """Return the unmasked per-column certificate vectors.
+
+        Split out so callers that score many supports against one certificate
+        state build these once instead of once per support mask.
+        """
+        vectors = {}
         for idx in range(self.cfg.column_pool.total_columns):
             cert = persistent_state.certificates.get(idx)
             if cert is None:
-                matrix[idx] = jnp.zeros((self.cfg.composer_cert_dim,), dtype=jnp.float32)
+                vectors[idx] = jnp.zeros((self.cfg.composer_cert_dim,), dtype=jnp.float32)
                 continue
-            vec = jnp.asarray(
+            vectors[idx] = jnp.asarray(
                 [
                     cert.q_mean,
                     cert.prec_mean,
@@ -150,8 +153,26 @@ class ShellController:
                 ],
                 dtype=jnp.float32,
             )
-            matrix[idx] = vec * support_mask[idx]
-        return matrix
+        return vectors
+
+    @staticmethod
+    def mask_certificate_vectors(
+        vectors: Dict[int, jnp.ndarray],
+        support_mask: jnp.ndarray,
+    ) -> Dict[int, jnp.ndarray]:
+        """Apply one support mask to precomputed certificate vectors."""
+        return {idx: vec * support_mask[idx] for idx, vec in vectors.items()}
+
+    def certificate_matrix(
+        self,
+        persistent_state: PersistentHiBaCaMLState,
+        support_mask: jnp.ndarray,
+    ) -> Dict[int, jnp.ndarray]:
+        """Return per-column certificate vectors masked by active support."""
+        return self.mask_certificate_vectors(
+            self.certificate_vectors(persistent_state),
+            support_mask,
+        )
 
     def semantic_penalty(
         self,
@@ -212,7 +233,14 @@ class ShellController:
                 metrics = self._unit_metrics(node_params, node_state)
                 updated_node = self._apply_inhibition(
                     node_params,
-                    self._inhibition_adjustment(node_params),
+                    self._inhibition_adjustment(
+                        node_params,
+                        {
+                            shell: entry["redundancy"]
+                            for shell, entry in metrics.items()
+                            if "redundancy" in entry
+                        },
+                    ),
                 )
 
                 if self._occupancy(updated_node, "tier3") > self.cfg.exact_search.semantic_targets[2]:
@@ -362,28 +390,25 @@ class ShellController:
         q_means = []
         prec_means = []
         pred_means = []
-        live_fracs = []
+        mean_occupancies = []
         tier_q = {"kernel": [], "tier1": [], "tier2": [], "tier3": []}
         tier_occ = {"kernel": [], "tier1": [], "tier2": [], "tier3": []}
         for node_name in self._shell_node_names(meta):
             node_params = params.nodes[node_name]
             node_state = graph_state.nodes[node_name]
             pred_means.append(float(jnp.mean(jnp.abs(node_state.z_mu))))
-            live_fracs.append(
-                np_mean(
-                    [
-                        self._occupancy(node_params, shell_name)
-                        for shell_name in self.shell_slices
-                    ]
-                )
-            )
+            occupancies = {
+                shell_name: self._occupancy(node_params, shell_name)
+                for shell_name in self.shell_slices
+            }
+            mean_occupancies.append(np_mean(list(occupancies.values())))
             for shell_name in self.shell_slices:
                 log_precision = node_params.biases[f"log_precision_{shell_name}"]
                 q_val = float(jnp.mean(jax_nn_sigmoid(log_precision)))
                 q_means.append(q_val)
                 prec_means.append(float(jnp.mean(jnp.exp(log_precision))))
                 tier_q[shell_name].append(q_val)
-                tier_occ[shell_name].append(self._occupancy(node_params, shell_name))
+                tier_occ[shell_name].append(occupancies[shell_name])
 
         kernel_q_mean = float(np_mean(tier_q["kernel"]))
         tier1_mean = float(np_mean(tier_q["tier1"]))
@@ -399,7 +424,7 @@ class ShellController:
             shell_stats.task_variance_ema.get("tier1", 0.0)
             - shell_stats.task_variance_ema.get("tier3", 0.0),
         )
-        saturation = float(np_mean(live_fracs))
+        saturation = float(np_mean(mean_occupancies))
         return ColumnCertificate(
             column_index=column_index,
             q_mean=float(np_mean(q_means)),
@@ -445,6 +470,7 @@ class ShellController:
             metrics[shell_name] = {
                 "score": score,
                 "specificity": specificity.reshape(-1),
+                "redundancy": redundancy,
             }
         return metrics
 
@@ -456,10 +482,19 @@ class ShellController:
         sim = sim - jnp.eye(sim.shape[0], dtype=sim.dtype)
         return jnp.mean(jnp.maximum(sim, 0.0), axis=1)
 
-    def _inhibition_adjustment(self, node_params: NodeParams) -> Dict[str, jnp.ndarray]:
+    def _inhibition_adjustment(
+        self,
+        node_params: NodeParams,
+        redundancy_by_shell: Dict[str, jnp.ndarray] | None = None,
+    ) -> Dict[str, jnp.ndarray]:
         adjustment = {}
+        redundancy_by_shell = redundancy_by_shell or {}
         for shell_name, strength in self.inhibition_strengths.items():
-            redundancy = self._redundancy_penalty(node_params.weights[shell_name])
+            # Reuse the value _unit_metrics already computed from these same params.
+            # Empty shells are skipped there, so fall back when it is absent.
+            redundancy = redundancy_by_shell.get(shell_name)
+            if redundancy is None:
+                redundancy = self._redundancy_penalty(node_params.weights[shell_name])
             adjust = redundancy
             for _ in range(2):
                 adjust = redundancy + 0.5 * adjust

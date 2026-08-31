@@ -6,13 +6,13 @@ import gc
 import math
 import time
 from dataclasses import dataclass
+from itertools import islice
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import jax.numpy as jnp
 
 from hibacaml.config import HiBaCaMLConfig, PhiConfig
 from hibacaml.control.replay_bank import (
-    ReplayRow,
     SelectorBank,
     build_context,
     make_replay_row,
@@ -74,19 +74,60 @@ class ExactSearchService:
         self.run_id = run_id
         self._old_audit_cache: Dict[Tuple[int, int, int], Dict[str, float]] = {}
 
-    def make_bundle(self, task_id: int) -> BoundaryBundle:
+    def _bundle_batch_caps(self, purpose: str) -> Dict[str, Optional[int] | bool]:
+        cfg = self.cfg.exact_search
+        if purpose == "boundary":
+            return {
+                "current": cfg.boundary_current_data_batch_size,
+                "rollout": cfg.rollout_train_data_batch_size,
+                "worst_old": cfg.boundary_worst_old_data_batch_size,
+                "mixed_old": cfg.boundary_mixed_old_data_batch_size,
+                "include_rollout": True,
+            }
+        if purpose == "local_swap":
+            cap = cfg.local_swap_audit_data_batch_size
+            return {
+                "current": cap,
+                "rollout": None,
+                "worst_old": cap,
+                "mixed_old": cap,
+                "include_rollout": False,
+            }
+        if purpose == "demotion":
+            cap = cfg.demotion_audit_data_batch_size
+            return {
+                "current": cap,
+                "rollout": None,
+                "worst_old": cap,
+                "mixed_old": cap,
+                "include_rollout": False,
+            }
+        raise ValueError(f"Unsupported boundary bundle purpose: {purpose!r}")
+
+    @staticmethod
+    def _slice_batch(batch: Dict[str, jnp.ndarray], max_examples: Optional[int]):
+        if max_examples is None:
+            return batch
+        return {key: value[:max_examples] for key, value in batch.items()}
+
+    def make_bundle(self, task_id: int, *, purpose: str = "boundary") -> BoundaryBundle:
         """Build the audit bundle: current eval batches + worst-old + mixed-old."""
+        caps = self._bundle_batch_caps(purpose)
         task = self.trainer.task(task_id)
         current_eval = tuple(
-            batch
-            for idx, batch in enumerate(task.test_loader)
-            if idx < self.cfg.exact_search.boundary_current_batches
+            self._slice_batch(batch, caps["current"])
+            for batch in islice(
+                task.test_loader, self.cfg.exact_search.boundary_current_batches
+            )
         )
-        train_batches = tuple(
-            batch
-            for idx, batch in enumerate(task.train_loader)
-            if idx < self.cfg.exact_search.boundary_rollout_steps
-        )
+        train_batches = ()
+        if caps["include_rollout"]:
+            train_batches = tuple(
+                self._slice_batch(batch, caps["rollout"])
+                for batch in islice(
+                    task.train_loader, self.cfg.exact_search.boundary_rollout_steps
+                )
+            )
 
         worst_old = None
         worst_old_eval = None
@@ -100,10 +141,16 @@ class ExactSearchService:
                 worst_old_eval = self._concat_loader_prefix(
                     worst_old_task.test_loader,
                     self.cfg.exact_search.boundary_old_batches,
+                    batch_size=caps["worst_old"],
                 )
                 if worst_old_eval is not None:
                     worst_old_eval = (worst_old, worst_old_eval)
-            mixed_old_eval = list(self._build_mixed_old_fragments(task_id))
+            mixed_old_eval = list(
+                self._build_mixed_old_fragments(
+                    task_id,
+                    batch_size=caps["mixed_old"],
+                )
+            )
         return BoundaryBundle(
             current_eval=current_eval,
             train_batches=train_batches,
@@ -112,11 +159,23 @@ class ExactSearchService:
             worst_old=worst_old,
         )
 
-    def _concat_loader_prefix(self, loader, max_batches: int):
+    def _concat_loader_prefix(
+        self,
+        loader,
+        max_batches: int,
+        *,
+        batch_size: Optional[int] = None,
+    ):
         pieces = []
+        remaining = batch_size
         for idx, batch in enumerate(loader):
             if idx >= max_batches:
                 break
+            if remaining is not None:
+                if remaining <= 0:
+                    break
+                batch = self._slice_batch(batch, remaining)
+                remaining -= int(batch["x"].shape[0])
             pieces.append(batch)
         if not pieces:
             return None
@@ -130,6 +189,8 @@ class ExactSearchService:
     def _build_mixed_old_fragments(
         self,
         task_id: int,
+        *,
+        batch_size: Optional[int] = None,
     ) -> Tuple[Tuple[int, Dict[str, jnp.ndarray]], ...]:
         """Build one deterministic mixed-old batch from all prior tasks."""
         prior_batches: List[Tuple[int, Dict[str, jnp.ndarray]]] = []
@@ -141,6 +202,8 @@ class ExactSearchService:
             return ()
 
         target_size = min(int(batch["x"].shape[0]) for _, batch in prior_batches)
+        if batch_size is not None:
+            target_size = min(target_size, int(batch_size))
         target_size = max(1, target_size)
         per_source = max(1, target_size // len(prior_batches))
         remainder = max(0, target_size - per_source * len(prior_batches))
@@ -230,8 +293,6 @@ class ExactSearchService:
     def _rank_support_rows(
         self,
         rows: Sequence[SupportSearchRow],
-        *,
-        reserve_recruitment_triggered: bool = False,
     ) -> List[SupportSearchRow]:
         if not rows:
             return []
@@ -412,7 +473,10 @@ class ExactSearchService:
     def _old_audit_terms(self, trainer, bundle: BoundaryBundle) -> Dict[str, float]:
         """Compute old-task audit losses under their frozen saved supports."""
         cache_key = (
-            id(trainer),
+            # Not id(trainer): every rollout clone reaches the same params_revision
+            # and is freed before the next is allocated, so reused addresses would
+            # make distinct candidates collide and share old-task audit losses.
+            getattr(trainer, "instance_id", id(trainer)),
             id(bundle),
             int(getattr(trainer.persistent_state, "params_revision", 0)),
         )
@@ -464,24 +528,14 @@ class ExactSearchService:
         *,
         refresh_certificates: bool,
     ) -> List[float]:
-        if hasattr(trainer, "evaluate_batch_losses"):
-            return list(
-                trainer.evaluate_batch_losses(
-                    task,
-                    batch,
-                    supports,
-                    refresh_certificates=refresh_certificates,
-                )
-            )
-        return [
-            trainer.evaluate_batch_loss(
+        return list(
+            trainer.evaluate_batch_losses(
                 task,
                 batch,
-                support,
-                refresh_certificates=refresh_certificates and idx == 0,
+                supports,
+                refresh_certificates=refresh_certificates,
             )
-            for idx, support in enumerate(supports)
-        ]
+        )
 
     def static_support_score(
         self,
@@ -587,7 +641,7 @@ class ExactSearchService:
         final_state = None
         for batch in bundle.train_batches:
             if self.cfg.exact_search.rollout_gradient_mode == "trainer":
-                grads, _, final_state = clone.compute_pc_gradients(
+                grads, _, final_state = clone.compute_training_gradients(
                     batch,
                     task,
                     support_cols,
@@ -617,7 +671,11 @@ class ExactSearchService:
             clone.persistent_state.params = clone.params
             clone._bump_params_revision()
         if final_state is None and bundle.current_eval:
-            final_state, _ = clone.run_batch_inference(bundle.current_eval[0], task, support_cols)
+            final_state, _ = clone.run_batch_evaluation_inference(
+                bundle.current_eval[0],
+                task,
+                support_cols,
+            )
         objective = self.boundary_objective(
             task_id,
             support_cols,
@@ -633,7 +691,7 @@ class ExactSearchService:
             phi,
             self.cfg.phi,
         )
-        if final_state is not None and hasattr(clone, "composer_diagnostics_from_state"):
+        if final_state is not None:
             composer_diag = clone.composer_diagnostics_from_state(final_state, task, support_cols)
         else:
             composer_diag = {
@@ -973,7 +1031,7 @@ class ExactSearchService:
 
     def boundary_search(self, task_id: int) -> Tuple[Tuple[int, ...], PhiConfig]:
         search_started = time.perf_counter()
-        bundle = self.make_bundle(task_id)
+        bundle = self.make_bundle(task_id, purpose="boundary")
         support_candidates = tuple(enumerate_nonshared_supports(self.cfg))
         phi_candidates = self.phi_candidates()
         if getattr(self.trainer, "run_logger", None) is not None:
@@ -1001,10 +1059,7 @@ class ExactSearchService:
                 bundle,
                 reserve_recruitment_candidate=True,
             )
-            support_rows = self._rank_support_rows(
-                [*support_rows, *reserve_rows],
-                reserve_recruitment_triggered=True,
-            )
+            support_rows = self._rank_support_rows([*support_rows, *reserve_rows])
 
         support_rows.sort(key=lambda row: row.posterior_energy)
         shortlisted = support_rows[: self.cfg.exact_search.boundary_shortlist]
@@ -1044,7 +1099,6 @@ class ExactSearchService:
             "boundary_total_seconds",
             time.perf_counter() - search_started,
         )
-        self._ensure_persistent_tables()
         self.trainer.persistent_state.support_tables[task_id] = support_rows
         self.trainer.persistent_state.support_posterior_tables[task_id] = self._posterior_summary(
             task_id,
@@ -1118,7 +1172,6 @@ class ExactSearchService:
         """Audit a small set of internal demotion swaps before mutating shells."""
         if not self.cfg.exact_search.enable_demotion_swap_audit:
             return []
-        self._ensure_persistent_tables()
         candidates = self.trainer.shell_controller.demotion_swap_candidates(
             self.trainer.params,
             final_state,
@@ -1130,7 +1183,7 @@ class ExactSearchService:
             return []
 
         started_at = time.perf_counter()
-        bundle = self.make_bundle(task_id)
+        bundle = self.make_bundle(task_id, purpose="demotion")
         current_support = tuple(sorted(nonshared))
         round_index = 1 + len(
             {row.round_index for row in self.trainer.persistent_state.demotion_swap_tables.get(task_id, [])}
@@ -1247,21 +1300,6 @@ class ExactSearchService:
         gc.collect()
         return rows
 
-    def _ensure_persistent_tables(self) -> None:
-        defaults = {
-            "support_posterior_tables": {},
-            "reserve_recruitment_tables": {},
-            "controller_tables": {},
-            "local_swap_tables": {},
-            "demotion_swap_tables": {},
-            "last_demotion_audit_step": {},
-            "replay_proposals": {},
-            "recently_demoted": {},
-        }
-        for name, value in defaults.items():
-            if not hasattr(self.trainer.persistent_state, name):
-                setattr(self.trainer.persistent_state, name, value)
-
     def local_one_swap(self, task_id: int) -> Tuple[int, ...]:
         """V20.2b in-task support refinement.
 
@@ -1269,11 +1307,10 @@ class ExactSearchService:
         `replay_overlap_floor`, scores the union under the penalised objective,
         and accepts the best candidate if it beats current by `local_swap_margin`.
         """
-        self._ensure_persistent_tables()
         if task_id == 0:
             return self.trainer.current_nonshared
 
-        bundle = self.make_bundle(task_id)
+        bundle = self.make_bundle(task_id, purpose="local_swap")
         current_nonshared = tuple(
             sorted(
                 self.trainer.persistent_state.current_support.get(
