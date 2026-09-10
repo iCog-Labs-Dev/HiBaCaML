@@ -6,16 +6,20 @@ from typing import Any, Dict
 
 import jax.numpy as jnp
 
-from fabricpc.core.energy import CrossEntropyEnergy
+from fabricpc.core.energy import CrossEntropyEnergy, EnergyFunctional
 
 
 class WeightedCrossEntropyEnergy(CrossEntropyEnergy):
     """Cross-entropy energy scaled by a fixed loss weight."""
 
     def __init__(self, weight: float = 1.0, eps: float = 1e-7, axis: int = -1):
-        super().__init__(eps=eps, axis=axis)
-        self.config = dict(self.config)
-        self.config["weight"] = weight
+        # FabricPC's EnergyFunctional/FrozenConfig freezes `config` at
+        # construction time (see fabricpc/core/_frozen.py); config keys can
+        # no longer be added after the fact. CrossEntropyEnergy.__init__
+        # only forwards (eps, axis), so we bypass it and call the
+        # EnergyFunctional constructor directly with the full config,
+        # matching the documented subclassing pattern in fabricpc/core/energy.py.
+        EnergyFunctional.__init__(self, eps=eps, axis=axis, weight=weight)
 
     @staticmethod
     def energy(

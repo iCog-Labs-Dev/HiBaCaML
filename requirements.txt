@@ -1,0 +1,20 @@
+# HiBaCaML experiment dependencies, beyond FabricPC itself.
+#
+# FabricPC (https://github.com/trueagi-io/FabricPC) must be installed
+# separately in editable mode -- see README.md "Install FabricPC".
+#
+# The two packages below are imported by this repo but were previously
+# undeclared anywhere, so a clean checkout + FabricPC install alone is
+# not enough to run experiments/split_mnist.py end to end:
+#
+#   - matplotlib is required by hibacaml/reporting/plots.py
+#     (experiments/split_mnist.py calls generate_plots() unconditionally
+#     at the end of a run; without matplotlib this raises ImportError
+#     only after a full training run has already completed).
+#   - tensorflow is the primary path hibacaml/data/split_mnist.py uses
+#     to fetch/cache MNIST via tensorflow.keras.datasets.mnist.load_data().
+#     (A pure-numpy fallback exists that downloads mnist.npz directly,
+#     but tensorflow/keras is tried first.)
+
+matplotlib>=3.7
+tensorflow-cpu>=2.15
