@@ -224,6 +224,8 @@ class ShellController:
         phi,
     ) -> GraphParams:
         """Apply inhibition, prune, promote, and demote to active columns."""
+        if not self.cfg.exact_search.enable_structural_edits:
+            return params
         updated_nodes = dict(params.nodes)
         for column_index in active_columns:
             meta = self.column_nodes[column_index]
