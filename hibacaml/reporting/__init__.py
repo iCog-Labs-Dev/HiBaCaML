@@ -1,20 +1,43 @@
 """Reporting utilities for HiBaCaML experiments."""
 
-from hibacaml.reporting.export import export_run_artifacts
-from hibacaml.reporting.logger import HiBaCaMLRunLogger, rss_mb
+from hibacaml.reporting.export import (
+    append_event,
+    export_run_artifacts,
+    start_run,
+    to_jsonable,
+    write_csv,
+    write_json,
+    write_run_state,
+)
+from hibacaml.reporting.logger import (
+    log_progress,
+    rollout_logging,
+    rss_mb,
+)
 from hibacaml.reporting.plots import (
     plot_accuracy_forgetting,
+    plot_composer_usage,
+    plot_confusion_matrix,
+    plot_learning_curve,
     plot_support_table,
     plot_swap_gains,
 )
-from hibacaml.reporting.review import print_pre_run_review
 
 __all__ = [
+    "append_event",
     "export_run_artifacts",
-    "HiBaCaMLRunLogger",
+    "log_progress",
+    "rollout_logging",
+    "start_run",
     "plot_accuracy_forgetting",
+    "plot_composer_usage",
+    "plot_confusion_matrix",
+    "plot_learning_curve",
     "plot_support_table",
     "plot_swap_gains",
-    "print_pre_run_review",
     "rss_mb",
+    "to_jsonable",
+    "write_csv",
+    "write_json",
+    "write_run_state",
 ]

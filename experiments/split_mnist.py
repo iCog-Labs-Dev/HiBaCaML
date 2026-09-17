@@ -1,37 +1,29 @@
 """Split-MNIST experiment runner for HiBaCaML."""
 
 from __future__ import annotations
-import csv
-import dataclasses
 import gc
-import json
 import sys
 import jax
 from pathlib import Path
 from typing import Dict, List, Sequence
 
-from fabricpc.core.inference import InferenceSGD
-from fabricpc.graph_initialization import initialize_params
-from fabricpc.graph_initialization.state_initializer import FeedforwardStateInit
-
 sys.path.append(".")
 
-from hibacaml.debug import log_progress
+from hibacaml.reporting.logger import log_progress
 from hibacaml import (
-    HiBaCaMLBackpropRunner,
-    HiBaCaMLTrainer,
     build_split_mnist_tasks,
-    create_hibacaml_structure,
+    build_trainer,
     export_run_artifacts,
     make_hibacaml_config,
     override,
+    prepare_run_root,
 )
-
 from hibacaml.reporting import (
     plot_accuracy_forgetting,
     plot_support_table,
     plot_swap_gains,
-    print_pre_run_review,
+    write_csv,
+    write_json,
 )
 
 
@@ -51,61 +43,6 @@ OVERRIDES = {
     "exact_search__local_swap_audit_data_batch_size": 128,
     "exact_search__demotion_audit_data_batch_size": 128,
 }
-
-
-# Helpers
-def _jsonable(value):
-    if dataclasses.is_dataclass(value):
-        return {key: _jsonable(val) for key, val in dataclasses.asdict(value).items()}
-    if isinstance(value, dict):
-        return {str(key): _jsonable(val) for key, val in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_jsonable(val) for val in value]
-    if hasattr(value, "tolist"):
-        try:
-            return value.tolist()
-        except Exception:
-            return value
-    return value
-
-
-def _write_json(path: Path, payload) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(_jsonable(payload), indent=2, sort_keys=True))
-
-
-def _write_csv(path: Path, rows: Sequence[Dict[str, object]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if not rows:
-        path.write_text("")
-        return
-    fieldnames = sorted({key for row in rows for key in row})
-    with path.open("w", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({key: _jsonable(row.get(key)) for key in fieldnames})
-
-
-# Trainer construction
-def build_trainer(cfg, tasks, learning: str, *, run_id: str = ""):
-    """Construct the HiBaCaML trainer for one learning mode."""
-    inference = InferenceSGD(eta_infer=cfg.eta_infer, infer_steps=cfg.infer_steps)
-    graph_state_initializer = FeedforwardStateInit()
-    structure = create_hibacaml_structure(
-        cfg,
-        inference,
-        graph_state_initializer=graph_state_initializer,
-    )
-    log_progress(f"graph ready with {len(structure.nodes)} nodes", component="runner")
-
-    params = initialize_params(structure, jax.random.PRNGKey(cfg.seed))
-    log_progress("parameter initialization complete", component="runner")
-
-    trainer_cls = HiBaCaMLBackpropRunner if learning == "backprop" else HiBaCaMLTrainer
-    trainer = trainer_cls(cfg, structure, params, tasks=tasks, run_id=run_id)
-    log_progress(f"trainer constructed class={type(trainer).__name__}", component="runner")
-    return structure, trainer
 
 
 # Metric helpers
@@ -279,8 +216,8 @@ def _run_tasks(
         "checkpoint_paths": checkpoint_paths,
     }
 
-    _write_json(run_root / "run_summary.json", results)
-    _write_csv(run_root / "task_summary.csv", task_metric_rows)
+    write_json(run_root / "run_summary.json", results)
+    write_csv(run_root / "task_summary.csv", task_metric_rows)
 
     return results
 
@@ -320,9 +257,10 @@ def run_experiment(
     if learning not in ("pc", "backprop"):
         raise ValueError("learning must be 'pc' or 'backprop'")
 
-    print("JAX backend:", jax.default_backend(), flush=True)
-    print("JAX devices:", jax.devices(), flush=True)
-    print("starting HiBaCaML experiment.")
+    log_progress(
+        f"backend={jax.default_backend()} devices={jax.devices()}",
+        component="runner",
+    )
 
     tasks = build_split_mnist_tasks(cfg, limit=tasks_limit)
 
@@ -331,27 +269,10 @@ def run_experiment(
     if run_id is None:
         from datetime import datetime, timezone
         run_id = f"SMNIST_{learning}_{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
-    run_output_root = cfg.experiment_root_path() / run_id
-    if run_output_root.exists():
-        raise FileExistsError(
-            f"run directory already exists: {run_output_root} "
-            "(choose a different run_id, or remove the existing directory)"
-        )
-    run_output_root.mkdir(parents=True)
+    cfg, run_output_root = prepare_run_root(cfg, run_id)
     run_plots_dir = Path(plots_dir) if plots_dir else run_output_root / "plots"
 
-    selector_state_root = cfg.reporting.selector_state_root or str(run_output_root / "selector_state")
-    cfg = dataclasses.replace(
-        cfg,
-        reporting=dataclasses.replace(
-            cfg.reporting,
-            experiment_root=str(run_output_root),
-            selector_state_root=selector_state_root,
-        ),
-    )
-
-    structure, trainer = build_trainer(cfg, tasks, learning, run_id=run_id)
-    print_pre_run_review(cfg, structure, tasks, learning)
+    _, trainer = build_trainer(cfg, tasks, learning, run_id=run_id)
 
     results = _run_tasks(
         trainer,
@@ -361,13 +282,9 @@ def run_experiment(
     )
     generate_plots(results, run_plots_dir)
 
-    print("\nRun complete.")
-    print(f"  Run ID  : {run_id}")
-    print(f"  Run dir : {run_output_root}")
-    print(f"  Summary : {run_output_root / 'run_summary.json'}")
-    print(f"  Table   : {run_output_root / 'task_summary.csv'}")
-    print(f"  Plots   : {run_plots_dir}")
-    print(f"  Selector: {cfg.selector_state_path()}")
+    log_progress(
+        f"run complete id={run_id} dir={run_output_root}", component="runner"
+    )
 
     return {
         "cfg": cfg,

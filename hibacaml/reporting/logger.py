@@ -1,22 +1,26 @@
-"""Structured run logging for HiBaCaML experiments."""
+"""Human-readable progress logging for HiBaCaML."""
 
 from __future__ import annotations
 
-import csv
-import json
+import contextlib
+import contextvars
+import logging
 import platform
-import threading
+import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
-
-from hibacaml.reporting.export import _to_jsonable
 
 try:
     import resource
-except Exception:  # pragma: no cover - non-Unix fallback.
+except Exception:
     resource = None
 
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_START_TIME = time.perf_counter()
+_LOGGER_NAME = "hibacaml"
+_FORMAT = "[%(component)s t+%(elapsed)7.1fs%(rss)s] %(message)s"
+_ROLLOUT_DEPTH = contextvars.ContextVar("hibacaml_rollout_depth", default=0)
+_configured = False
 
 def rss_mb() -> float | None:
     """Return peak resident set size in MiB with platform-correct units."""
@@ -31,101 +35,74 @@ def rss_mb() -> float | None:
     return value / (1024.0 * 1024.0)
 
 
-class HiBaCaMLRunLogger:
-    """Small JSONL/JSON/CSV logger for HiBaCaML experiments."""
+@contextlib.contextmanager
+def rollout_logging():
+    """Demote progress lines to DEBUG while a rollout clone is running.
 
-    def __init__(self, cfg, root: Optional[Path] = None):
-        self.cfg = cfg
-        self.root = Path(root) if root is not None else Path(cfg.reporting.experiment_root)
-        self.root.mkdir(parents=True, exist_ok=True)
-        self.started_at = time.time()
-        self._lock = threading.Lock()
-        self._event_path = self.root / "events.jsonl"
-        self._memory_path = self.root / "memory_samples.csv"
-        self._phase_timings: Dict[str, float] = {}
-        self._task_summaries: Dict[str, Dict[str, Any]] = {}
-        self._progress: Dict[str, Any] = {
-            "mode": cfg.mode,
-            "global_step": 0,
-            "phase": "created",
-        }
-        if not self._memory_path.exists():
-            with self._memory_path.open("w", newline="", encoding="utf-8") as handle:
-                writer = csv.DictWriter(
-                    handle,
-                    fieldnames=["wall_time", "elapsed_seconds", "phase", "task_id", "step", "rss_mb"],
-                )
-                writer.writeheader()
+    Rollout trials re-run training on a clone, so their progress lines are
+    repetitive and vastly outnumber the parent's. They stay recoverable with
+    `logging.getLogger("hibacaml").setLevel(logging.DEBUG)`.
+    """
+    token = _ROLLOUT_DEPTH.set(_ROLLOUT_DEPTH.get() + 1)
+    try:
+        yield
+    finally:
+        # Reset by token so an exception cannot leave the level demoted.
+        _ROLLOUT_DEPTH.reset(token)
 
-    def event(self, phase: str, payload: Optional[Dict[str, Any]] = None, **extra: Any) -> None:
-        record = {
-            "wall_time": time.time(),
-            "elapsed_seconds": time.time() - self.started_at,
-            "phase": phase,
-            "rss_mb": rss_mb(),
-        }
-        if payload:
-            record.update(payload)
-        record.update(extra)
-        with self._lock:
-            with self._event_path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(_to_jsonable(record), sort_keys=True) + "\n")
-        self.heartbeat(phase=phase, global_step=record.get("global_step"))
 
-    def progress(self, **payload: Any) -> None:
-        self._progress.update(payload)
-        self._write_json(self.root / self.cfg.reporting.progress_filename, self._progress)
+class _ContextFilter(logging.Filter):
+    """Attach elapsed time, peak RSS, and the short component to every record."""
 
-    def heartbeat(self, **payload: Any) -> None:
-        heartbeat = {
-            "wall_time": time.time(),
-            "elapsed_seconds": time.time() - self.started_at,
-            "rss_mb": rss_mb(),
-            **payload,
-        }
-        self._write_json(self.root / self.cfg.reporting.heartbeat_filename, heartbeat)
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.elapsed = time.perf_counter() - _START_TIME
+        value = rss_mb()
+        record.rss = f" rss={value:8.1f}MB" if value is not None else ""
+        record.component = record.name.rpartition(".")[2]
+        return True
 
-    def memory_sample(
-        self,
-        *,
-        phase: str,
-        task_id: int | None = None,
-        step: int | None = None,
-    ) -> None:
-        row = {
-            "wall_time": time.time(),
-            "elapsed_seconds": time.time() - self.started_at,
-            "phase": phase,
-            "task_id": task_id,
-            "step": step,
-            "rss_mb": rss_mb(),
-        }
-        with self._lock:
-            with self._memory_path.open("a", newline="", encoding="utf-8") as handle:
-                writer = csv.DictWriter(
-                    handle,
-                    fieldnames=["wall_time", "elapsed_seconds", "phase", "task_id", "step", "rss_mb"],
-                )
-                writer.writerow(_to_jsonable(row))
 
-    def phase_timing(self, phase: str, seconds: float) -> None:
-        self._phase_timings[phase] = self._phase_timings.get(phase, 0.0) + float(seconds)
-        self._write_json(
-            self.root / "phase_timings.json",
-            self._phase_timings,
-        )
+def _configure() -> None:
+    """Attach handlers to the `hibacaml` logger once. Never touches the root."""
+    global _configured
+    if _configured:
+        return
+    _configured = True
 
-    def task_summary(self, task_id: int, summary: Dict[str, Any]) -> None:
-        self._task_summaries[str(task_id)] = summary
-        self._write_json(
-            self.root / "task_summaries.json",
-            self._task_summaries,
-        )
+    logger = logging.getLogger(_LOGGER_NAME)
+    if logger.handlers:
+        # An application configured its own logging; it owns level and sinks.
+        return
 
-    def _write_json(self, path: Path, payload: Any) -> None:
+    logger.setLevel(logging.INFO)
+    logging.raiseExceptions = False  # logging must never interrupt a run
+
+    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
+    try:
+        path: Path = _REPO_ROOT / "hibacaml_debug.log"
         path.parent.mkdir(parents=True, exist_ok=True)
-        with self._lock:
-            path.write_text(
-                json.dumps(_to_jsonable(payload), indent=2, sort_keys=True),
-                encoding="utf-8",
-            )
+        handlers.append(logging.FileHandler(path, encoding="utf-8", delay=True))
+    except OSError:
+        pass
+
+    formatter = logging.Formatter(_FORMAT)
+    context = _ContextFilter()
+    for handler in handlers:
+        handler.setFormatter(formatter)
+        handler.addFilter(context)
+        logger.addHandler(handler)
+    # Keep records inside the hibacaml tree so an application's own root
+    # configuration cannot print them a second time.
+    logger.propagate = False
+
+
+def log_progress(message: str, *, component: str = _LOGGER_NAME) -> None:
+    """Emit a progress line to stdout and the debug log file."""
+    _configure()
+    name = (
+        _LOGGER_NAME
+        if component == _LOGGER_NAME
+        else f"{_LOGGER_NAME}.{component}"
+    )
+    level = logging.DEBUG if _ROLLOUT_DEPTH.get() else logging.INFO
+    logging.getLogger(name).log(level, message)

@@ -23,6 +23,7 @@ from hibacaml.control.support import (
     enumerate_reserve_recruitment_supports,
     one_swap_neighbors,
 )
+from hibacaml.reporting import append_event, rollout_logging
 from hibacaml.types import (
     BoundaryBundle,
     ControllerSearchRow,
@@ -634,6 +635,16 @@ class ExactSearchService:
         phi: PhiConfig,
         bundle: BoundaryBundle,
     ) -> ControllerSearchRow:
+        with rollout_logging():
+            return self._rollout_score(task_id, support_cols, phi, bundle)
+
+    def _rollout_score(
+        self,
+        task_id: int,
+        support_cols: Sequence[int],
+        phi: PhiConfig,
+        bundle: BoundaryBundle,
+    ) -> ControllerSearchRow:
         clone = self.trainer.clone()
         clone.set_current_support(task_id, support_cols, phi)
         clone.current_phi = phi
@@ -661,15 +672,17 @@ class ExactSearchService:
                 )
             grads = clone._mask_grads(grads, support_cols)
             clone._apply_grads(grads)
-            clone.params = clone.shell_controller.apply_structural_edits(
+            updated_params = clone.shell_controller.apply_structural_edits(
                 clone.params,
                 final_state,
                 clone.persistent_state,
                 clone.active_full_support(support_cols),
                 phi,
             )
-            clone.persistent_state.params = clone.params
-            clone._bump_params_revision()
+            if updated_params is not clone.params:
+                clone.params = updated_params
+                clone.persistent_state.params = clone.params
+                clone._bump_params_revision()
         if final_state is None and bundle.current_eval:
             final_state, _ = clone.run_batch_evaluation_inference(
                 bundle.current_eval[0],
@@ -1034,8 +1047,9 @@ class ExactSearchService:
         bundle = self.make_bundle(task_id, purpose="boundary")
         support_candidates = tuple(enumerate_nonshared_supports(self.cfg))
         phi_candidates = self.phi_candidates()
-        if getattr(self.trainer, "run_logger", None) is not None:
-            self.trainer.run_logger.event(
+        if self.trainer.run_root is not None:
+            append_event(
+                self.trainer.run_root,
                 "boundary_search_start",
                 task_id=task_id,
                 candidate_count=len(support_candidates),
@@ -1083,8 +1097,9 @@ class ExactSearchService:
             for phi in phi_candidates:
                 row = self.rollout_score(task_id, support_row.nonshared, phi, bundle)
                 controller_rows.append(row)
-                if getattr(self.trainer, "run_logger", None) is not None:
-                    self.trainer.run_logger.event(
+                if self.trainer.run_root is not None:
+                    append_event(
+                        self.trainer.run_root,
                         "rollout_scored",
                         task_id=task_id,
                         support=row.nonshared,
@@ -1110,8 +1125,9 @@ class ExactSearchService:
         if best_row is None:
             fallback = tuple(sorted(self.trainer.current_nonshared))
             self.trainer.set_boundary_choice(task_id, fallback, self.trainer.current_phi)
-            if getattr(self.trainer, "run_logger", None) is not None:
-                self.trainer.run_logger.event(
+            if self.trainer.run_root is not None:
+                append_event(
+                    self.trainer.run_root,
                     "boundary_search_done",
                     task_id=task_id,
                     support_rows=len(support_rows),
@@ -1149,8 +1165,9 @@ class ExactSearchService:
             phi=reselection.accepted_phi,
             objective=accepted_objective,
         )
-        if getattr(self.trainer, "run_logger", None) is not None:
-            self.trainer.run_logger.event(
+        if self.trainer.run_root is not None:
+            append_event(
+                self.trainer.run_root,
                 "boundary_search_done",
                 task_id=task_id,
                 support_rows=len(support_rows),
@@ -1205,53 +1222,55 @@ class ExactSearchService:
         baseline_total = float(baseline_objective["total"] + baseline_semantic)
         rows: List[DemotionSwapAuditRow] = []
         best_row = None
-        for candidate in candidates:
-            clone = self.trainer.clone()
-            clone.params = clone.shell_controller.apply_demotion_swap(
-                clone.params,
-                node_name=str(candidate["node_name"]),
-                inner_shell=str(candidate["inner_shell"]),
-                outer_shell=str(candidate["outer_shell"]),
-                inner_index=int(candidate["inner_index"]),
-                outer_index=int(candidate["outer_index"]),
-            )
-            clone.persistent_state.params = clone.params
-            clone._bump_params_revision()
-            candidate_objective = self.boundary_objective(
-                task_id,
-                current_support,
-                bundle,
-                trainer=clone,
-                refresh_certificates=True,
-            )
-            candidate_semantic = (
-                clone.shell_controller.semantic_penalty(
-                    clone.persistent_state,
-                    clone.active_full_support(current_support),
+        # Each candidate is scored on a clone; demote their progress lines.
+        with rollout_logging():
+            for candidate in candidates:
+                clone = self.trainer.clone()
+                clone.params = clone.shell_controller.apply_demotion_swap(
+                    clone.params,
+                    node_name=str(candidate["node_name"]),
+                    inner_shell=str(candidate["inner_shell"]),
+                    outer_shell=str(candidate["outer_shell"]),
+                    inner_index=int(candidate["inner_index"]),
+                    outer_index=int(candidate["outer_index"]),
                 )
-                if self.cfg.exact_search.log_semantic_penalty
-                else 0.0
-            )
-            candidate_total = float(candidate_objective["total"] + candidate_semantic)
-            row = DemotionSwapAuditRow(
-                task_id=task_id,
-                round_index=round_index,
-                global_step=self.trainer.persistent_state.global_step,
-                column_index=int(candidate["column_index"]),
-                node_name=str(candidate["node_name"]),
-                inner_shell=str(candidate["inner_shell"]),
-                outer_shell=str(candidate["outer_shell"]),
-                inner_index=int(candidate["inner_index"]),
-                outer_index=int(candidate["outer_index"]),
-                baseline_total=baseline_total,
-                candidate_total=candidate_total,
-                gain=float(baseline_total - candidate_total),
-                accepted=False,
-            )
-            rows.append(row)
-            if best_row is None or row.gain > best_row.gain:
-                best_row = row
-            del clone
+                clone.persistent_state.params = clone.params
+                clone._bump_params_revision()
+                candidate_objective = self.boundary_objective(
+                    task_id,
+                    current_support,
+                    bundle,
+                    trainer=clone,
+                    refresh_certificates=True,
+                )
+                candidate_semantic = (
+                    clone.shell_controller.semantic_penalty(
+                        clone.persistent_state,
+                        clone.active_full_support(current_support),
+                    )
+                    if self.cfg.exact_search.log_semantic_penalty
+                    else 0.0
+                )
+                candidate_total = float(candidate_objective["total"] + candidate_semantic)
+                row = DemotionSwapAuditRow(
+                    task_id=task_id,
+                    round_index=round_index,
+                    global_step=self.trainer.persistent_state.global_step,
+                    column_index=int(candidate["column_index"]),
+                    node_name=str(candidate["node_name"]),
+                    inner_shell=str(candidate["inner_shell"]),
+                    outer_shell=str(candidate["outer_shell"]),
+                    inner_index=int(candidate["inner_index"]),
+                    outer_index=int(candidate["outer_index"]),
+                    baseline_total=baseline_total,
+                    candidate_total=candidate_total,
+                    gain=float(baseline_total - candidate_total),
+                    accepted=False,
+                )
+                rows.append(row)
+                if best_row is None or row.gain > best_row.gain:
+                    best_row = row
+                del clone
 
         if best_row is not None and best_row.gain > self.cfg.exact_search.demotion_swap_margin:
             self.trainer.params = self.trainer.shell_controller.apply_demotion_swap(
@@ -1288,8 +1307,9 @@ class ExactSearchService:
             time.perf_counter() - started_at,
             accumulate=True,
         )
-        if getattr(self.trainer, "run_logger", None) is not None:
-            self.trainer.run_logger.event(
+        if self.trainer.run_root is not None:
+            append_event(
+                self.trainer.run_root,
                 "demotion_swap_audit_done",
                 task_id=task_id,
                 round_index=round_index,
@@ -1501,8 +1521,9 @@ class ExactSearchService:
             time.perf_counter() - started_at,
             accumulate=True,
         )
-        if getattr(self.trainer, "run_logger", None) is not None:
-            self.trainer.run_logger.event(
+        if self.trainer.run_root is not None:
+            append_event(
+                self.trainer.run_root,
                 "local_one_swap_done",
                 task_id=task_id,
                 round_index=round_index,

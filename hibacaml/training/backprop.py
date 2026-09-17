@@ -10,11 +10,12 @@ import jax.numpy as jnp
 from fabricpc.graph_initialization.state_initializer import initialize_graph_state
 from hibacaml.training.trainer import (
     HiBaCaMLTrainer,
+    _batch_targets,
     _composer_details_from_runtime,
     _cross_entropy_per_sample,
+    _evaluation_details_from_state,
     _hierarchy_parent_child_penalty,
 )
-
 
 class HiBaCaMLBackpropRunner(HiBaCaMLTrainer):
     """End-to-end autodiff runner that preserves HiBaCaML control semantics."""
@@ -111,31 +112,15 @@ class HiBaCaMLBackpropRunner(HiBaCaMLTrainer):
         params,
         clamps: Dict[str, jnp.ndarray],
     ) -> jnp.ndarray:
-        output_name = self.structure.task_map["y"]
-        hier_mid_name = self.structure.task_map["hier_mid"]
-        hier_global_name = self.structure.task_map["hier_global"]
-        task = _cross_entropy_per_sample(
-            final_state.nodes[output_name].z_mu,
-            jnp.asarray(stacked_batch["y"], dtype=jnp.float32),
-            1.0,
-        )
-        hier_mid = _cross_entropy_per_sample(
-            final_state.nodes[hier_mid_name].z_mu,
-            jnp.asarray(stacked_batch["hier_mid"], dtype=jnp.float32),
-            self.cfg.hierarchy.mid_loss_weight,
-        )
-        hier_global = _cross_entropy_per_sample(
-            final_state.nodes[hier_global_name].z_mu,
-            jnp.asarray(stacked_batch["hier_global"], dtype=jnp.float32),
-            self.cfg.hierarchy.global_loss_weight,
-        )
-        composer_details = _composer_details_from_runtime(params, final_state, clamps, self.structure)
-        parent_child = _hierarchy_parent_child_penalty(
+        _, per_sample_total, _, _ = _evaluation_details_from_state(
+            params,
             final_state,
+            clamps,
+            _batch_targets(stacked_batch),
             self.structure,
-            self.cfg.hierarchy.parent_child_loss_weight,
+            composer_before_parent=True,
         )
-        return task + hier_mid + hier_global + composer_details["aux_penalty"] + parent_child
+        return per_sample_total
 
     def _forward_state(
         self,
@@ -272,8 +257,6 @@ class HiBaCaMLBackpropRunner(HiBaCaMLTrainer):
                 refresh_certificates=False,
             )
             losses = self._loss_components(final_state, batch, p, clamps)
-            # Report the components computed here rather than recomputing them
-            # eagerly afterwards on the same state and params.
             return losses["total"], (final_state, losses)
 
         (total_loss, (final_state, losses)), grads = jax.value_and_grad(
@@ -299,7 +282,7 @@ class HiBaCaMLBackpropRunner(HiBaCaMLTrainer):
             params=params,
         )
 
-    def evaluate_batch_outputs(
+    def _evaluate_batch_details(
         self,
         task,
         batch: Dict[str, jnp.ndarray],
@@ -319,32 +302,17 @@ class HiBaCaMLBackpropRunner(HiBaCaMLTrainer):
             update_cache=False,
             refresh_certificates=refresh_certificates,
         )
-        per_sample_total = self._per_sample_total(
-            final_state,
-            batch,
+        details = _evaluation_details_from_state(
             params,
+            final_state,
             clamps,
+            _batch_targets(batch),
+            self.structure,
+            composer_before_parent=True,
         )
-        logits = final_state.nodes[self.structure.task_map["y"]].z_mu
-        return logits, per_sample_total
-
-    def evaluate_batch_loss(
-        self,
-        task,
-        batch: Dict[str, jnp.ndarray],
-        nonshared: Sequence[int],
-        params=None,
-        *,
-        refresh_certificates: bool = True,
-    ) -> float:
-        _, per_sample_total = self.evaluate_batch_outputs(
-            task,
-            batch,
-            nonshared,
-            params=params,
-            refresh_certificates=refresh_certificates,
-        )
-        return float(jnp.mean(per_sample_total))
+        _, per_sample_total, _, _ = details
+        jax.block_until_ready(per_sample_total)
+        return details
 
     def evaluate_batch_losses(
         self,

@@ -11,15 +11,16 @@ from fabricpc.core.types import GraphParams
 
 
 @dataclass(frozen=True)
-class SplitMnistTask:
-    """Task-local Split-MNIST loaders and metadata."""
+class MnistTask:
+    """MNIST task loaders and metadata."""
 
     task_id: int
-    classes: Tuple[int, int]
+    classes: Tuple[int, ...]
     train_loader: Any
     test_loader: Any
     task_query: jnp.ndarray
     output_dim: int
+    validation_loader: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -196,7 +197,7 @@ class TaskSummary:
     """Per-task summary emitted after training/evaluation."""
 
     task_id: int
-    classes: Tuple[int, int]
+    classes: Tuple[int, ...]
     support_indices: Tuple[int, ...]
     accuracy: float
     mean_loss: float
@@ -251,6 +252,7 @@ class PersistentHiBaCaMLState:
     latest_local_swap: Optional[LocalSwapRow] = None
     last_demotion_audit_step: Dict[int, int] = field(default_factory=dict)
     composer_diagnostics: Dict[int, Dict[str, float]] = field(default_factory=dict)
+    epoch_evaluations: List[Dict[str, Any]] = field(default_factory=list)
     certificates: Dict[int, ColumnCertificate] = field(default_factory=dict)
     shell_stats: Dict[int, ShellStats] = field(default_factory=dict)
     global_step: int = 0
