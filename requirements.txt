@@ -1,7 +1,12 @@
 # HiBaCaML experiment dependencies, beyond FabricPC itself.
 #
 # FabricPC (https://github.com/trueagi-io/FabricPC) must be installed
-# separately in editable mode -- see README.md "Install FabricPC".
+# separately in editable mode, PINNED TO v0.5.2 -- see README.md
+# "Install FabricPC" for the exact commands and why the pin matters
+# (FabricPC v0.6.0 replaced the node forward() contract with a
+# predict()/energy() split that this repo's node code does not yet
+# implement; installing an unpinned/latest FabricPC breaks graph
+# construction entirely).
 #
 # The two packages below are imported by this repo but were previously
 # undeclared anywhere, so a clean checkout + FabricPC install alone is

@@ -23,10 +23,26 @@ The goal of this repo is to explore how a HiBaCaML/ColBa-style columnar, modular
 
 ## Install FabricPC
 
-Create a Python virtual environment, then install FabricPC in editable mode:
+Create a Python virtual environment, then install FabricPC in editable mode,
+**pinned to v0.5.2**:
 
 ```bash
 git clone https://github.com/trueagi-io/FabricPC.git
 cd FabricPC
+git checkout v0.5.2
 pip install -e ".[all]"
 ```
+
+**Why pinned, not latest:** FabricPC is under active development and has
+shipped several breaking changes to its node/energy contracts (see its own
+CHANGELOG.md). Most recently, v0.6.0 replaced the node `forward()` method
+with a `predict()`/`energy()` split, which this repo's node code
+(`hibacaml/nodes/core.py`) does not yet implement -- installing FabricPC
+`main` or any version >=0.6.0 will fail with
+`TypeError: Can't instantiate abstract class ... without an implementation
+for abstract method 'predict'` at graph-construction time. v0.5.2 is the
+newest version confirmed to work against the current node code (verified:
+`python experiments/split_mnist.py` and `trainer.evaluate_task(...)` both
+run successfully under it). Migrating to the v0.6.0 `predict()`/`energy()`
+contract is tracked as a separate, larger follow-up rather than folded into
+smaller fixes here.
