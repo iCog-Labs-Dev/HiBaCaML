@@ -11,7 +11,11 @@ from hibacaml.config import (
     make_hibacaml_config,
     override,
 )
-from hibacaml.control import ExactSearchService, ShellController
+from hibacaml.control import (
+    CertificateController,
+    ExactSearchService,
+    ShellController,
+)
 from hibacaml.data import build_full_mnist_task, build_split_mnist_tasks
 from hibacaml.experiment import build_trainer, prepare_run_root
 from hibacaml.graph import create_hibacaml_structure, initialize_hibacaml_state
@@ -50,6 +54,7 @@ __all__ = [
     "build_split_mnist_tasks",
     "build_trainer",
     "ExactSearchConfig",
+    "CertificateController",
     "ExactSearchService",
     "export_run_artifacts",
     "HiBaCaMLBackpropTrainer",

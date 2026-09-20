@@ -17,6 +17,7 @@ from fabricpc.graph_initialization.state_initializer import FeedforwardStateInit
 from hibacaml.config import HiBaCaMLConfig
 from hibacaml.control.replay_bank import SelectorBank
 from hibacaml.control.search import ExactSearchService
+from hibacaml.control.certificates import CertificateController, shell_slices
 from hibacaml.control.shells import ShellController, precision_weight_gradients
 from hibacaml.control.support import (
     build_full_support,
@@ -25,7 +26,7 @@ from hibacaml.control.support import (
 )
 from hibacaml.reporting.logger import log_progress
 from hibacaml.graph import initialize_hibacaml_state
-from hibacaml.nodes.core import composer_stage2_details
+from hibacaml.nodes.composer import composer_details
 from hibacaml.training.shared import (
     EvaluationAccumulator,
     batch_query,
@@ -107,7 +108,8 @@ class HiBaCaMLTrainer(ABC):
             if programs is not None
             else type(self).build_programs(structure, self.optimizer, cfg)
         )
-        self.shell_controller = ShellController(cfg, structure)
+        self.certificate_controller = CertificateController(cfg, structure)
+        self.shell_controller = ShellController(cfg, self.certificate_controller)
         # Rollout clones get no run root, which is what keeps their events out
         # of the audit stream.
         self.run_root: Optional[Path] = (
@@ -272,7 +274,7 @@ class HiBaCaMLTrainer(ABC):
     ) -> None:
         params = params if params is not None else self.params
         state = graph_state if graph_state is not None else self._last_graph_state_or_placeholder(batch_size)
-        self.shell_controller.refresh_certificates(params, state, self.persistent_state)
+        self.certificate_controller.refresh_certificates(params, state, self.persistent_state)
 
     def _build_clamps(
         self,
@@ -294,7 +296,7 @@ class HiBaCaMLTrainer(ABC):
         if refresh_certificates:
             self._refresh_certificates(batch_size, params=params)
         support_mask = self.build_support_mask(nonshared)
-        cert_vectors = self.shell_controller.certificate_matrix(self.persistent_state, support_mask)
+        cert_vectors = self.certificate_controller.certificate_matrix(self.persistent_state, support_mask)
         return build_single_support_clamps(
             self.structure,
             batch,
@@ -325,9 +327,9 @@ class HiBaCaMLTrainer(ABC):
             self._refresh_certificates(batch_size, params=params)
         support_masks = [self.build_support_mask(nonshared) for nonshared in supports]
         # The unmasked vectors are identical for every support; only the mask differs.
-        cert_base = self.shell_controller.certificate_vectors(self.persistent_state)
+        cert_base = self.certificate_controller.certificate_vectors(self.persistent_state)
         cert_matrices = [
-            self.shell_controller.mask_certificate_vectors(cert_base, support_mask)
+            self.certificate_controller.mask_certificate_vectors(cert_base, support_mask)
             for support_mask in support_masks
         ]
         return build_multi_support_clamps(
@@ -402,7 +404,7 @@ class HiBaCaMLTrainer(ABC):
             axis=1,
         )
         support_mask = self.build_support_mask(nonshared)
-        cert_vectors = self.shell_controller.certificate_matrix(self.persistent_state, support_mask)
+        cert_vectors = self.certificate_controller.certificate_matrix(self.persistent_state, support_mask)
         certs = jnp.stack(
             [
                 jnp.broadcast_to(
@@ -414,12 +416,12 @@ class HiBaCaMLTrainer(ABC):
             axis=1,
         )
         query = batch_query(task, final_state.batch_size)
-        details = composer_stage2_details(
-            self.params.nodes[meta["composer2_node"]],
+        details = composer_details(
+            self.params.nodes[meta["composer_node"]],
             features,
             certs,
             query,
-            self.structure.nodes[meta["composer2_node"]].node_info.node_config,
+            self.structure.nodes[meta["composer_node"]].node_info.node_config,
         )
         gate_probs = details["gate_probs"]
         return {
@@ -460,7 +462,7 @@ class HiBaCaMLTrainer(ABC):
         grads = precision_weight_gradients(
             grads,
             self.params,
-            shell_names=tuple(self.shell_controller.shell_slices),
+            shell_names=tuple(shell_slices(self.cfg)),
             enabled=self.cfg.exact_search.enable_precision_update_resistance,
             strength=self.cfg.exact_search.precision_update_strength,
             floor=self.cfg.exact_search.precision_update_floor,

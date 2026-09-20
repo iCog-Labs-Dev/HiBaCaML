@@ -1,219 +1,38 @@
-"""Shell certificates and structural edits for HiBaCaML."""
+"""Structural shell editing for HiBaCaML."""
 
 from __future__ import annotations
 
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, Sequence, Tuple
 
 import jax.numpy as jnp
 
 from fabricpc.core.types import GraphParams, GraphState, NodeParams
 from hibacaml.config import HiBaCaMLConfig
-from hibacaml.types import ColumnCertificate, PersistentHiBaCaMLState, ShellStats
+from hibacaml.control.certificates import (
+    CertificateController,
+    effective_precision,
+    shell_node_names,
+    shell_occupancy,
+    shell_slices,
+)
+from hibacaml.types import PersistentHiBaCaMLState
 
 
 class ShellController:
-    """External shell statistics, certificate, and edit service."""
+    """Structural editing of column shells."""
 
-    def __init__(self, cfg: HiBaCaMLConfig, structure):
+    def __init__(self, cfg: HiBaCaMLConfig, certificates: CertificateController):
         self.cfg = cfg
-        self.structure = structure
-        self.column_nodes = structure.config["hibacaml"]["column_nodes"]
-        kernel_dim = cfg.column_pool.memory_dim
-        s1, s2, s3 = cfg.column_pool.shell_sizes
-        self.shell_slices = {
-            "kernel": slice(0, kernel_dim),
-            "tier1": slice(kernel_dim, kernel_dim + s1),
-            "tier2": slice(kernel_dim + s1, kernel_dim + s1 + s2),
-            "tier3": slice(kernel_dim + s1 + s2, kernel_dim + s1 + s2 + s3),
-        }
+        # Editing ends by refreshing what it changed, so the observer is a
+        # collaborator rather than a caller's responsibility.
+        self.certificates = certificates
+        self.column_nodes = certificates.column_nodes
+        self.shell_slices = shell_slices(cfg)
         self.inhibition_strengths = {
             "tier1": 0.30,
             "tier2": 0.18,
             "tier3": 0.08,
         }
-
-    def update_shell_stats(
-        self,
-        persistent_state: PersistentHiBaCaMLState,
-        graph_state: GraphState,
-    ) -> None:
-        """Update shell EMAs from the latest graph state."""
-        for column_index, meta in enumerate(self.column_nodes):
-            stats = persistent_state.shell_stats.setdefault(column_index, ShellStats())
-            for shell_name, shell_slice in self.shell_slices.items():
-                shell_values = [
-                    graph_state.nodes[node_name].z_mu[..., shell_slice]
-                    for node_name in self._shell_node_names(meta)
-                ]
-                act = float(
-                    jnp.mean(
-                        jnp.asarray(
-                            [jnp.mean(jnp.abs(values)) for values in shell_values],
-                            dtype=jnp.float32,
-                        )
-                    )
-                )
-                var = float(
-                    jnp.mean(
-                        jnp.asarray(
-                            [jnp.mean(jnp.var(values, axis=0)) for values in shell_values],
-                            dtype=jnp.float32,
-                        )
-                    )
-                )
-                old_act = stats.activation_ema.get(shell_name, 0.0)
-                old_var = stats.task_variance_ema.get(shell_name, 0.0)
-                stats.activation_ema[shell_name] = 0.9 * old_act + 0.1 * act
-                stats.task_variance_ema[shell_name] = 0.9 * old_var + 0.1 * var
-            stats.reuse_ema = 0.9 * stats.reuse_ema + 0.1 * (
-                stats.activation_ema.get("kernel", 0.0) + stats.activation_ema.get("tier1", 0.0)
-            ) / 2.0
-            stats.specificity_ema = 0.9 * stats.specificity_ema + 0.1 * stats.task_variance_ema.get(
-                "tier3", 0.0
-            )
-
-    def refresh_certificates(
-        self,
-        params: GraphParams,
-        graph_state: GraphState,
-        persistent_state: PersistentHiBaCaMLState,
-    ) -> Dict[int, ColumnCertificate]:
-        """Compute and store fresh column certificates."""
-        self.update_shell_stats(persistent_state, graph_state)
-        certificates: Dict[int, ColumnCertificate] = {}
-        for column_index, meta in enumerate(self.column_nodes):
-            certificates[column_index] = self._compute_column_certificate(
-                column_index,
-                meta,
-                params,
-                graph_state,
-                persistent_state.shell_stats[column_index],
-            )
-        cert_vectors = {
-            idx: jnp.asarray(
-                [
-                    cert.q_mean,
-                    cert.prec_mean,
-                    cert.pred_mean,
-                    cert.live_frac,
-                    cert.tier_occ[0],
-                    cert.tier_occ[1],
-                    cert.tier_occ[2],
-                    cert.tier_q[0],
-                    cert.tier_q[1],
-                    cert.tier_q[2],
-                    cert.shared_abstraction_mass,
-                    cert.specificity_load,
-                    cert.demotion_pressure,
-                    cert.saturation,
-                ],
-                dtype=jnp.float32,
-            )
-            for idx, cert in certificates.items()
-        }
-        for idx, cert in certificates.items():
-            signature = []
-            base = cert_vectors[idx]
-            base_norm = jnp.linalg.norm(base) + 1e-8
-            for other_idx in range(self.cfg.column_pool.total_columns):
-                other = cert_vectors[other_idx]
-                sim = float(jnp.dot(base, other) / (base_norm * (jnp.linalg.norm(other) + 1e-8)))
-                signature.append(sim)
-            cert.similarity_signature = tuple(signature)
-        persistent_state.certificates = certificates
-        return certificates
-
-    def certificate_vectors(
-        self,
-        persistent_state: PersistentHiBaCaMLState,
-    ) -> Dict[int, jnp.ndarray]:
-        """Return the unmasked per-column certificate vectors.
-
-        Split out so callers that score many supports against one certificate
-        state build these once instead of once per support mask.
-        """
-        vectors = {}
-        for idx in range(self.cfg.column_pool.total_columns):
-            cert = persistent_state.certificates.get(idx)
-            if cert is None:
-                vectors[idx] = jnp.zeros((self.cfg.composer_cert_dim,), dtype=jnp.float32)
-                continue
-            vectors[idx] = jnp.asarray(
-                [
-                    cert.q_mean,
-                    cert.prec_mean,
-                    cert.pred_mean,
-                    cert.live_frac,
-                    cert.tier_q[0],
-                    cert.tier_q[1],
-                    cert.tier_q[2],
-                    cert.shared_abstraction_mass,
-                    cert.specificity_load,
-                    cert.demotion_pressure,
-                ],
-                dtype=jnp.float32,
-            )
-        return vectors
-
-    @staticmethod
-    def mask_certificate_vectors(
-        vectors: Dict[int, jnp.ndarray],
-        support_mask: jnp.ndarray,
-    ) -> Dict[int, jnp.ndarray]:
-        """Apply one support mask to precomputed certificate vectors."""
-        return {idx: vec * support_mask[idx] for idx, vec in vectors.items()}
-
-    def certificate_matrix(
-        self,
-        persistent_state: PersistentHiBaCaMLState,
-        support_mask: jnp.ndarray,
-    ) -> Dict[int, jnp.ndarray]:
-        """Return per-column certificate vectors masked by active support."""
-        return self.mask_certificate_vectors(
-            self.certificate_vectors(persistent_state),
-            support_mask,
-        )
-
-    def semantic_penalty(
-        self,
-        persistent_state: PersistentHiBaCaMLState,
-        active_columns: Sequence[int] | None = None,
-    ) -> float:
-        """Penalty for shell occupancy drift or broken q ordering."""
-        occ_targets = self.cfg.exact_search.semantic_targets
-        occ1 = []
-        occ2 = []
-        occ3 = []
-        q1 = []
-        q2 = []
-        q3 = []
-        if active_columns is None:
-            certificates = list(persistent_state.certificates.values())
-        else:
-            certificates = [
-                persistent_state.certificates[idx]
-                for idx in active_columns
-                if idx in persistent_state.certificates
-            ]
-        if not certificates:
-            return 0.0
-        for cert in certificates:
-            occ1.append(cert.tier_occ[0])
-            occ2.append(cert.tier_occ[1])
-            occ3.append(cert.tier_occ[2])
-            q1.append(cert.tier_q[0])
-            q2.append(cert.tier_q[1])
-            q3.append(cert.tier_q[2])
-        occ_penalty = (
-            abs(float(jnp.mean(jnp.asarray(occ1))) - occ_targets[0])
-            + abs(float(jnp.mean(jnp.asarray(occ2))) - occ_targets[1])
-            + abs(float(jnp.mean(jnp.asarray(occ3))) - occ_targets[2])
-        )
-        q_order_penalty = float(
-            jnp.maximum(0.0, jnp.mean(jnp.asarray(q2)) - jnp.mean(jnp.asarray(q1)))
-            + jnp.maximum(0.0, jnp.mean(jnp.asarray(q3)) - jnp.mean(jnp.asarray(q2)))
-        )
-        return occ_penalty + q_order_penalty
 
     def apply_structural_edits(
         self,
@@ -229,7 +48,7 @@ class ShellController:
         updated_nodes = dict(params.nodes)
         for column_index in active_columns:
             meta = self.column_nodes[column_index]
-            for node_name in self._shell_node_names(meta):
+            for node_name in shell_node_names(meta):
                 node_params = updated_nodes[node_name]
                 node_state = graph_state.nodes[node_name]
                 metrics = self._unit_metrics(node_params, node_state)
@@ -245,11 +64,11 @@ class ShellController:
                     ),
                 )
 
-                if self._occupancy(updated_node, "tier3") > self.cfg.exact_search.semantic_targets[2]:
+                if shell_occupancy(updated_node, "tier3") > self.cfg.exact_search.semantic_targets[2]:
                     prune_idx = self._low_score_indices(metrics["tier3"]["score"], phi.outer_quantile)
                     updated_node = self._prune_units(updated_node, "tier3", prune_idx)
 
-                if self._occupancy(updated_node, "tier2") > self.cfg.exact_search.semantic_targets[1]:
+                if shell_occupancy(updated_node, "tier2") > self.cfg.exact_search.semantic_targets[1]:
                     prune_idx = self._low_score_indices(metrics["tier2"]["score"], phi.middle_quantile)
                     updated_node = self._prune_units(updated_node, "tier2", prune_idx)
 
@@ -278,7 +97,10 @@ class ShellController:
                 updated_nodes[node_name] = updated_node
 
         params = params._replace(nodes=updated_nodes)
-        self.refresh_certificates(params, graph_state, persistent_state)
+        # Editing returns with certificates already describing the edited graph.
+        # The disabled path above returns before this, which is why refresh
+        # cadence differs between the two branches.
+        self.certificates.refresh_certificates(params, graph_state, persistent_state)
         return params
 
     def demotion_swap_candidates(
@@ -294,7 +116,7 @@ class ShellController:
         candidates = []
         for column_index in active_columns:
             meta = self.column_nodes[column_index]
-            for node_name in self._shell_node_names(meta):
+            for node_name in shell_node_names(meta):
                 node_params = params.nodes[node_name]
                 node_state = graph_state.nodes[node_name]
                 metrics = self._unit_metrics(node_params, node_state)
@@ -347,117 +169,11 @@ class ShellController:
         )
         return params._replace(nodes=updated_nodes)
 
-    def precision_weight_gradients(
-        self,
-        grads: GraphParams,
-        params: GraphParams,
-    ) -> GraphParams:
-        """Precondition shell gradients by inverse effective precision."""
-        if not self.cfg.exact_search.enable_precision_update_resistance:
-            return grads
-        strength = max(float(self.cfg.exact_search.precision_update_strength), 0.0)
-        floor = max(float(self.cfg.exact_search.precision_update_floor), 0.0)
-        updated_nodes = {}
-        for node_name, node_grads in grads.nodes.items():
-            node_params = params.nodes.get(node_name)
-            if node_params is None:
-                updated_nodes[node_name] = node_grads
-                continue
-            weights = dict(node_grads.weights)
-            biases = dict(node_grads.biases)
-            for shell_name in self.shell_slices:
-                precision_key = f"log_precision_{shell_name}"
-                if shell_name not in weights or precision_key not in node_params.biases:
-                    continue
-                precision = jax_nn_sigmoid(node_params.biases[precision_key])
-                factor = jnp.maximum(floor, 1.0 / (1.0 + strength * precision))
-                weights[shell_name] = weights[shell_name] * factor.reshape((1, -1))
-                recurrent_key = f"recur_{shell_name}"
-                if recurrent_key in weights:
-                    weights[recurrent_key] = weights[recurrent_key] * factor.reshape((1, -1))
-                for bias_key in (f"b_{shell_name}", precision_key):
-                    if bias_key in biases:
-                        biases[bias_key] = biases[bias_key] * factor
-            updated_nodes[node_name] = node_grads._replace(weights=weights, biases=biases)
-        return grads._replace(nodes=updated_nodes)
-
-    def _compute_column_certificate(
-        self,
-        column_index: int,
-        meta: Dict[str, str],
-        params: GraphParams,
-        graph_state: GraphState,
-        shell_stats: ShellStats,
-    ) -> ColumnCertificate:
-        q_means = []
-        prec_means = []
-        pred_means = []
-        mean_occupancies = []
-        tier_q = {"kernel": [], "tier1": [], "tier2": [], "tier3": []}
-        tier_occ = {"kernel": [], "tier1": [], "tier2": [], "tier3": []}
-        for node_name in self._shell_node_names(meta):
-            node_params = params.nodes[node_name]
-            node_state = graph_state.nodes[node_name]
-            pred_means.append(float(jnp.mean(jnp.abs(node_state.z_mu))))
-            occupancies = {
-                shell_name: self._occupancy(node_params, shell_name)
-                for shell_name in self.shell_slices
-            }
-            mean_occupancies.append(np_mean(list(occupancies.values())))
-            for shell_name in self.shell_slices:
-                log_precision = node_params.biases[f"log_precision_{shell_name}"]
-                q_val = float(jnp.mean(jax_nn_sigmoid(log_precision)))
-                q_means.append(q_val)
-                prec_means.append(float(jnp.mean(jnp.exp(log_precision))))
-                tier_q[shell_name].append(q_val)
-                tier_occ[shell_name].append(occupancies[shell_name])
-
-        kernel_q_mean = float(np_mean(tier_q["kernel"]))
-        tier1_mean = float(np_mean(tier_q["tier1"]))
-        tier2_mean = float(np_mean(tier_q["tier2"]))
-        tier3_mean = float(np_mean(tier_q["tier3"]))
-        occ_tier1 = float(np_mean(tier_occ["tier1"]))
-        occ_tier2 = float(np_mean(tier_occ["tier2"]))
-        occ_tier3 = float(np_mean(tier_occ["tier3"]))
-        shared_abstraction_mass = float(np_mean([kernel_q_mean, tier1_mean])) * shell_stats.reuse_ema
-        specificity_load = tier3_mean * shell_stats.specificity_ema
-        demotion_pressure = max(
-            0.0,
-            shell_stats.task_variance_ema.get("tier1", 0.0)
-            - shell_stats.task_variance_ema.get("tier3", 0.0),
-        )
-        saturation = float(np_mean(mean_occupancies))
-        return ColumnCertificate(
-            column_index=column_index,
-            q_mean=float(np_mean(q_means)),
-            prec_mean=float(np_mean(prec_means)),
-            pred_mean=float(np_mean(pred_means)),
-            live_frac=float(np_mean(tier_occ["kernel"])),
-            tier_q=(tier1_mean, tier2_mean, tier3_mean),
-            tier_occ=(occ_tier1, occ_tier2, occ_tier3),
-            shared_abstraction_mass=shared_abstraction_mass,
-            specificity_load=specificity_load,
-            demotion_pressure=demotion_pressure,
-            saturation=saturation,
-        )
-
-    def _shell_node_names(self, meta: Dict[str, str]) -> List[str]:
-        if "b_micro" in meta:
-            kernel_names = list(meta.get("k_micro_depth", (meta["k_micro"],)))
-            return [meta["b_micro"], *kernel_names, meta["l_micro"]]
-        return [meta["bridge"], meta["kernel_0"], meta["kernel_1"], meta["lateral"]]
-
-    def _occupancy(self, node_params: NodeParams, shell_name: str) -> float:
-        log_precision = node_params.biases[f"log_precision_{shell_name}"]
-        weight = node_params.weights[shell_name]
-        live = (jnp.linalg.norm(weight, axis=0) > 1e-6) & (jax_nn_sigmoid(log_precision.squeeze(0).squeeze(0)) > 0.2)
-        return float(jnp.mean(live.astype(jnp.float32)))
-
     def _unit_metrics(self, node_params: NodeParams, node_state) -> Dict[str, Dict[str, jnp.ndarray]]:
         metrics = {}
         for shell_name, shell_slice in self.shell_slices.items():
             weight = node_params.weights[shell_name]
-            precision = jax_nn_sigmoid(node_params.biases[f"log_precision_{shell_name}"].reshape(-1))
+            precision = effective_precision(node_params.biases[f"log_precision_{shell_name}"].reshape(-1))
             shell_values = node_state.z_mu[..., shell_slice]
             if weight.shape[1] == 0:
                 metrics[shell_name] = {
@@ -551,13 +267,44 @@ class ShellController:
         return NodeParams(weights=weights, biases=biases)
 
 
-def jax_nn_sigmoid(x: jnp.ndarray) -> jnp.ndarray:
-    """Small helper to avoid importing jax.nn in multiple places."""
-    return 1.0 / (1.0 + jnp.exp(-x))
+def precision_weight_gradients(
+    grads: GraphParams,
+    params: GraphParams,
+    *,
+    shell_names: Sequence[str],
+    enabled: bool,
+    strength: float,
+    floor: float,
+) -> GraphParams:
+    """Precondition shell gradients by inverse effective precision.
 
-
-def np_mean(values: Sequence[float]) -> float:
-    """Mean over Python sequences with an empty fallback."""
-    if not values:
-        return 0.0
-    return float(sum(values) / len(values))
+    Module-level rather than a controller method so the training update can close
+    over plain configuration values instead of a controller object.
+    """
+    if not enabled:
+        return grads
+    strength = max(float(strength), 0.0)
+    floor = max(float(floor), 0.0)
+    updated_nodes = {}
+    for node_name, node_grads in grads.nodes.items():
+        node_params = params.nodes.get(node_name)
+        if node_params is None:
+            updated_nodes[node_name] = node_grads
+            continue
+        weights = dict(node_grads.weights)
+        biases = dict(node_grads.biases)
+        for shell_name in shell_names:
+            precision_key = f"log_precision_{shell_name}"
+            if shell_name not in weights or precision_key not in node_params.biases:
+                continue
+            precision = effective_precision(node_params.biases[precision_key])
+            factor = jnp.maximum(floor, 1.0 / (1.0 + strength * precision))
+            weights[shell_name] = weights[shell_name] * factor.reshape((1, -1))
+            recurrent_key = f"recur_{shell_name}"
+            if recurrent_key in weights:
+                weights[recurrent_key] = weights[recurrent_key] * factor.reshape((1, -1))
+            for bias_key in (f"b_{shell_name}", precision_key):
+                if bias_key in biases:
+                    biases[bias_key] = biases[bias_key] * factor
+        updated_nodes[node_name] = node_grads._replace(weights=weights, biases=biases)
+    return grads._replace(nodes=updated_nodes)
