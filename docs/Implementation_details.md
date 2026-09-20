@@ -40,8 +40,11 @@ while internal certificates let the controller reuse modules more intelligently.
 
 - `hibacaml/graph/builder.py:create_hibacaml_structure`
 - `hibacaml/types.py:PersistentHiBaCaMLState`
-- `hibacaml/training/trainer.py:HiBaCaMLTrainer`
+- `hibacaml/training/trainer.py:HiBaCaMLTrainer` (abstract base)
+- `hibacaml/training/pc.py:HiBaCaMLPCTrainer`
+- `hibacaml/training/backprop.py:HiBaCaMLBackpropTrainer`
 - `hibacaml/control/search.py:ExactSearchService`
+- `hibacaml/control/certificates.py:CertificateController`
 - `hibacaml/control/shells.py:ShellController`
 
 **Implementation details.**
@@ -50,9 +53,9 @@ while internal certificates let the controller reuse modules more intelligently.
   `create_hibacaml_structure`. Column metadata records nodes such as
   `b_micro`, `k_micro`, `l_micro`, `feature_pool`, gates, logits, and
   certificate inputs.
-- `C`: the combiner is split into a simple stage-1 averaged logit path and a
-  stage-2 attention-style composer. `ScaledAddNode` combines `stage1_logits`
-  with the `ComposerStage2Node` correction and applies softmax.
+- `C`: the combiner pools the active columns' logits and adds a correction from
+  the attention-style column composer. `ScaledAddNode` combines `pooled_logits`
+  with the `ColumnComposerNode` correction and applies softmax.
 - `delta`: persistent internal state is represented by `ShellStats`,
   `ColumnCertificate`, precision-like shell biases, support snapshots, and
   controller audit tables in `PersistentHiBaCaMLState`.
@@ -122,7 +125,7 @@ or too-specific structure outward.
 
 **Implementation location.**
 
-- `hibacaml/nodes/core.py`
+- `hibacaml/nodes/micro_columns.py`
 - `hibacaml/graph/builder.py:create_hibacaml_structure`
 - `hibacaml/control/shells.py:ShellController`
 
@@ -175,9 +178,9 @@ estimation compared with external fit scores alone.
 
 - `hibacaml/types.py:ColumnCertificate`
 - `hibacaml/types.py:ShellStats`
-- `hibacaml/control/shells.py:ShellController.refresh_certificates`
-- `hibacaml/control/shells.py:ShellController.certificate_matrix`
-- `hibacaml/control/search.py:_certificate_reuse_score`
+- `hibacaml/control/certificates.py:CertificateController.refresh_certificates`
+- `hibacaml/control/certificates.py:CertificateController.certificate_matrix`
+- `hibacaml/control/scoring.py:SupportScorer._certificate_reuse_score`
 
 **Implementation details.**
 
@@ -275,6 +278,13 @@ explicit `gc.collect()` before the next clone is allocated, so CPython reuses th
 address and distinct candidates would collide on one cache entry and silently
 share each other's old-task losses.
 
+This audit cache is intentionally distinct from ordinary evaluation. General
+loader evaluation is not cached: its former key omitted certificate, loader,
+RNG, and other state that can affect the result, while observed savings were
+negligible. Every evaluation request therefore executes, advances its normal
+RNG transition, and performs a requested certificate refresh. The
+`params_revision` counter remains because the audit cache still uses it.
+
 During training, `HiBaCaMLTrainer.train_task` runs `local_one_swap` every
 `maintenance_interval` steps for tasks after task 0. It also runs
 `demotion_swap_audit` at a configured interval when enabled.
@@ -322,9 +332,9 @@ task-local material.
 
 **Implementation location.**
 
-- `hibacaml/nodes/core.py:ShellBankInputNode`
-- `hibacaml/nodes/core.py:ShellBankRecurrentNode`
-- `hibacaml/nodes/core.py:ShellBankResidualNode`
+- `hibacaml/nodes/micro_columns.py:ShellBankInputNode`
+- `hibacaml/nodes/micro_columns.py:ShellBankRecurrentNode`
+- `hibacaml/nodes/micro_columns.py:ShellBankResidualNode`
 - `hibacaml/control/shells.py:precision_weight_gradients`
 
 **Implementation details.**
@@ -355,11 +365,11 @@ composer combines active columns.
 
 **Implementation location.**
 
-- `hibacaml/data/split_mnist.py:_hierarchy_targets`
+- `hibacaml/data/mnist.py:_hierarchy_targets`
 - `hibacaml/graph/builder.py:create_hibacaml_structure`
-- `hibacaml/nodes/core.py:ComposerStage2Node`
-- `hibacaml/nodes/core.py:ScaledAddNode`
-- `hibacaml/training/trainer.py:_hierarchy_parent_child_penalty`
+- `hibacaml/nodes/composer.py:ColumnComposerNode`
+- `hibacaml/nodes/composer.py:ScaledAddNode`
+- `hibacaml/training/shared.py:hierarchy_parent_child_penalty`
 
 **Implementation details.**
 
@@ -440,13 +450,20 @@ L_parent_child = lambda_parent * mean_class(
 ```
 
 Its default weight is `lambda_parent = 0.04`. The reported composite also
-includes the composer auxiliary penalty. In predictive-coding training, the
-weighted cross-entropies are graph energies on clamped target nodes, but the
-parent-child and composer terms are calculated only after FabricPC local
-gradients and therefore do not currently affect the PC update. In backprop
-training, targets remain outside the graph and all five named terms are
-differentiated end to end. The graph-native auxiliary-gradient comparison is
-tracked separately in `PC_AUXILIARY_GRADIENT_EXPERIMENT_TODO.md`.
+includes the composer auxiliary penalty. Both learners differentiate all five
+named terms. In backprop, targets remain outside the graph and the five terms
+are differentiated end to end. In predictive coding, the three weighted
+cross-entropies are graph energies on clamped target nodes, while the
+parent-child and composer terms are contributed by `HiBaCaMLPCInference` as
+explicit factors that reach both the settling latent gradients and the local
+parameter gradients of the nodes producing their operands (section 4.5).
+
+Historical note: until 2026-09-19 the predictive-coding runner computed these
+two terms only after `compute_local_weight_gradients`, so they appeared in the
+reported loss while influencing neither settling nor the parameter update. Any
+PC result recorded before that date carries the narrower three-term update, and
+the PC-versus-backprop comparisons in the older reports therefore differ in both
+the learning rule and the differentiated objective.
 
 The graph adds:
 
@@ -456,14 +473,14 @@ The graph adds:
 - a parent-child penalty that encourages the mean midpoint prediction to match
   the global prediction.
 
-`ComposerStage2Node` stacks per-column gated features and certificate vectors,
+`ColumnComposerNode` stacks per-column gated features and certificate vectors,
 builds a certificate-derived prior, applies query-conditioned residual attention
 over active columns, and produces a correction vector. `ScaledAddNode` combines
 stage-1 logits with this correction.
 
 The composer has two entry points over a shared core. The node's `forward` calls
-`composer_stage2_correction`, which stops at the correction vector, because that
-is all the graph needs. `composer_stage2_details` continues on to the gate
+`composer_correction`, which stops at the correction vector, because that is all
+the graph needs. `composer_details` continues on to the gate
 auxiliary penalty (`aux_penalty`, part of the objective) and the reported
 diagnostics (`gate_entropy`, `prior_kl`, `gate_dev`, `top1_mass`,
 `effective_k`); it is called separately from the settled state by
@@ -484,44 +501,180 @@ inside the column graph before feature pooling.
 : Defines all public hyperparameters and mode presets. `make_hibacaml_config`
   supports `default` and `smoke`.
 
-`hibacaml/data/split_mnist.py`
-: Builds deterministic task loaders for task-incremental Split-MNIST,
-  including task-local targets, task queries, and hierarchy targets.
+`hibacaml/data/mnist.py`
+: Builds deterministic loaders for task-incremental Split-MNIST and the
+  single-task ten-class Full-MNIST protocol, including task queries,
+  hierarchy targets, and the stratified fit/validation split. This is the
+  single canonical MNIST data module; the former `data/split_mnist.py` shim
+  and `SplitMnistTask` alias have been removed.
 
 `hibacaml/graph/builder.py`
 : Builds the static FabricPC graph and initializes persistent HiBaCaML state.
 
-`hibacaml/nodes/core.py`
-: Defines custom FabricPC node types for patch tokenization, gated columns,
-  shell-bank processing, attention-style composition, and final output
-  combination.
+`hibacaml/nodes/pathways.py`
+: Defines patch-token preparation and support-gated graph pathways.
+
+`hibacaml/nodes/micro_columns.py`
+: Defines the input, recurrent, and residual shell-bank micro-column nodes.
+
+`hibacaml/nodes/composer.py`
+: Defines stage-2 composer mathematics and final output integration. The
+  numerical detail helpers stay beside `ColumnComposerNode` so training,
+  evaluation, and graph execution share one implementation.
+
+This node layout is an ownership and readability boundary; it does not change
+the graph or claim a runtime improvement.
 
 `hibacaml/control/support.py`
 : Encodes support-set arithmetic: shared-column inclusion, support masks,
   adaptive support enumeration, reserve recruitment candidates, and one-swap
   neighbors.
 
+`hibacaml/control/certificates.py`
+: `CertificateController` — everything that *reads* the graph's shells: shell-EMA
+  statistics, per-column `ColumnCertificate` construction and similarity
+  signatures, the certificate vectors the composer and support scorer consume,
+  and the semantic penalty. It also owns the shell geometry helpers
+  (`shell_slices`, `shell_node_names`, `shell_occupancy`, `effective_precision`,
+  `mean_or_zero`) that `shells.py` reuses, so both halves agree on what a shell
+  is.
+
 `hibacaml/control/shells.py`
-: Owns shell statistics, certificates, semantic penalties, structural edits,
-  demotion-swap candidates, and precision-weighted gradients.
+: `ShellController` — everything that *mutates* shells: inhibition, outside-in
+  pruning, promotion swaps, and audited demotion swaps. It is constructed with
+  the certificate controller because `apply_structural_edits` returns with
+  certificates already refreshed for the edited parameters; the disabled path
+  returns first and deliberately does not refresh, and that asymmetry is refresh
+  cadence rather than an optimization. `precision_weight_gradients` stays a
+  module-level function so the training update can close over plain configuration
+  values instead of a controller object.
+
+`hibacaml/control/ranking.py`
+: Stateless calculations, defined by a property rather than a topic: a function
+  belongs here if it is pure over its arguments and imports no controller,
+  trainer, bank, or reporting module. Posterior ranking and summaries, reserve
+  recruitment diagnosis, the phi neighbourhood, candidate chunking, and support
+  set geometry.
+
+`hibacaml/control/scoring.py`
+: `SupportScorer` — audit-bundle construction, the Eq. (1) boundary objective,
+  batched static support rows, and the old-task audit cache. The trainer is a
+  parameter on every call rather than an attribute, because rollout scoring
+  evaluates candidates on cloned trainers and the clone should be visible at the
+  call site. The audit cache is the class's only state; its key covers trainer
+  identity, bundle identity, and parameter revision.
 
 `hibacaml/control/search.py`
-: Owns exact boundary search, rollout scoring, posterior ranking, reserve
-  diagnostics, replay-bank reselection, local one-swap maintenance, and
-  demotion-swap auditing.
+: `ExactSearchService` — the decisions and their consequences: rollout
+  coordination, replay-bank proposal and acceptance policy, boundary search,
+  local one-swap and demotion-swap orchestration, installing accepted supports
+  and parameters, controller tables, timing, and events. Everything it records is
+  written here; the modules above compute but never persist.
 
 `hibacaml/training/trainer.py`
-: Implements predictive-coding inference/gradient training with support
-  selection, gradient masking, structural edits, evaluation, artifact export,
-  checkpoints, and snapshots.
+: The abstract `HiBaCaMLTrainer` base: support selection, certificate refresh,
+  clamp orchestration, gradient masking, structural edits, the
+  `training_update` template, the task loop, and evaluation orchestration. Five
+  operations are abstract —
+  `build_runtime`, `_training_inputs`, `_gradients`,
+  `_run_evaluation_inference`, and `_evaluate_prepared_batch` — and everything
+  else is shared by both learners. The trainer prepares target-free clamps and
+  external targets, owns support ordering and RNG transitions, refreshes
+  certificates on the first requested loader batch, and installs graph state
+  only for explicit raw inference.
+  Also holds `feedforward_state`, the one FabricPC entry point both learners
+  use, and `LearnerRuntime`, the compiled programs a trainer shares with its
+  rollout clones.
+
+  Two class constants declare where the learner contracts genuinely differ:
+  `COMPOSER_BEFORE_PARENT` (objective summation order),
+  `CLAMPS_MAY_INCLUDE_TARGETS` (whether supervised targets may be clamped into
+  the graph at all). Every update returns its graph state; the former unused
+  lean-update declaration and ignored `need_state` argument have been removed.
+
+`hibacaml/training/shared.py`
+: Trainer-independent computation, in three sections following one batch's
+  journey. **Clamp assembly** builds the clamps for one support or a stack of
+  candidate supports; the stateful half — the certificate refresh, whose cadence
+  is scientific state — stays in the trainer, which derives the support mask and
+  certificate vectors and hands them here. **Objective mathematics** holds
+  cross-entropy, the hierarchy penalties, the parent-child term, composer
+  details, and the PC training loss vector. **Evaluation** holds stateless
+  scoring, target preparation, ordered multi-support loss reduction, per-class
+  metrics, and the single stateful `EvaluationAccumulator`, whose state spans
+  exactly one loader pass. One prepared batch is represented directly as
+  `(logits, per_sample_total, loss_vector, composer)`; no request/result
+  dataclass or named tuple is introduced. `composer_before_parent` preserves the
+  learners' established difference in objective summation order.
+
+  The module's identity is what it refuses to import: no trainer, controller,
+  selector bank, persistent state, or reporting. Everything stateful is passed
+  in as a plain argument. A test enforces that boundary rather than leaving it
+  to convention. This module replaced the former `clamps.py`, `objectives.py`,
+  and `evaluation.py`, which shared one dependency profile and were merged
+  without changing a single function body.
+
+`hibacaml/training/pc.py`
+: `HiBaCaMLPCTrainer`, the compiled PC programs, and the full-native factor
+  machinery. Feedforward initialization, the established latent-state relaxation
+  with supervised targets clamped, and local graph-energy weight gradients. For
+  evaluation it supplies only target-free inference and prepared-batch execution
+  hooks.
+  Also holds `HiBaCaMLPCInference`, an `InferenceSGD` subclass overriding only
+  the latent-gradient phase. After the ordinary FabricPC sweep it adds the
+  parent-child and composer auxiliary contributions, so both take part in
+  settling. `_add_full_native_weight_gradients` then adds their local parameter
+  gradients at the settled state. Each factor reaches only the parameters
+  producing its operands -- the two hierarchy heads and `composer` -- because
+  everything upstream learns through the settling state the factors altered and
+  its ordinary local prediction errors. That is what keeps this predictive
+  coding rather than global backpropagation.
+  The factors act only when every supervised target is clamped, which is exactly
+  training; a partial target set is rejected. `build_runtime` refuses a graph
+  built with stock `InferenceSGD`, since that would silently restore the former
+  report-only behavior. The auxiliary weights are the whole control surface:
+  with `parent_child_loss_weight` and the three composer penalty weights at
+  zero, both factors take an early return and the update reduces exactly to the
+  pre-2026-09-19 algorithm. That is a regression property, not a supported mode.
 
 `hibacaml/training/backprop.py`
-: Implements an end-to-end autodiff runner that preserves the same support,
-  certificate, shell-edit, and audit semantics.
+: `HiBaCaMLBackpropTrainer`, an end-to-end autodiff learner preserving the same
+  support, certificate, shell-edit, and audit semantics. Its forward pass is
+  exactly the PC learner's initialization without the relaxation that follows
+  it there. For evaluation it supplies only feedforward inference and
+  prepared-batch scoring hooks.
+
+Both learners are siblings under the abstract base rather than one inheriting
+the other. The stage order of an update — gradient production, support masking,
+the configured precision treatment, AdamW, then parameter application — is
+fixed once in `training_update`, and rollout trials run that same template, so
+no trial can substitute a different update algorithm.
+
+`hibacaml/experiment.py`
+: Holds the wiring both runners share: `build_trainer` (inference, graph,
+  parameter initialization, runner selection) and `prepare_run_root`
+  (exclusive run directory plus config re-rooting).
+
+`hibacaml/reporting/`
+: Three modules, one job each. `logger.py` is the progress logger, a
+  stdlib-only leaf so any module can log without pulling JAX or matplotlib;
+  `rollout_logging()` demotes clone progress lines to DEBUG. `export.py` owns
+  snapshot assembly, task artifact export, checkpoint serialization, the final
+  bundle, and the two files written while a run is in flight (`events.jsonl`,
+  `heartbeat.json`). `build_run_snapshot` is deliberately stateful: it evaluates
+  every saved support, advances evaluation RNG, and may refresh certificates.
+  `support_diagnostics.json` is no longer produced; task-level support entropy
+  and controller-relevant diagnostics remain. `plots.py` holds the figures for
+  both protocols and selects the headless Agg backend on import.
 
 `experiments/split_mnist.py`
-: Wires configuration overrides, task construction, graph review, training,
-  evaluation aggregation, summaries, and plots.
+: Wires configuration overrides, task construction, training, evaluation
+  aggregation, summaries, and plots.
+
+`experiments/mnist.py`
+: Runs the static Full-MNIST full-bank protocol with fixed support, epoch-level
+  fit/validation evaluation, a configurable bank size, and isolated
+  PC/backprop artifact roots.
 
 ### 3.2 Data and Control Flow
 
@@ -532,11 +685,12 @@ make_hibacaml_config(mode)
 override(cfg, ...)
 run_experiment(cfg, ...)
   -> build_split_mnist_tasks(cfg, limit=tasks_limit)
-  -> build_trainer(cfg, tasks, learning)
+  -> prepare_run_root(cfg, run_id)            # hibacaml/experiment.py
+  -> build_trainer(cfg, tasks, learning)      # hibacaml/experiment.py
        -> create_hibacaml_structure(cfg, inference, graph_state_initializer)
        -> initialize_params(...)
-       -> HiBaCaMLBackpropRunner or HiBaCaMLTrainer
-  -> print_pre_run_review(cfg, structure, tasks, learning)
+       -> HiBaCaMLBackpropTrainer or HiBaCaMLPCTrainer
+       -> log protocol / graph / schedule summary
   -> _run_tasks(trainer, ...)
   -> for each task:
        train_task(task)
@@ -548,8 +702,9 @@ run_experiment(cfg, ...)
          -> certificate refresh
          -> optional demotion and one-swap audits
        evaluate_all_saved_supports()
-       export_task_artifacts()
-       save_checkpoint()
+       export_task_artifacts(trainer, task_id)
+       save_checkpoint(trainer, task_id)
+  -> build_run_snapshot(trainer)
   -> aggregate accuracy/forgetting/support trajectories
   -> write run summary/table and plots
 ```
@@ -562,9 +717,11 @@ scalar mask entry to zero or retain token, feature, and logit pathways.
 
 The experiment script accepts `learning = "pc"` or `"backprop"`.
 
-- `HiBaCaMLTrainer` uses FabricPC inference and local predictive-coding weight
-  gradients through `compute_local_weight_gradients`.
-- `HiBaCaMLBackpropRunner` uses feedforward state initialization and JAX
+- `HiBaCaMLPCTrainer` uses FabricPC inference and local predictive-coding weight
+  gradients through `compute_local_weight_gradients`, plus the two auxiliary
+  factors described in section 4.5. `learning = "pc"` means full-native PC;
+  there is no selectable report-only variant.
+- `HiBaCaMLBackpropTrainer` uses feedforward state initialization and JAX
   autodiff for supervised losses, while preserving support masks, certificate
   refresh, gradient masking, shell edits, boundary search, local swaps, and
   evaluation semantics. Its target-free evaluation path is also feedforward-only
@@ -592,11 +749,15 @@ interference.
 
 ### 4.2 Dataset Handling in Code
 
+`hibacaml/data/mnist.py` is the canonical data module for both protocols. It
+sets `KERAS_BACKEND=jax`, loads MNIST through
+`keras.datasets.mnist.load_data()`, and exposes `build_split_mnist_tasks` plus
+`build_full_mnist_task`. There is no project-owned `mnist.npz` fallback.
+
 `build_split_mnist_tasks` implements the five tasks from `_TASK_CLASS_PAIRS`.
-It loads MNIST via TensorFlow/Keras when available, otherwise a cached
-`mnist.npz` fallback. Images are filtered to each task's two classes first and
-then normalized by MNIST mean/std and reshaped to `28 x 28 x 1`, so no float32
-copy of the full dataset is held alongside the per-task copies.
+Images are filtered to each task's two classes first and then normalized by
+MNIST mean/std and reshaped to `28 x 28 x 1`, so no float32 copy of the full
+dataset is held alongside the per-task copies.
 
 The optional `limit` argument caps how many tasks are built and is what
 `run_experiment`'s `tasks_limit` forwards. It deliberately does not go through
@@ -612,6 +773,14 @@ For each task:
 - `_ArrayTaskLoader` provides deterministic iteration with optional shuffling
   and batch limits;
 - a one-hot `task_query` vector is attached to the task.
+
+`build_full_mnist_task` instead creates one ten-class task with
+`task_local_heads=False`. A seed-controlled stratified split partitions the
+official 60,000 training examples into 54,000 fit and 6,000 validation
+examples; the official 10,000-example test set remains separate. Batch limits
+apply independently to the three loaders and run metadata records their
+effective iterable counts. See Section 4.7 for the fixed full-bank training and
+evaluation protocol.
 
 ### 4.3 Patch Processing
 
@@ -643,9 +812,10 @@ local readout head."
 
 ### 4.5 Training Procedure
 
-`experiments/split_mnist.py` constructs the trainer in `build_trainer`, which
-`run_experiment` calls once and then passes to `_run_tasks`. The pre-run review
-is printed from that same structure rather than from a separate throwaway graph:
+Both runners construct their trainer through `hibacaml.experiment.build_trainer`,
+which `run_experiment` calls once and then passes to the task loop. The pre-run
+review is printed from that same structure rather than from a separate throwaway
+graph:
 
 - `InferenceSGD` is always configured for graph inference;
 - `FeedforwardStateInit` is used explicitly for both runners;
@@ -675,6 +845,12 @@ For each task, `_run_tasks` calls `trainer.train_task(task)`. Training:
 8. freezes the task support as a `SupportSnapshot`;
 9. evaluates the task using its saved support.
 
+`train_task` owns task-level setup and completion. `_train_epoch` owns epoch
+aggregation and held-out evaluation, while `_train_batch` owns the established
+per-update hook order. The split is organizational only: gradient production,
+structural edits, step advancement, demotion audit, composer reporting,
+certificate refresh, and local maintenance retain their previous order.
+
 #### Predictive-coding clamping contract
 
 The runner implements standard discriminative predictive coding. Clamped nodes are
@@ -682,7 +858,7 @@ held fixed for the whole settling process; every non-clamped node is updated by
 `InferenceBase.update_latents`, which applies `z_latent -= eta_infer * latent_grad`
 once per iteration for `infer_steps` iterations under `jax.lax.fori_loop`.
 
-During **training**, `compute_pc_gradients` clamps:
+During **training**, `HiBaCaMLPCTrainer._training_inputs` clamps:
 
 - the input image `x`;
 - the HiBaCaML control inputs: `support_mask`, `task_query`, and the per-column
@@ -703,13 +879,39 @@ never enters the hidden-state trajectory.
 
 The clamp policy is expressed by the `include_targets` flag on
 `HiBaCaMLTrainer._build_clamps`. It defaults to `False`, so target-free is the
-default behavior and supervised training opts in explicitly. `HiBaCaMLBackpropRunner`
-overrides `_build_clamps` to discard the flag entirely, because backprop keeps its
-targets outside the graph in all cases.
+default behavior and supervised PC training opts in explicitly. The base
+trainer rejects target clamps for a learner whose `CLAMPS_MAY_INCLUDE_TARGETS`
+contract is false, so backprop targets remain external in every path.
 
-Note that the parent-child and composer auxiliary terms are computed from the settled
-state but do not enter the predictive-coding weight update; see section 2.8 and
-`PC_AUXILIARY_GRADIENT_EXPERIMENT_TODO.md`.
+#### Full-native auxiliary factors
+
+The parent-child and composer auxiliary terms enter PC learning as explicit
+factors rather than as node energies, because neither fits FabricPC's node-local
+`energy(z_latent, z_mu)` contract: parent-child couples two hierarchy
+predictions, and the composer penalty depends on gate probabilities derived from
+every active column's features, certificates, and the task query.
+
+Each settling step therefore runs the ordinary FabricPC sweep, then pushes each
+factor's `dE/dz_mu` back through the producing node's own `forward` with
+`jax.vjp`, accumulating into the source nodes' `latent_grad` before latents are
+updated. Parent-child reaches `active_feature_summary` through both hierarchy
+heads; the composer reaches each column's feature branch through its
+`feature_gate`.
+
+Two numerical boundaries are deliberate. Factor gradients differentiate the
+**batch sum**, matching FabricPC, which differentiates `jnp.sum(energy)` in both
+`forward_and_latent_grads` and `forward_and_weight_grads`; the reported
+components remain batch means. And the factors inherit FabricPC's existing
+one-step offset: settling factors act on fresh in-step `z_mu`, the weight phase
+recomputes predictions from the settled `z_latent`, and reporting keeps reading
+the stored `z_mu`, exactly as the three cross-entropies already did. No final
+refresh was added.
+
+Both factors read `z_mu`, never `z_latent`. During supervised training the
+hierarchy and output nodes are clamped, so their `z_latent` holds the labels;
+a factor reading those would measure agreement between targets rather than
+between predictions. Certificates, the task query, and the support mask are
+clamped, so cotangents reaching them are inert by construction.
 
 ### 4.6 Evaluation Setup
 
@@ -723,6 +925,16 @@ cross-entropies. This separation is essential for the predictive-coding runner,
 where clamping test targets during settling would leak the answer into the
 hidden-state trajectory. Per-task exports include evaluated/correct example
 counts and a task-local confusion matrix so aggregate accuracy can be audited.
+
+`HiBaCaMLTrainer` owns the evaluation request and its stateful effects. It
+normalizes ordered supports, constructs single- or multi-support clamps, splits
+the evaluation RNG once for each executed batch, and refreshes certificates on
+the first loader batch only when requested. `pc.py` and `backprop.py` turn that
+prepared batch into the same four-value detail tuple. `shared.py` scores an
+already-produced graph state and accumulates example-weighted metrics. Ordinary
+metric evaluation does not replace `_last_graph_state`; the explicit
+`run_batch_evaluation_inference` path does because controller rollouts consume
+that state.
 
 The script then derives:
 
@@ -738,7 +950,91 @@ retention across prior tasks, support reuse/churn, and the local value of
 counterfactual support edits. This document intentionally does not interpret any
 actual run outputs.
 
+### 4.7 Static Full-MNIST Phase 1A
+
+`build_full_mnist_task` constructs one ten-way task and requires
+`task_local_heads=False`. It deterministically stratifies the official 60,000
+training examples into 54,000 fit examples and 6,000 validation examples. The
+official 10,000-example test set remains separate and is evaluated only after
+training. The split seed, counts, update budget, and bank size are stored in the run
+metadata.
+
+The static full-bank configuration uses all adaptive columns:
+
+```text
+shared columns       = 2
+active adaptive      = 15
+active_support_size  = 17
+inactive reserves    = (17, 18, 19)
+composer top-k       = 3
+```
+
+`pooled_logits` and `active_feature_summary` retain their 20 gated input
+edges, but their aggregation scale changes from the Split-MNIST default
+`1 / 5 = 0.200` to the true full-bank mean `1 / 17 = 0.0588235`. This is an
+architectural normalization change. It does not alter parameter shapes or
+initial values, and the effective support size and scale are recorded in every
+Full-MNIST run. Slow learning in both static arms should therefore prompt a
+scale/path inspection before a learner-specific conclusion.
+
+Static mode disables boundary search, structural shell edits, precision
+resistance, demotion audits, and selector-state writes. The default support
+path inside `train_task` selects adaptive columns 2 through 16; the experiment
+runner asserts that support and never installs a duplicate override. The
+assertion is derived from `topk_nonshared` and `active_support_size` rather
+than from the literal full-bank numbers, so a smaller declared support is
+checked the same way (Section 5.2).
+`ExactSearchConfig.enable_structural_edits` is the authoritative controller
+guard. When false, `apply_structural_edits` returns the same parameter object,
+does not refresh controller state, and causes no extra parameter-revision bump.
+
+Evaluation metrics come from the same forward/inference operation for both
+learners. The PC JIT exposes its already-computed loss vector and composer
+details; backprop uses the same state-scoring helper
+(`shared.py:evaluation_details_from_state`).
+`evaluate_batch_outputs` remains the compatible
+`(logits, per_sample_total)` interface, while `evaluate_loader` delegates
+aggregation to `EvaluationAccumulator` and additionally reports pure class
+cross-entropy, the full composite, per-class precision/recall, and per-column
+composer use. It never runs `composer_diagnostics_from_state` as a second
+forward and never reuses a cached general-evaluation result.
+
+For compatibility, Split-MNIST `evaluate_task` still refreshes certificates on
+its first test batch by default. Full-MNIST passes
+`refresh_certificates=False` explicitly for fit, validation, official test,
+snapshot, and export calls. `build_run_snapshot` and `export_task_artifacts`
+remain separate evaluation requests; neither reuses the other's result.
+Consequently held-out data cannot advance shell
+EMAs or recompute certificates. Epoch loss means are weighted by actual batch
+size, including partial batches, and epoch evaluations are checkpointed and
+exported but deliberately omitted from rollout clones.
+
+Phase 1A does not refactor the established learner-specific training
+certificate path: PC clamp construction can refresh before its training
+settling, while backprop uses the scheduled interval. The run metadata records
+the effective training certificate policy. Standardizing controller
+observation state is intentionally deferred to the adaptive phase.
+
+The result-bearing default layout is:
+
+```text
+runs/experiments/full_mnist_architecture/
+    full_mnist_backprop_bank<BANK>/seed_<n>/
+    full_mnist_pc_bank<BANK>/seed_<n>/
+```
+
+The PC arm was named `pc_local` before 2026-09-19, when its update omitted the
+parent-child and composer terms. Existing `full_mnist_pc_local_bank*` bundles
+keep that name: they record the older contract and are not comparable to a
+full-native run.
+
+At batch size 256 and five epochs, the 54,000-example fit split produces 211
+updates per epoch and 1,055 updates total. The runner records expected and
+completed counts and fails rather than silently accepting a shortened run.
+
 ## 5. Important Hyperparameters
+
+### 5.1 Shared Defaults and Split-MNIST Overrides
 
 The `default` mode's values are defined by `HiBaCaMLConfig` and nested
 configs:
@@ -775,6 +1071,43 @@ distinguish config defaults from script overrides.
 `infer_steps` and `eta_infer` remain ordinary configuration hyperparameters.
 The value 16 is the corrected normal-mode starting point, not a claim that it
 is optimal for every graph or accelerator configuration.
+
+### 5.2 Full-MNIST Phase 1A Overrides
+
+`experiments/mnist.py` declares a separate static protocol over the same
+20-column graph:
+
+- seed: `0`;
+- batch size: `256`;
+- epochs: `5`;
+- one ten-class task with `task_local_heads=False` and `num_tasks=1`;
+- PC settling: `infer_steps=16`, `eta_infer=0.05`;
+- active columns: 2 shared plus all 15 adaptive columns;
+- inactive reserve columns: `(17, 18, 19)`;
+- `topk_nonshared=15`, giving `active_support_size=17`;
+- stage-1 and active-feature aggregation scale: `1/17`;
+- composer top-k: exactly `3`;
+- exact search, structural edits, precision resistance, demotion audits, and
+  selector-state writes: disabled.
+
+The bank size is the runner's one architectural knob. `BANK` in
+`experiments/mnist.py` derives `adaptive_count = BANK - 2`,
+`reserve_count = 20 - BANK`, and `topk_nonshared = adaptive_count`, so `BANK=17`
+leaves columns `(17, 18, 19)` in reserve while `BANK=20` puts every column in
+the bank at aggregation scale `1/20`. The two are architecturally identical --
+the same 210 nodes and the same parameter shapes -- and differ only in the
+aggregation scale and which columns are gated on.
+
+The runner enforces one invariant, `topk_nonshared == adaptive_count`: every
+non-shared column in the pool must be active. That is what distinguishes a full
+bank of size `BANK` from a sparse subset of a larger pool, which this runner
+rejects. Run directories are named from the bank (`full_mnist_backprop_bank17`),
+so two bank sizes never collide.
+
+The 54,000-example fit split yields 211 updates per epoch at batch size 256,
+or 1,055 updates across five epochs. These values are protocol declarations,
+not replacements for the Split-MNIST defaults above, and the Full-MNIST runner
+records both expected and completed update counts in its artifacts.
 
 ## 6. Exact Matches, Deviations, and Missing Ideas
 
@@ -841,7 +1174,7 @@ cfg = make_hibacaml_config("default")
 tasks = build_split_mnist_tasks(cfg, limit=None)
 structure = create_hibacaml_structure(cfg, inference, FeedforwardStateInit())
 params = initialize_params(structure, seed)
-trainer = HiBaCaMLBackpropRunner or HiBaCaMLTrainer(cfg, structure, params, tasks)
+trainer = HiBaCaMLBackpropTrainer or HiBaCaMLPCTrainer(cfg, structure, params, tasks)
 
 for task in tasks:
     if task has no current support:
@@ -864,7 +1197,8 @@ for task in tasks:
 
     freeze support snapshot
     evaluate all frozen supports
-    export summaries/checkpoint
+    export_task_artifacts(trainer, task_id)
+    save_checkpoint(trainer, task_id)
 ```
 
 ## 8. Reader Guide
@@ -873,15 +1207,28 @@ To understand the code as a concrete realization of the paper, read in this
 order:
 
 1. `hibacaml/config/defaults.py` for the paper-scale architectural constants.
-2. `hibacaml/data/split_mnist.py` for the task and target construction.
+2. `hibacaml/data/mnist.py` for Split-MNIST and Full-MNIST construction. Both
+   protocols go through the same `_make_loader`/`_make_task` pair and differ
+   only in which splits they supply.
 3. `hibacaml/graph/builder.py` for how columns, gates, composer, and hierarchy
    heads become a FabricPC graph.
-4. `hibacaml/control/support.py` and `hibacaml/control/search.py` for support
+4. `hibacaml/control/support.py`, `hibacaml/control/scoring.py`, and
+   `hibacaml/control/search.py` for support
    control and teacher-first search.
-5. `hibacaml/control/shells.py` for internal certificates and shell edits.
-6. `hibacaml/training/trainer.py` plus `hibacaml/training/backprop.py` for the
-   sequential training loop.
-7. `experiments/split_mnist.py` for the executable experiment orchestration.
+5. `hibacaml/control/certificates.py` for internal certificates, then
+   `hibacaml/control/shells.py` for the shell edits they describe.
+6. `hibacaml/training/shared.py` for clamp assembly, objective primitives,
+   and evaluation scoring/accumulation — everything both learners compute
+   without touching trainer state.
+7. `hibacaml/training/trainer.py` for the shared base and the update
+   template, then `hibacaml/training/pc.py` and
+   `hibacaml/training/backprop.py` for the two learner contracts.
+8. `hibacaml/experiment.py` for the graph/trainer/run-root wiring both runners
+   share.
+9. `experiments/split_mnist.py` for the executable experiment orchestration.
+   Use `experiments/mnist.py` for the static ten-class full-bank study.
+   Each runner now contains only its own protocol: task construction,
+   protocol assertions, metric aggregation, and reporting.
 
 The shortest conceptual summary is: the paper propose two coupled probabilistic
 levels for continual learning, and the code realizes them as a sparse gated
