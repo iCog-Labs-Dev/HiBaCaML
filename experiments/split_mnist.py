@@ -5,7 +5,23 @@ import csv
 import dataclasses
 import gc
 import json
+import os
 import sys
+
+# Force JAX onto the CPU backend before `import jax` runs (jax picks its
+# backend at first import, so this must happen first). Without this,
+# JAX falls back to whatever platform it auto-detects, which raises an
+# opaque AssertionError deep inside jax._src.xla_bridge on a machine
+# with no GPU/CUDA available rather than a clear "no accelerator found"
+# message. Set CPU = False below (or export JAX_PLATFORMS=cuda/gpu
+# yourself before running) if you do have a supported accelerator.
+CPU = True
+if CPU:
+    os.environ.setdefault("JAX_PLATFORMS", "cpu")
+from fabricpc import setup_jax
+
+setup_jax(platform=os.environ.get("JAX_PLATFORMS"))
+
 import jax
 from pathlib import Path
 from typing import Dict, List, Sequence
