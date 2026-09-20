@@ -2,7 +2,10 @@
 
 from hibacaml.reporting.export import (
     append_event,
+    build_run_snapshot,
+    export_task_artifacts,
     export_run_artifacts,
+    save_checkpoint,
     start_run,
     to_jsonable,
     write_csv,
@@ -25,6 +28,8 @@ from hibacaml.reporting.plots import (
 
 __all__ = [
     "append_event",
+    "build_run_snapshot",
+    "export_task_artifacts",
     "export_run_artifacts",
     "log_progress",
     "rollout_logging",
@@ -36,6 +41,7 @@ __all__ = [
     "plot_support_table",
     "plot_swap_gains",
     "rss_mb",
+    "save_checkpoint",
     "to_jsonable",
     "write_csv",
     "write_json",

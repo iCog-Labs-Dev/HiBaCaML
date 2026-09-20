@@ -19,9 +19,12 @@ from hibacaml import (
     prepare_run_root,
 )
 from hibacaml.reporting import (
+    build_run_snapshot,
+    export_task_artifacts,
     plot_accuracy_forgetting,
     plot_support_table,
     plot_swap_gains,
+    save_checkpoint,
     write_csv,
     write_json,
 )
@@ -169,9 +172,13 @@ def _run_tasks(
             }
         )
 
-        artifact_root = trainer.export_task_artifacts(task.task_id)
+        artifact_root = export_task_artifacts(trainer, task.task_id)
         checkpoint_root = run_root / f"task_{task.task_id}" / "checkpoints"
-        checkpoint_path = trainer.save_checkpoint(task.task_id, root=checkpoint_root)
+        checkpoint_path = save_checkpoint(
+            trainer,
+            task.task_id,
+            root=checkpoint_root,
+        )
 
         artifact_roots[task.task_id] = str(artifact_root)
         checkpoint_paths[task.task_id] = str(checkpoint_path)
@@ -183,7 +190,7 @@ def _run_tasks(
         )
         gc.collect()
 
-    snapshot = trainer.snapshot()
+    snapshot = build_run_snapshot(trainer)
     mean_seen_accuracy = _mean_seen_accuracy(accuracy_matrix)
     mean_forgetting = _mean_forgetting_curve(accuracy_matrix)
     support_sequence = _support_sequence(trainer)

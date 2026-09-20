@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import csv
 import json
+import pickle
 import time
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
@@ -16,7 +17,7 @@ from typing import Any, Dict, Iterable, List
 
 import jax.numpy as jnp
 
-from hibacaml.reporting.logger import rss_mb
+from hibacaml.reporting.logger import log_progress, rss_mb
 
 _RUN_STARTED_AT = time.time()
 _RUN_STATE: Dict[str, Any] = {}
@@ -129,6 +130,55 @@ def write_run_state(root: str | Path, /, **fields: Any) -> None:
     )
 
 
+def build_run_snapshot(
+    trainer,
+    *,
+    refresh_evaluation_certificates: bool = True,
+) -> Dict[str, object]:
+    """Build a run snapshot, evaluating saved supports and advancing evaluation state."""
+    return {
+        "cfg": trainer.cfg.to_dict(),
+        "current_support": trainer.persistent_state.current_support,
+        "boundary_support": trainer.persistent_state.boundary_support,
+        "support_tables": trainer.persistent_state.support_tables,
+        "support_posterior_tables": trainer.persistent_state.support_posterior_tables,
+        "reserve_recruitment_tables": (
+            trainer.persistent_state.reserve_recruitment_tables
+        ),
+        "controller_tables": trainer.persistent_state.controller_tables,
+        "local_swap_tables": trainer.persistent_state.local_swap_tables,
+        "demotion_swap_tables": trainer.persistent_state.demotion_swap_tables,
+        "replay_proposals": trainer.persistent_state.replay_proposals,
+        "recently_demoted": trainer.persistent_state.recently_demoted,
+        "certificates": trainer.persistent_state.certificates,
+        "task_support_snapshots": trainer.persistent_state.task_support_snapshots,
+        "support_sequence": {
+            task_id: snapshot.full_support
+            for task_id, snapshot in sorted(
+                trainer.persistent_state.task_support_snapshots.items()
+            )
+        },
+        "phi_trajectory": {
+            task_id: snapshot.phi
+            for task_id, snapshot in sorted(
+                trainer.persistent_state.task_support_snapshots.items()
+            )
+        },
+        "evaluations": trainer.evaluate_all_saved_supports(
+            refresh_certificates=refresh_evaluation_certificates,
+        ),
+        "global_step": trainer.persistent_state.global_step,
+        "params_revision": trainer.persistent_state.params_revision,
+        "timing_summaries": trainer.persistent_state.timing_summaries,
+        "composer_diagnostics": trainer.persistent_state.composer_diagnostics,
+        "epoch_evaluations": trainer.persistent_state.epoch_evaluations,
+        "selector_bank_summary": trainer.selector_bank.summary(),
+        "run_id": trainer.run_id,
+        "experiment_metadata": trainer.experiment_metadata,
+        "evaluation_protocol": "target_free_inference_external_supervision_v1",
+    }
+
+
 def export_run_artifacts(snapshot: Dict[str, object], root: str | Path) -> None:
     """Export the HiBaCaML artifact bundle (V20.2b)."""
     root = Path(root)
@@ -153,7 +203,6 @@ def export_run_artifacts(snapshot: Dict[str, object], root: str | Path) -> None:
         "support_sequence.json": snapshot["support_sequence"],
         "phi_trajectory.json": snapshot["phi_trajectory"],
         "timing_summary.json": snapshot["timing_summaries"],
-        "support_diagnostics.json": snapshot["support_diagnostics"],
         "epoch_evaluations.json": snapshot.get("epoch_evaluations", []),
         "recently_demoted.json": snapshot.get("recently_demoted", {}),
         "selector_bank_summary.json": snapshot.get("selector_bank_summary", {}),
@@ -178,3 +227,73 @@ def export_run_artifacts(snapshot: Dict[str, object], root: str | Path) -> None:
 
     for filename, payload in csv_exports.items():
         write_csv(root / filename, payload)
+
+
+def export_task_artifacts(
+    trainer,
+    task_id: int,
+    root: str | Path | None = None,
+    *,
+    refresh_evaluation_certificates: bool = True,
+) -> Path:
+    """Build and export one task's run artifact bundle."""
+    run_root = (
+        Path(root)
+        if root is not None
+        else trainer.cfg.experiment_root_path() / f"task_{task_id}"
+    )
+    log_progress(f"export task={task_id} start root={run_root}", component="report")
+    if trainer.run_root is not None:
+        append_event(
+            trainer.run_root,
+            "export_start",
+            task_id=task_id,
+            root=str(run_root),
+        )
+    run_root.mkdir(parents=True, exist_ok=True)
+    export_run_artifacts(
+        build_run_snapshot(
+            trainer,
+            refresh_evaluation_certificates=refresh_evaluation_certificates,
+        ),
+        run_root,
+    )
+    log_progress(f"export task={task_id} done root={run_root}", component="report")
+    if trainer.run_root is not None:
+        append_event(
+            trainer.run_root,
+            "export_done",
+            task_id=task_id,
+            root=str(run_root),
+        )
+    return run_root
+
+
+def save_checkpoint(
+    trainer,
+    task_id: int,
+    root: str | Path | None = None,
+) -> Path:
+    """Serialize the trainer's current checkpoint payload."""
+    checkpoint_root = (
+        Path(root) if root is not None else trainer.cfg.experiment_root_path()
+    )
+    checkpoint_root.mkdir(parents=True, exist_ok=True)
+    path = checkpoint_root / trainer.cfg.reporting.checkpoint_filename
+    payload = {
+        "task_id": task_id,
+        "persistent_state": trainer.persistent_state,
+        "params": trainer.params,
+        "opt_state": trainer.opt_state,
+        "experiment_metadata": trainer.experiment_metadata,
+    }
+    with path.open("wb") as handle:
+        pickle.dump(payload, handle)
+    if trainer.run_root is not None:
+        append_event(
+            trainer.run_root,
+            "checkpoint_saved",
+            task_id=task_id,
+            path=str(path),
+        )
+    return path

@@ -20,9 +20,12 @@ from hibacaml import (
     prepare_run_root,
 )
 from hibacaml.reporting import (
+    build_run_snapshot,
+    export_task_artifacts,
     plot_composer_usage,
     plot_confusion_matrix,
     plot_learning_curve,
+    save_checkpoint,
     write_csv,
     write_json,
 )
@@ -82,9 +85,11 @@ def _select(source: Dict[str, object], *names: str) -> Dict[str, object]:
 
 
 def _arm_name(learning: str, bank: int) -> str:
+    # Plain "pc": there is one PC implementation. The old "pc_local" name marks
+    # pre-2026-09-19 bundles, whose update omitted the two auxiliary terms.
     learner = {
         "backprop": "backprop",
-        "pc": "pc_local",
+        "pc": "pc",
     }.get(learning)
     if learner is None:
         raise ValueError("learning must be 'pc' or 'backprop'")
@@ -176,7 +181,7 @@ def run_experiment(
     experiment_metadata = {
         "experiment": "full_mnist_architecture",
         "arm": arm,
-        "learner_contract": "backprop_full" if learning == "backprop" else "pc_local",
+        "learner_contract": "backprop_full" if learning == "backprop" else "pc",
         "bank": bank,
         "seed": cfg.seed,
         "validation_fraction": validation_fraction,
@@ -250,14 +255,19 @@ def run_experiment(
     }
     experiment_metadata.update(completed_schedule)
     trainer.experiment_metadata.update(completed_schedule)
-    snapshot = trainer.snapshot(refresh_evaluation_certificates=False)
+    snapshot = build_run_snapshot(
+        trainer,
+        refresh_evaluation_certificates=False,
+    )
     export_run_artifacts(snapshot, run_output_root / "final")
-    trainer.export_task_artifacts(
+    export_task_artifacts(
+        trainer,
         task.task_id,
         root=run_output_root / "task_0",
         refresh_evaluation_certificates=False,
     )
-    checkpoint_path = trainer.save_checkpoint(
+    checkpoint_path = save_checkpoint(
+        trainer,
         task.task_id,
         root=run_output_root / "checkpoints",
     )
