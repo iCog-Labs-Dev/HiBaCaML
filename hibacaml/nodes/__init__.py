@@ -1,19 +1,20 @@
 """Custom HiBaCaML nodes and energies."""
 
-from hibacaml.nodes.core import (
-    ComposerStage2Node,
-    ElementwiseGateNode,
-    PatchTokenizerNode,
+from hibacaml.nodes.pathways import ElementwiseGateNode, PatchTokenizerNode
+from hibacaml.nodes.composer import (
+    ColumnComposerNode,
     ScaledAddNode,
+    composer_details,
+)
+from hibacaml.nodes.energy import WeightedCrossEntropyEnergy
+from hibacaml.nodes.micro_columns import (
     ShellBankInputNode,
     ShellBankRecurrentNode,
     ShellBankResidualNode,
-    composer_stage2_details,
 )
-from hibacaml.nodes.energy import WeightedCrossEntropyEnergy
 
 __all__ = [
-    "ComposerStage2Node",
+    "ColumnComposerNode",
     "ElementwiseGateNode",
     "PatchTokenizerNode",
     "ScaledAddNode",
@@ -21,5 +22,5 @@ __all__ = [
     "ShellBankRecurrentNode",
     "ShellBankResidualNode",
     "WeightedCrossEntropyEnergy",
-    "composer_stage2_details",
+    "composer_details",
 ]

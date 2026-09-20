@@ -93,6 +93,7 @@ class ExactSearchConfig:
     """Boundary and local support search settings."""
 
     enable_exact_search: bool = True
+    enable_structural_edits: bool = True
     boundary_current_data_batch_size: int | None = None
     rollout_train_data_batch_size: int | None = None
     boundary_worst_old_data_batch_size: int | None = None
@@ -111,8 +112,6 @@ class ExactSearchConfig:
     controller_l1_penalty: float = 0.01
     local_swap_margin: float = 0.005
     maintenance_interval: int = 64
-    cache_evaluations: bool = True
-    rollout_gradient_mode: str = "trainer"
     certificate_support_weight: float = 0.0
     support_posterior_temperature: float = 1.0
     reserve_saturation_threshold: float = 0.85
@@ -131,7 +130,8 @@ class ExactSearchConfig:
     demotion_gain_bounds: Tuple[float, float] = (0.005, 0.08)
     semantic_targets: Tuple[float, float, float] = (1.0, 0.90, 0.66)
     log_semantic_penalty: bool = True
-    # V20.2b reselection knobs.
+
+    # replay reselection knobs.
     replay_topk: int = 8
     replay_overlap_floor: float = 0.34
     replay_overlap_penalty_alpha: float = 0.02
@@ -153,8 +153,6 @@ class ReportingConfig:
     checkpoint_filename: str = "hibacaml_checkpoint.pkl"
     selector_bank_filename: str = "bank.pkl"
     selector_bank_metadata_filename: str = "bank_metadata.json"
-    heartbeat_filename: str = "heartbeat.json"
-    progress_filename: str = "progress.json"
     export_progress_every: int = 1
     export_selector_replay_dataset: bool = True
 

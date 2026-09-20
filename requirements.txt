@@ -1,7 +1,7 @@
-fabricpc
-jax
-numpy
-optax
-tensorflow
-keras
-matplotlib
+fabricpc==0.4.0
+jax==0.11.0
+jaxlib==0.11.0
+numpy==2.5.1
+optax==0.2.8
+keras==3.15.1
+matplotlib==3.11.1

@@ -4,11 +4,18 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Mapping, Sequence
-import matplotlib.pyplot as plt
 
-def _save_fig(fig, path: Path, dpi: int = 150) -> None:
+import matplotlib
+
+matplotlib.use("Agg")
+
+import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
+
+
+def _save_fig(fig, path: Path, dpi: int = 150, bbox_inches: str | None = "tight") -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(path, dpi=dpi, bbox_inches="tight")
+    fig.savefig(path, dpi=dpi, bbox_inches=bbox_inches)
     plt.close(fig)
 
 
@@ -135,3 +142,62 @@ def plot_swap_gains(
 
     fig.tight_layout()
     _save_fig(fig, output_path)
+
+
+def _epoch_series(records: Sequence[Mapping], split: str, metric: str):
+    return [record[f"{split}_metrics"].get(metric, np.nan) for record in records]
+
+
+def plot_learning_curve(epoch_records: Sequence[Mapping], output_path: Path) -> None:
+    """Plot fit/validation cross-entropy and accuracy against epoch."""
+    epochs = [record["epoch"] for record in epoch_records]
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+    for axis, metric, label in (
+        (axes[0], "cross_entropy", "Target-free CE"),
+        (axes[1], "accuracy", "Target-free accuracy"),
+    ):
+        axis.plot(epochs, _epoch_series(epoch_records, "train", metric),
+                  marker="o", label="fit")
+        axis.plot(epochs, _epoch_series(epoch_records, "validation", metric),
+                  marker="o", label="validation")
+        axis.set(xlabel="epoch", ylabel=metric.replace("_", "-"), title=label)
+        axis.legend()
+    fig.tight_layout()
+    _save_fig(fig, output_path, dpi=160, bbox_inches=None)
+
+
+def plot_confusion_matrix(
+    confusion_matrix,
+    output_path: Path,
+    *,
+    title: str = "Official-test confusion",
+) -> None:
+    """Plot one target-by-prediction confusion matrix."""
+    confusion = np.asarray(confusion_matrix)
+    fig, axis = plt.subplots(figsize=(6, 5))
+    image = axis.imshow(confusion, cmap="Blues")
+    axis.set(xlabel="predicted", ylabel="target", title=title)
+    axis.set_xticks(range(confusion.shape[0]))
+    axis.set_yticks(range(confusion.shape[0]))
+    fig.colorbar(image, ax=axis)
+    fig.tight_layout()
+    _save_fig(fig, output_path, dpi=160, bbox_inches=None)
+
+
+def plot_composer_usage(
+    column_gate_mean,
+    column_selection_fraction,
+    output_path: Path,
+) -> None:
+    """Plot mean composer gate mass and selected fraction per column."""
+    gate_mean = np.asarray(column_gate_mean)
+    selection = np.asarray(column_selection_fraction)
+    columns = np.arange(gate_mean.shape[0])
+    fig, axis = plt.subplots(figsize=(11, 4))
+    axis.bar(columns - 0.2, gate_mean, width=0.4, label="mean gate")
+    axis.bar(columns + 0.2, selection, width=0.4, label="selected fraction")
+    axis.set(xlabel="column", ylabel="fraction / mass", title="Composer use")
+    axis.set_xticks(columns)
+    axis.legend()
+    fig.tight_layout()
+    _save_fig(fig, output_path, dpi=160, bbox_inches=None)
