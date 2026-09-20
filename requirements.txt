@@ -1,4 +1,15 @@
-fabricpc
+fabricpc==0.5.2
+# Pinned: FabricPC v0.6.0 replaced the node forward() method with a
+# predict()/energy() split (see FabricPC's own CHANGELOG.md). This
+# repo's node code (hibacaml/nodes/core.py) implements the older
+# forward() -> NodeState contract, not the v0.6.0 split, so installing
+# an unpinned/latest fabricpc breaks graph construction entirely:
+#   TypeError: Can't instantiate abstract class ... 'predict'
+# v0.5.2 is the newest version confirmed to work end-to-end against
+# the current node code (verified: python experiments/split_mnist.py
+# and trainer.evaluate_task(...) both run successfully under it).
+# Migrating to the v0.6.0 predict()/energy() contract is tracked as a
+# separate, larger follow-up.
 jax
 numpy
 optax
