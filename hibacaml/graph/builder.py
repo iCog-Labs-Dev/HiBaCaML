@@ -12,7 +12,7 @@ from fabricpc.core.inference import InferenceBase
 from fabricpc.graph_initialization.state_initializer import StateInitBase
 from hibacaml.config import HiBaCaMLConfig
 from hibacaml.nodes import (
-    ComposerStage2Node,
+    ColumnComposerNode,
     ElementwiseGateNode,
     PatchTokenizerNode,
     ScaledAddNode,
@@ -184,9 +184,9 @@ def create_hibacaml_structure(
             k_node = next(node for node in nodes if node.name == k_micro_names[source_index])
             edges.append(Edge(source=k_node, target=l_node.slot("in")))
 
-    stage1_logits = IdentityNode(
+    pooled_logits = IdentityNode(
         shape=(cfg.output_dim,),
-        name="stage1_logits",
+        name="pooled_logits",
         scale=1.0 / cfg.column_pool.active_support_size,
     )
     active_feature_summary = IdentityNode(
@@ -194,9 +194,9 @@ def create_hibacaml_structure(
         name="active_feature_summary",
         scale=1.0 / cfg.column_pool.active_support_size,
     )
-    composer2 = ComposerStage2Node(
+    column_composer = ColumnComposerNode(
         shape=(cfg.output_dim,),
-        name="composer2",
+        name="composer",
         hidden_dim=cfg.composer.hidden_dim,
         gate_temp=cfg.composer.gate_temp,
         prior_logit_scale=cfg.composer.prior_logit_scale,
@@ -230,7 +230,7 @@ def create_hibacaml_structure(
         activation=SoftmaxActivation(),
         energy=WeightedCrossEntropyEnergy(weight=cfg.hierarchy.global_loss_weight),
     )
-    nodes.extend([stage1_logits, active_feature_summary, composer2, final_output, hier_mid, hier_global])
+    nodes.extend([pooled_logits, active_feature_summary, column_composer, final_output, hier_mid, hier_global])
 
     for column_index in range(cfg.column_pool.total_columns):
         feature_gate_name = feature_gate_names[column_index]
@@ -239,16 +239,16 @@ def create_hibacaml_structure(
         feature_gate_node = next(node for node in nodes if node.name == feature_gate_name)
         logit_gate_node = next(node for node in nodes if node.name == logit_gate_name)
         cert_input_node = next(node for node in nodes if node.name == cert_input_name)
-        edges.append(Edge(source=logit_gate_node, target=stage1_logits.slot("in")))
+        edges.append(Edge(source=logit_gate_node, target=pooled_logits.slot("in")))
         edges.append(Edge(source=feature_gate_node, target=active_feature_summary.slot("in")))
-        edges.append(Edge(source=feature_gate_node, target=composer2.slot("feature")))
-        edges.append(Edge(source=cert_input_node, target=composer2.slot("cert")))
+        edges.append(Edge(source=feature_gate_node, target=column_composer.slot("feature")))
+        edges.append(Edge(source=cert_input_node, target=column_composer.slot("cert")))
 
     edges.extend(
         [
-            Edge(source=task_query, target=composer2.slot("query")),
-            Edge(source=stage1_logits, target=final_output.slot("base")),
-            Edge(source=composer2, target=final_output.slot("correction")),
+            Edge(source=task_query, target=column_composer.slot("query")),
+            Edge(source=pooled_logits, target=final_output.slot("base")),
+            Edge(source=column_composer, target=final_output.slot("correction")),
             Edge(source=active_feature_summary, target=hier_mid.slot("in")),
             Edge(source=active_feature_summary, target=hier_global.slot("in")),
         ]
@@ -272,9 +272,9 @@ def create_hibacaml_structure(
         "support_mask_node": support_mask.name,
         "task_query_node": task_query.name,
         "patch_tokens_node": patch_tokens.name,
-        "stage1_logits_node": stage1_logits.name,
+        "pooled_logits_node": pooled_logits.name,
         "active_feature_summary_node": active_feature_summary.name,
-        "composer2_node": composer2.name,
+        "composer_node": column_composer.name,
         "final_output_node": final_output.name,
         "column_nodes": tuple(column_metadata),
         "b_micro_names": b_micro_names,

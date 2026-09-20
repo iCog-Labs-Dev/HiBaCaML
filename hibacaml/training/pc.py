@@ -18,7 +18,7 @@ from fabricpc.core.scaling import scale_input_grads, scale_inputs, scale_weight_
 from fabricpc.core.state_ops import update_node_in_state
 from fabricpc.graph_initialization.state_initializer import initialize_graph_state
 
-from hibacaml.nodes.core import composer_stage2_details
+from hibacaml.nodes.composer import composer_details
 from hibacaml.training.shared import (
     composer_context,
     composer_details_from_runtime,
@@ -159,7 +159,7 @@ def _add_composer_latent_gradients(params, state, clamps, structure):
     )
 
     def energy(feature_predictions):
-        details = composer_stage2_details(
+        details = composer_details(
             node_params, feature_predictions, certs, query, node_config
         )
         return jnp.sum(details["aux_penalty"])
@@ -209,7 +209,7 @@ def _add_parent_child_weight_gradients(params, final_state, structure, grads):
 def _add_composer_weight_gradients(params, final_state, clamps, structure, grads):
     if _composer_is_inert(structure):
         return grads
-    composer_name = structure.config["hibacaml"]["composer2_node"]
+    composer_name = structure.config["hibacaml"]["composer_node"]
     features = jnp.stack(
         [
             _predict_from_state(name, params.nodes[name], final_state, structure)
@@ -222,7 +222,7 @@ def _add_composer_weight_gradients(params, final_state, clamps, structure, grads
     )
 
     def energy(node_params):
-        details = composer_stage2_details(
+        details = composer_details(
             node_params, features, certs, query, node_config
         )
         return jnp.sum(details["aux_penalty"])

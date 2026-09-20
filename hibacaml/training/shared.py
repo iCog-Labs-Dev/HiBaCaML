@@ -7,7 +7,7 @@ from typing import Dict, Sequence
 import jax
 import jax.numpy as jnp
 
-from hibacaml.nodes.core import composer_stage2_details
+from hibacaml.nodes.composer import composer_details
 from hibacaml.types import MnistTask
 
 # --------------------------------------------------------------------------
@@ -128,7 +128,7 @@ def composer_feature_gate_names(structure):
 
 
 def composer_context(params, state, clamps, structure, *, feature_predictions=None):
-    """Assemble the composer's inputs as ``composer_stage2_details`` takes them.
+    """Assemble the composer's inputs as ``composer_details`` takes them.
 
     One builder for every caller -- backprop, evaluation, reporting, and the PC
     auxiliary factor -- so they cannot drift apart. ``feature_predictions``
@@ -136,7 +136,7 @@ def composer_context(params, state, clamps, structure, *, feature_predictions=No
     phase supplies it, recomputing them from settled inputs.
     """
     meta = structure.config["hibacaml"]
-    composer_name = meta["composer2_node"]
+    composer_name = meta["composer_node"]
     if feature_predictions is None:
         feature_predictions = jnp.stack(
             [state.nodes[name].z_mu for name in composer_feature_gate_names(structure)],
@@ -157,7 +157,7 @@ def composer_context(params, state, clamps, structure, *, feature_predictions=No
 
 
 def composer_details_from_runtime(params, final_state, clamps, structure):
-    return composer_stage2_details(
+    return composer_details(
         *composer_context(params, final_state, clamps, structure)
     )
 
