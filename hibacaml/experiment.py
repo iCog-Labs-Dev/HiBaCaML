@@ -13,14 +13,14 @@ from pathlib import Path
 from typing import Dict, Optional, Sequence, Tuple
 
 import jax
-from fabricpc.core.inference import InferenceSGD
 from fabricpc.graph_initialization import initialize_params
 from fabricpc.graph_initialization.state_initializer import FeedforwardStateInit
 
 from hibacaml.config import HiBaCaMLConfig
 from hibacaml.reporting.logger import log_progress
 from hibacaml.graph import create_hibacaml_structure
-from hibacaml.training import HiBaCaMLBackpropRunner, HiBaCaMLTrainer
+from hibacaml.training import HiBaCaMLBackpropTrainer, HiBaCaMLPCTrainer
+from hibacaml.training.pc import HiBaCaMLPCInference
 from hibacaml.types import MnistTask
 
 LEARNERS = ("pc", "backprop")
@@ -99,7 +99,13 @@ def build_trainer(
     if learning not in LEARNERS:
         raise ValueError(f"learning must be one of {LEARNERS}")
 
-    inference = InferenceSGD(eta_infer=cfg.eta_infer, infer_steps=cfg.infer_steps)
+    # Both learners get the same graph. Backprop reaches it only through
+    # feedforward_state, which never runs the inference algorithm, so carrying
+    # the PC one costs it nothing.
+    inference = HiBaCaMLPCInference(
+        eta_infer=cfg.eta_infer,
+        infer_steps=cfg.infer_steps,
+    )
     structure = create_hibacaml_structure(
         cfg,
         inference,
@@ -110,7 +116,9 @@ def build_trainer(
     params = initialize_params(structure, jax.random.PRNGKey(cfg.seed))
     log_progress("parameter initialization complete", component="runner")
 
-    trainer_cls = HiBaCaMLBackpropRunner if learning == "backprop" else HiBaCaMLTrainer
+    trainer_cls = (
+        HiBaCaMLBackpropTrainer if learning == "backprop" else HiBaCaMLPCTrainer
+    )
     trainer = trainer_cls(
         cfg,
         structure,

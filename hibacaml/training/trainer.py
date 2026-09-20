@@ -1,28 +1,23 @@
-"""Main HiBaCaML trainer."""
+"""Shared HiBaCaML training and evaluation orchestration."""
 
 from __future__ import annotations
 
 import copy
 import itertools
-import pickle
 import time
+from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import jax
 import jax.numpy as jnp
 import optax
 
-from fabricpc.core.inference import run_inference
-from fabricpc.core.learning import compute_local_weight_gradients
-from fabricpc.graph_initialization.state_initializer import (
-    FeedforwardStateInit,
-    initialize_graph_state,
-)
+from fabricpc.graph_initialization.state_initializer import FeedforwardStateInit
 from hibacaml.config import HiBaCaMLConfig
 from hibacaml.control.replay_bank import SelectorBank
 from hibacaml.control.search import ExactSearchService
-from hibacaml.control.shells import ShellController
+from hibacaml.control.shells import ShellController, precision_weight_gradients
 from hibacaml.control.support import (
     build_full_support,
     default_nonshared_support,
@@ -31,9 +26,17 @@ from hibacaml.control.support import (
 from hibacaml.reporting.logger import log_progress
 from hibacaml.graph import initialize_hibacaml_state
 from hibacaml.nodes.core import composer_stage2_details
+from hibacaml.training.shared import (
+    EvaluationAccumulator,
+    batch_query,
+    batch_targets,
+    build_multi_support_clamps,
+    build_single_support_clamps,
+    loss_dict_from_vector,
+    support_mean_losses,
+)
 from hibacaml.reporting import (
     append_event,
-    export_run_artifacts,
     start_run,
     write_run_state,
 )
@@ -45,278 +48,14 @@ from hibacaml.types import (
     TaskSummary,
 )
 
-def _composer_details_from_runtime(params, final_state, clamps, structure):
-    meta = structure.config["hibacaml"]
-    composer_name = meta["composer2_node"]
-    feature_names = [meta["feature_gate_names"][idx] for idx in sorted(meta["feature_gate_names"])]
-    cert_names = [meta["cert_input_names"][idx] for idx in sorted(meta["cert_input_names"])]
-    features = jnp.stack([final_state.nodes[name].z_mu for name in feature_names], axis=1)
-    certs = jnp.stack(
-        [clamps.get(name, final_state.nodes[name].z_mu) for name in cert_names],
-        axis=1,
-    )
-    query = clamps[meta["task_query_node"]]
-    node_info = structure.nodes[composer_name].node_info
-    node_params = params.nodes[composer_name]
-    return composer_stage2_details(node_params, features, certs, query, node_info.node_config)
-
-
-def _hierarchy_parent_child_penalty(final_state, structure, weight: float) -> jnp.ndarray:
-    if weight <= 0.0:
-        return jnp.zeros((final_state.batch_size,), dtype=jnp.float32)
-    hier_mid = final_state.nodes[structure.task_map["hier_mid"]].z_mu
-    hier_global = final_state.nodes[structure.task_map["hier_global"]].z_mu
-    mid_parent = jnp.mean(hier_mid, axis=1)
-    return weight * jnp.mean(jnp.square(mid_parent - hier_global), axis=-1)
-
-
-def _loss_vector_from_state(
-    final_state,
-    structure,
-    *,
-    composer_aux_mean: jnp.ndarray,
-    parent_child_mean: jnp.ndarray,
-) -> jnp.ndarray:
-    output_name = structure.task_map["y"]
-    hier_mid_name = structure.task_map["hier_mid"]
-    hier_global_name = structure.task_map["hier_global"]
-    task = jnp.mean(final_state.nodes[output_name].energy)
-    hier_mid = jnp.mean(final_state.nodes[hier_mid_name].energy)
-    hier_global = jnp.mean(final_state.nodes[hier_global_name].energy)
-    total = task + hier_mid + hier_global + parent_child_mean + composer_aux_mean
-    return jnp.asarray(
-        [task, hier_mid, hier_global, parent_child_mean, composer_aux_mean, total],
-        dtype=jnp.float32,
-    )
-
-
-def _loss_dict_from_vector(losses: jnp.ndarray) -> Dict[str, float]:
-    return {
-        "task": float(losses[0]),
-        "hier_mid": float(losses[1]),
-        "hier_global": float(losses[2]),
-        "parent_child": float(losses[3]),
-        "composer": float(losses[4]),
-        "total": float(losses[5]),
-    }
-
-
-def _per_sample_parent_child_from_state(final_state, structure) -> jnp.ndarray:
-    cfg = structure.config["hibacaml"]["cfg"]
-    return _hierarchy_parent_child_penalty(
-        final_state,
-        structure,
-        cfg.hierarchy.parent_child_loss_weight,
-    )
-
-
-def _per_sample_total_from_state(
-    final_state,
-    structure,
-    *,
-    composer_aux: jnp.ndarray,
-    parent_child: jnp.ndarray,
-) -> jnp.ndarray:
-    output_name = structure.task_map["y"]
-    hier_mid_name = structure.task_map["hier_mid"]
-    hier_global_name = structure.task_map["hier_global"]
-    return (
-        final_state.nodes[output_name].energy
-        + final_state.nodes[hier_mid_name].energy
-        + final_state.nodes[hier_global_name].energy
-        + parent_child
-        + composer_aux
-    )
-
-
-def _cross_entropy_per_sample(
-    probs: jnp.ndarray,
-    targets: jnp.ndarray,
-    weight: float = 1.0,
-) -> jnp.ndarray:
-    """Return externally supervised cross-entropy for each example."""
-    safe = jnp.clip(probs, 1e-7, 1.0)
-    axes = tuple(range(1, targets.ndim))
-    return weight * (-jnp.sum(targets * jnp.log(safe), axis=axes))
-
-
-def _per_sample_supervised_total_from_state(
-    final_state,
-    structure,
-    targets: Dict[str, jnp.ndarray],
-    *,
-    composer_aux: jnp.ndarray,
-    parent_child: jnp.ndarray,
-    composer_before_parent: bool = False,
-) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """Compute label-based losses without feeding labels into inference."""
-    cfg = structure.config["hibacaml"]["cfg"]
-    output_name = structure.task_map["y"]
-    hier_mid_name = structure.task_map["hier_mid"]
-    hier_global_name = structure.task_map["hier_global"]
-    task = _cross_entropy_per_sample(
-        final_state.nodes[output_name].z_mu,
-        targets["y"],
-    )
-    hier_mid = _cross_entropy_per_sample(
-        final_state.nodes[hier_mid_name].z_mu,
-        targets["hier_mid"],
-        cfg.hierarchy.mid_loss_weight,
-    )
-    hier_global = _cross_entropy_per_sample(
-        final_state.nodes[hier_global_name].z_mu,
-        targets["hier_global"],
-        cfg.hierarchy.global_loss_weight,
-    )
-    if composer_before_parent:
-        # Preserve the established backprop summation order exactly.
-        total = task + hier_mid + hier_global + composer_aux + parent_child
-    else:
-        total = task + hier_mid + hier_global + parent_child + composer_aux
-    losses = jnp.asarray(
-        [
-            jnp.mean(task),
-            jnp.mean(hier_mid),
-            jnp.mean(hier_global),
-            jnp.mean(parent_child),
-            jnp.mean(composer_aux),
-            jnp.mean(total),
-        ],
-        dtype=jnp.float32,
-    )
-    return total, losses
-
-
-def _evaluation_details_from_state(
-    params,
-    final_state,
-    clamps,
-    targets,
-    structure,
-    *,
-    composer_before_parent: bool = False,
-):
-    """Score one target-free state and retain already-computed diagnostics."""
-    composer_details = _composer_details_from_runtime(
-        params,
-        final_state,
-        clamps,
-        structure,
-    )
-    parent_child = _per_sample_parent_child_from_state(final_state, structure)
-    per_sample_total, losses = _per_sample_supervised_total_from_state(
-        final_state,
-        structure,
-        targets,
-        composer_aux=composer_details["aux_penalty"],
-        parent_child=parent_child,
-        composer_before_parent=composer_before_parent,
-    )
-    logits = final_state.nodes[structure.task_map["y"]].z_mu
-    composer_payload = {
-        "gate_probs": composer_details["gate_probs"],
-        "gate_entropy": composer_details["gate_entropy"],
-        "top1_mass": composer_details["top1_mass"],
-        "effective_k": composer_details["effective_k"],
-        "gate_dev": composer_details["gate_dev"],
-        "prior_kl": composer_details["prior_kl"],
-    }
-    return logits, per_sample_total, losses, composer_payload
-
-
-def _batch_targets(
-    batch: Dict[str, jnp.ndarray],
-    *,
-    repeats: int = 1,
-) -> Dict[str, jnp.ndarray]:
-    """Build external evaluation targets, optionally repeated by support."""
-    targets = {
-        "y": jnp.asarray(batch["y"], dtype=jnp.float32),
-        "hier_mid": jnp.asarray(batch["hier_mid"], dtype=jnp.float32),
-        "hier_global": jnp.asarray(batch["hier_global"], dtype=jnp.float32),
-    }
-    if repeats == 1:
-        return targets
-    return {
-        name: jnp.concatenate([value] * repeats, axis=0)
-        for name, value in targets.items()
-    }
-
-
-def _per_class_metrics_from_confusion(
-    confusion: jnp.ndarray,
-) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """Return per-class precision and recall for confusion[target, prediction]."""
-    row_totals = jnp.sum(confusion, axis=1)
-    column_totals = jnp.sum(confusion, axis=0)
-    diagonal = jnp.diag(confusion).astype(jnp.float32)
-    recall = jnp.where(row_totals > 0, diagonal / row_totals, 0.0)
-    precision = jnp.where(column_totals > 0, diagonal / column_totals, 0.0)
-    return precision, recall
-
-
-def _run_inference_step(params, clamps, structure, rng_key):
-    batch_size = next(iter(clamps.values())).shape[0]
-    init_state = initialize_graph_state(
-        structure,
-        batch_size,
-        rng_key,
-        clamps=clamps,
-        params=params,
-    )
-    return run_inference(params, init_state, clamps, structure)
-
-
-def _pc_gradient_step(params, clamps, structure, rng_key):
-    final_state = _run_inference_step(params, clamps, structure, rng_key)
-    grads = compute_local_weight_gradients(params, final_state, structure)
-    composer_details = _composer_details_from_runtime(params, final_state, clamps, structure)
-    parent_child = _per_sample_parent_child_from_state(final_state, structure)
-    losses = _loss_vector_from_state(
-        final_state,
-        structure,
-        composer_aux_mean=jnp.mean(composer_details["aux_penalty"]),
-        parent_child_mean=jnp.mean(parent_child),
-    )
-    return grads, losses, final_state
-
-
-def _eval_batch_step(params, clamps, targets, structure, rng_key):
-    """Run target-free inference, then score predictions against held-out labels."""
-    final_state = _run_inference_step(params, clamps, structure, rng_key)
-    return _evaluation_details_from_state(
-        params,
-        final_state,
-        clamps,
-        targets,
-        structure,
-    )
-
-
-def _make_jitted_runtime(structure):
-    jit_inference = jax.jit(
-        lambda params, clamps, rng_key: _run_inference_step(
-            params, clamps, structure, rng_key
-        )
-    )
-    jit_pc_gradients = jax.jit(
-        lambda params, clamps, rng_key: _pc_gradient_step(
-            params, clamps, structure, rng_key
-        )
-    )
-    jit_eval_batch = jax.jit(
-        lambda params, clamps, targets, rng_key: _eval_batch_step(
-            params, clamps, targets, structure, rng_key
-        )
-    )
-    return jit_inference, jit_pc_gradients, jit_eval_batch
-
-
 _TRAINER_INSTANCE_COUNTER = itertools.count()
 
 
-class HiBaCaMLTrainer:
-    """Sequential trainer for HiBaCaML."""
+class HiBaCaMLTrainer(ABC):
+    """Shared sequential trainer for the PC and backprop learners."""
+
+    COMPOSER_BEFORE_PARENT: bool
+    CLAMPS_MAY_INCLUDE_TARGETS: bool
 
     def __init__(
         self,
@@ -332,6 +71,7 @@ class HiBaCaMLTrainer:
         run_id: str = "",
         opt_state=None,
         experiment_metadata: Optional[Dict[str, object]] = None,
+        programs: Optional[Dict[str, Callable]] = None,
     ):
         self.cfg = cfg
         self.structure = structure
@@ -362,14 +102,11 @@ class HiBaCaMLTrainer:
         self.tasks: Dict[int, MnistTask] = {}
         self.current_phi = cfg.phi
         self.current_nonshared = default_nonshared_support(cfg)
-        (
-            self._jit_run_batch_inference,
-            self._jit_compute_pc_gradients,
-            self._jit_eval_batch,
-        ) = _make_jitted_runtime(structure)
-        self._eval_cache: Dict[
-            Tuple[int, int, Tuple[int, ...], str, str, bool], Dict[str, object]
-        ] = {}
+        self._programs = (
+            programs
+            if programs is not None
+            else type(self).build_programs(structure, self.optimizer, cfg)
+        )
         self.shell_controller = ShellController(cfg, structure)
         # Rollout clones get no run root, which is what keeps their events out
         # of the audit stream.
@@ -397,6 +134,15 @@ class HiBaCaMLTrainer:
             selector_bank=self.selector_bank,
             run_id=self.run_id,
         )
+
+    @classmethod
+    def build_programs(cls, structure, optimizer, cfg) -> Optional[Dict[str, Callable]]:
+        """Compiled programs this learner reuses, or None when it has none.
+
+        Predictive coding compiles its settling and evaluation programs once per
+        graph; backprop executes eagerly and keeps this None.
+        """
+        return None
 
     def register_tasks(self, tasks: Sequence[MnistTask]) -> None:
         for task in tasks:
@@ -435,15 +181,12 @@ class HiBaCaMLTrainer:
             run_id=self.run_id,
             opt_state=jax.tree_util.tree_map(lambda x: x, self.opt_state),  # share immutable leaves
             experiment_metadata=self.experiment_metadata,
+            programs=self._programs,  # compiled once, shared, never rebuilt
         )
         cloned.persistent_state.params = cloned.params
         cloned.persistent_state.opt_state = cloned.opt_state
         cloned.current_phi = self.current_phi                          # frozen dataclass
         cloned.current_nonshared = tuple(self.current_nonshared)
-        cloned._jit_run_batch_inference = self._jit_run_batch_inference
-        cloned._jit_compute_pc_gradients = self._jit_compute_pc_gradients
-        cloned._jit_eval_batch = self._jit_eval_batch
-        cloned._eval_cache = {}  # rollout clone builds its own; parent's entries are stale after training
         return cloned
 
     def _record_timing(
@@ -460,12 +203,8 @@ class HiBaCaMLTrainer:
         else:
             summary[key] = float(seconds)
 
-    def _invalidate_eval_cache(self) -> None:
-        self._eval_cache = {}
-
     def _bump_params_revision(self) -> None:
         self.persistent_state.params_revision += 1
-        self._invalidate_eval_cache()
 
     def set_boundary_choice(self, task_id: int, nonshared: Sequence[int], phi) -> None:
         boundary = tuple(sorted(nonshared))
@@ -503,9 +242,6 @@ class HiBaCaMLTrainer:
             component="trainer",
         )
 
-    def set_active_support(self, task_id: int, nonshared: Sequence[int], phi) -> None:
-        self.set_current_support(task_id, nonshared, phi)
-
     def freeze_task_support(self, task_id: int) -> SupportSnapshot:
         snapshot = SupportSnapshot(
             task_id=task_id,
@@ -527,12 +263,6 @@ class HiBaCaMLTrainer:
     def task(self, task_id: int) -> MnistTask:
         return self.tasks[task_id]
 
-    def _batch_query(self, task: MnistTask, batch_size: int) -> jnp.ndarray:
-        return jnp.broadcast_to(
-            jnp.asarray(task.task_query, dtype=jnp.float32),
-            (batch_size, task.task_query.shape[0]),
-        )
-
     def _refresh_certificates(
         self,
         batch_size: int,
@@ -544,41 +274,6 @@ class HiBaCaMLTrainer:
         state = graph_state if graph_state is not None else self._last_graph_state_or_placeholder(batch_size)
         self.shell_controller.refresh_certificates(params, state, self.persistent_state)
 
-    def _build_single_support_clamps(
-        self,
-        batch: Dict[str, jnp.ndarray],
-        task: MnistTask,
-        support_mask: jnp.ndarray,
-        cert_vectors: Dict[int, jnp.ndarray],
-        *,
-        include_targets: bool,
-    ) -> Dict[str, jnp.ndarray]:
-        meta = self.structure.config["hibacaml"]
-        batch_size = int(batch["x"].shape[0])
-        clamps = {
-            self.structure.task_map["x"]: jnp.asarray(batch["x"], dtype=jnp.float32),
-            meta["support_mask_node"]: jnp.broadcast_to(support_mask, (batch_size, support_mask.shape[0])),
-            meta["task_query_node"]: self._batch_query(task, batch_size),
-        }
-        if include_targets:
-            clamps.update(
-                {
-                    self.structure.task_map["y"]: jnp.asarray(
-                        batch["y"], dtype=jnp.float32
-                    ),
-                    self.structure.task_map["hier_mid"]: jnp.asarray(
-                        batch["hier_mid"], dtype=jnp.float32
-                    ),
-                    self.structure.task_map["hier_global"]: jnp.asarray(
-                        batch["hier_global"], dtype=jnp.float32
-                    ),
-                }
-            )
-        for column_index, node_name in meta["cert_input_names"].items():
-            vec = cert_vectors[column_index]
-            clamps[node_name] = jnp.broadcast_to(vec, (batch_size, vec.shape[0]))
-        return clamps
-
     def _build_clamps(
         self,
         batch: Dict[str, jnp.ndarray],
@@ -589,13 +284,19 @@ class HiBaCaMLTrainer:
         refresh_certificates: bool = True,
         include_targets: bool = False,
     ) -> Dict[str, jnp.ndarray]:
-        """Build PC clamps; supervised training includes target nodes."""
+        if include_targets and not self.CLAMPS_MAY_INCLUDE_TARGETS:
+            raise ValueError(
+                f"{type(self).__name__} must not clamp supervised targets into "
+                "the graph: its targets stay external, and clamping them would "
+                "hold the output node fixed instead of predicted."
+            )
         batch_size = int(batch["x"].shape[0])
         if refresh_certificates:
             self._refresh_certificates(batch_size, params=params)
         support_mask = self.build_support_mask(nonshared)
         cert_vectors = self.shell_controller.certificate_matrix(self.persistent_state, support_mask)
-        return self._build_single_support_clamps(
+        return build_single_support_clamps(
+            self.structure,
             batch,
             task,
             support_mask,
@@ -613,6 +314,12 @@ class HiBaCaMLTrainer:
         refresh_certificates: bool = True,
         include_targets: bool = False,
     ) -> Dict[str, jnp.ndarray]:
+        if include_targets and not self.CLAMPS_MAY_INCLUDE_TARGETS:
+            raise ValueError(
+                f"{type(self).__name__} must not clamp supervised targets into "
+                "the graph: its targets stay external, and clamping them would "
+                "hold the output node fixed instead of predicted."
+            )
         batch_size = int(batch["x"].shape[0])
         if refresh_certificates:
             self._refresh_certificates(batch_size, params=params)
@@ -623,71 +330,40 @@ class HiBaCaMLTrainer:
             self.shell_controller.mask_certificate_vectors(cert_base, support_mask)
             for support_mask in support_masks
         ]
-        meta = self.structure.config["hibacaml"]
-        total_batch = batch_size * len(supports)
-        clamps = {
-            self.structure.task_map["x"]: jnp.concatenate(
-                [jnp.asarray(batch["x"], dtype=jnp.float32)] * len(supports),
-                axis=0,
-            ),
-            meta["support_mask_node"]: jnp.concatenate(
-                [jnp.broadcast_to(mask, (batch_size, mask.shape[0])) for mask in support_masks],
-                axis=0,
-            ),
-            meta["task_query_node"]: self._batch_query(task, total_batch),
-        }
-        if include_targets:
-            clamps.update(
-                {
-                    self.structure.task_map["y"]: jnp.concatenate(
-                        [jnp.asarray(batch["y"], dtype=jnp.float32)]
-                        * len(supports),
-                        axis=0,
-                    ),
-                    self.structure.task_map["hier_mid"]: jnp.concatenate(
-                        [jnp.asarray(batch["hier_mid"], dtype=jnp.float32)]
-                        * len(supports),
-                        axis=0,
-                    ),
-                    self.structure.task_map["hier_global"]: jnp.concatenate(
-                        [jnp.asarray(batch["hier_global"], dtype=jnp.float32)]
-                        * len(supports),
-                        axis=0,
-                    ),
-                }
-            )
-        for column_index, node_name in meta["cert_input_names"].items():
-            clamps[node_name] = jnp.concatenate(
-                [
-                    jnp.broadcast_to(matrix[column_index], (batch_size, matrix[column_index].shape[0]))
-                    for matrix in cert_matrices
-                ],
-                axis=0,
-            )
-        return clamps
+        return build_multi_support_clamps(
+            self.structure,
+            batch,
+            task,
+            support_masks,
+            cert_matrices,
+            include_targets=include_targets,
+        )
 
     def _last_graph_state_or_placeholder(self, batch_size: int):
         if getattr(self, "_last_graph_state", None) is not None and self._last_graph_state.batch_size == batch_size:
             return self._last_graph_state
+        from fabricpc.core.types import GraphState, NodeState
+
         zero_nodes = {}
         for node_name, node in self.structure.nodes.items():
             shape = (batch_size, *node.node_info.shape)
-            zero_nodes[node_name] = self._make_zero_node_state(shape)
-        from fabricpc.core.types import GraphState
+            zero_nodes[node_name] = NodeState(
+                z_latent=jnp.zeros(shape, dtype=jnp.float32),
+                z_mu=jnp.zeros(shape, dtype=jnp.float32),
+                error=jnp.zeros(shape, dtype=jnp.float32),
+                energy=jnp.zeros((batch_size,), dtype=jnp.float32),
+                latent_grad=jnp.zeros(shape, dtype=jnp.float32),
+            )
 
         return GraphState(nodes=zero_nodes, batch_size=batch_size)
 
-    @staticmethod
-    def _make_zero_node_state(shape):
-        from fabricpc.core.types import NodeState
+    @abstractmethod
+    def _run_evaluation_inference(self, params, clamps, rng_key):
+        """Return this learner's target-free graph state."""
 
-        return NodeState(
-            z_latent=jnp.zeros(shape, dtype=jnp.float32),
-            z_mu=jnp.zeros(shape, dtype=jnp.float32),
-            error=jnp.zeros(shape, dtype=jnp.float32),
-            energy=jnp.zeros((shape[0],), dtype=jnp.float32),
-            latent_grad=jnp.zeros(shape, dtype=jnp.float32),
-        )
+    @abstractmethod
+    def _evaluate_prepared_batch(self, params, clamps, targets, rng_key):
+        """Return ``(logits, per_sample_total, losses, composer)``."""
 
     def run_batch_evaluation_inference(
         self,
@@ -696,17 +372,17 @@ class HiBaCaMLTrainer:
         nonshared: Sequence[int],
         params=None,
     ):
-        """Run inference without exposing any class-derived target nodes."""
+        """Run target-free learner inference and install its graph state."""
         params = params if params is not None else self.params
         clamps = self._build_clamps(
             batch,
             task,
-            nonshared,
+            tuple(sorted(nonshared)),
             params=params,
             include_targets=False,
         )
         self.rng_key, state_key = jax.random.split(self.rng_key)
-        final_state = self._jit_run_batch_inference(params, clamps, state_key)
+        final_state = self._run_evaluation_inference(params, clamps, state_key)
         self._last_graph_state = final_state
         return final_state, clamps
 
@@ -737,7 +413,7 @@ class HiBaCaMLTrainer:
             ],
             axis=1,
         )
-        query = self._batch_query(task, final_state.batch_size)
+        query = batch_query(task, final_state.batch_size)
         details = composer_stage2_details(
             self.params.nodes[meta["composer2_node"]],
             features,
@@ -757,43 +433,48 @@ class HiBaCaMLTrainer:
             "gate_min_active": float(jnp.min(jnp.where(gate_probs > 0.0, gate_probs, 1.0))),
         }
 
-    def compute_pc_gradients(
+    @abstractmethod
+    def _training_inputs(
         self,
         batch: Dict[str, jnp.ndarray],
         task: MnistTask,
         nonshared: Sequence[int],
-        params=None,
-    ):
-        params = params if params is not None else self.params
-        clamps = HiBaCaMLTrainer._build_clamps(
-            self,
-            batch,
-            task,
-            nonshared,
-            params=params,
-            include_targets=True,
-        )
-        self.rng_key, state_key = jax.random.split(self.rng_key)
-        grads, loss_vector, final_state = self._jit_compute_pc_gradients(
-            params, clamps, state_key
-        )
-        self._last_graph_state = final_state
-        return grads, _loss_dict_from_vector(loss_vector), final_state
+    ) -> Dict[str, object]:
+        """Build the host-side inputs consumed by this learner's update."""
 
-    def compute_training_gradients(
+    @abstractmethod
+    def _gradients(self, params, inputs, rng_key):
+        """Return ``(grads, loss_vector, final_state)`` for one batch."""
+
+    def training_update(
         self,
         batch: Dict[str, jnp.ndarray],
         task: MnistTask,
         nonshared: Sequence[int],
-        params=None,
     ):
-        """Compute gradients for the trainer's configured learning mode."""
-        return self.compute_pc_gradients(
-            batch,
-            task,
-            nonshared,
-            params=params,
+        """Run the shared gradient, masking, precision, and optimizer stages."""
+        inputs = self._training_inputs(batch, task, nonshared)
+        self.rng_key, state_key = jax.random.split(self.rng_key)
+        grads, loss_vector, final_state = self._gradients(self.params, inputs, state_key)
+        grads = self._mask_grads(grads, nonshared)
+        grads = precision_weight_gradients(
+            grads,
+            self.params,
+            shell_names=tuple(self.shell_controller.shell_slices),
+            enabled=self.cfg.exact_search.enable_precision_update_resistance,
+            strength=self.cfg.exact_search.precision_update_strength,
+            floor=self.cfg.exact_search.precision_update_floor,
         )
+        updates, self.opt_state = self.optimizer.update(
+            grads, self.opt_state, self.params
+        )
+        self.params = optax.apply_updates(self.params, updates)
+        self.persistent_state.params = self.params
+        self.persistent_state.opt_state = self.opt_state
+        self._bump_params_revision()
+        if final_state is not None:
+            self._last_graph_state = final_state
+        return loss_dict_from_vector(loss_vector), final_state
 
     def _mask_grads(self, grads, nonshared: Sequence[int]):
         keep_columns = set(self.cfg.column_pool.shared_indices + tuple(nonshared))
@@ -807,13 +488,246 @@ class HiBaCaMLTrainer:
             masked_nodes[node_name] = node_grads
         return grads._replace(nodes=masked_nodes)
 
-    def _apply_grads(self, grads):
-        grads = self.shell_controller.precision_weight_gradients(grads, self.params)
-        updates, self.opt_state = self.optimizer.update(grads, self.opt_state, self.params)
-        self.params = optax.apply_updates(self.params, updates)
-        self.persistent_state.params = self.params
-        self.persistent_state.opt_state = self.opt_state
-        self._bump_params_revision()
+    def _train_batch(
+        self,
+        task: MnistTask,
+        batch: Dict[str, jnp.ndarray],
+        nonshared: Sequence[int],
+        *,
+        epoch_index: int,
+        batch_index: int,
+        train_batches: int,
+        batch_log_every: int,
+    ):
+        next_step = self.persistent_state.global_step + 1
+        cert_due = next_step % self.cfg.cert_refresh_interval == 0
+        maintenance_due = (
+            self.cfg.exact_search.enable_exact_search
+            and task.task_id > 0
+            and next_step
+            - self.persistent_state.last_maintenance_step.get(task.task_id, 0)
+            >= self.cfg.exact_search.maintenance_interval
+        )
+        demotion_due = (
+            self.cfg.exact_search.enable_exact_search
+            and self.cfg.exact_search.enable_demotion_swap_audit
+            and task.task_id > 0
+            and next_step
+            - self.persistent_state.last_demotion_audit_step.get(task.task_id, 0)
+            >= self.cfg.exact_search.demotion_audit_interval
+        )
+        if (
+            batch_index == 0
+            or cert_due
+            or maintenance_due
+            or demotion_due
+            or batch_index + 1 == train_batches
+        ):
+            log_progress(
+                f"task={task.task_id} "
+                f"epoch={epoch_index + 1}/{self.cfg.epochs_per_task} "
+                f"batch={batch_index + 1}/{train_batches} start step={next_step} "
+                f"hooks(cert_refresh={cert_due}, maintenance={maintenance_due}, "
+                f"demotion={demotion_due})",
+                component="trainer",
+            )
+
+        batch_started = time.perf_counter()
+        losses, final_state = self.training_update(batch, task, nonshared)
+        jax.block_until_ready(
+            final_state.nodes[self.structure.task_map["y"]].z_mu
+        )
+        updated_params = self.shell_controller.apply_structural_edits(
+            self.params,
+            final_state,
+            self.persistent_state,
+            self.active_full_support(nonshared),
+            self.current_phi,
+        )
+        if updated_params is not self.params:
+            self.params = updated_params
+            self.persistent_state.params = self.params
+            self._bump_params_revision()
+        self.persistent_state.global_step += 1
+        final_losses = dict(losses)
+        batch_size = int(batch["x"].shape[0])
+
+        if demotion_due:
+            self.exact_search.demotion_swap_audit(
+                task.task_id,
+                final_state,
+                nonshared,
+            )
+            self.persistent_state.last_demotion_audit_step[
+                task.task_id
+            ] = self.persistent_state.global_step
+
+        if (
+            batch_index == 0
+            or (batch_index + 1) % batch_log_every == 0
+            or batch_index + 1 == train_batches
+        ):
+            composer_diag = self.composer_diagnostics_from_state(
+                final_state,
+                task,
+                nonshared,
+            )
+            self.persistent_state.composer_diagnostics[
+                self.persistent_state.global_step
+            ] = {
+                "task_id": task.task_id,
+                "epoch": epoch_index + 1,
+                "batch": batch_index + 1,
+                **composer_diag,
+            }
+            log_progress(
+                f"task={task.task_id} "
+                f"epoch={epoch_index + 1}/{self.cfg.epochs_per_task} "
+                f"batch={batch_index + 1}/{train_batches} "
+                f"loss_total={final_losses['total']:.4f} "
+                f"loss_task={final_losses['task']:.4f} "
+                f"step={self.persistent_state.global_step} "
+                f"batch_s={time.perf_counter() - batch_started:.2f}",
+                component="trainer",
+            )
+            if self.run_root is not None:
+                append_event(
+                    self.run_root,
+                    "training_step",
+                    task_id=task.task_id,
+                    epoch=epoch_index + 1,
+                    batch=batch_index + 1,
+                    train_batches=train_batches,
+                    global_step=self.persistent_state.global_step,
+                    losses=final_losses,
+                    composer=composer_diag,
+                )
+
+        if self.persistent_state.global_step % self.cfg.cert_refresh_interval == 0:
+            self._refresh_certificates(
+                final_state.batch_size,
+                graph_state=final_state,
+            )
+
+        if (
+            self.cfg.exact_search.enable_exact_search
+            and task.task_id > 0
+            and self.persistent_state.global_step
+            - self.persistent_state.last_maintenance_step.get(task.task_id, 0)
+            >= self.cfg.exact_search.maintenance_interval
+        ):
+            self.exact_search.local_one_swap(task.task_id)
+            nonshared = self.persistent_state.current_support[task.task_id]
+            self.persistent_state.last_maintenance_step[
+                task.task_id
+            ] = self.persistent_state.global_step
+
+        return nonshared, final_losses, batch_size
+
+    def _train_epoch(
+        self,
+        task: MnistTask,
+        nonshared: Sequence[int],
+        *,
+        epoch_index: int,
+        train_batches: int,
+        batch_log_every: int,
+        evaluate_train_each_epoch: bool,
+    ):
+        epoch_started = time.perf_counter()
+        epoch_start_step = self.persistent_state.global_step
+        epoch_examples = 0
+        final_losses = {
+            "task": 0.0,
+            "hier_mid": 0.0,
+            "hier_global": 0.0,
+            "parent_child": 0.0,
+            "composer": 0.0,
+            "total": 0.0,
+        }
+        epoch_loss_sums = {name: 0.0 for name in final_losses}
+        for batch_index, batch in enumerate(task.train_loader):
+            nonshared, final_losses, batch_size = self._train_batch(
+                task,
+                batch,
+                nonshared,
+                epoch_index=epoch_index,
+                batch_index=batch_index,
+                train_batches=train_batches,
+                batch_log_every=batch_log_every,
+            )
+            epoch_examples += batch_size
+            for name, value in final_losses.items():
+                epoch_loss_sums[name] += float(value) * batch_size
+
+        training_seconds = time.perf_counter() - epoch_started
+        self._record_timing(
+            task.task_id,
+            f"epoch_{epoch_index + 1}_seconds",
+            training_seconds,
+        )
+
+        validation_loader = getattr(task, "validation_loader", None)
+        if evaluate_train_each_epoch or validation_loader is not None:
+            evaluation_started = time.perf_counter()
+            train_metrics: Dict[str, object] = {}
+            validation_metrics: Dict[str, object] = {}
+            saved_training_rng = self.rng_key
+            try:
+                if evaluate_train_each_epoch:
+                    train_metrics = self.evaluate_loader(
+                        task,
+                        task.train_loader,
+                        nonshared,
+                        split_name="train",
+                        mode=f"epoch_{epoch_index + 1}",
+                        refresh_certificates=False,
+                    )
+                if validation_loader is not None:
+                    validation_metrics = self.evaluate_loader(
+                        task,
+                        validation_loader,
+                        nonshared,
+                        split_name="validation",
+                        mode=f"epoch_{epoch_index + 1}",
+                        refresh_certificates=False,
+                    )
+            finally:
+                # Epoch evaluation must not perturb later training randomness.
+                self.rng_key = saved_training_rng
+
+            evaluation_seconds = time.perf_counter() - evaluation_started
+            self._record_timing(
+                task.task_id,
+                f"epoch_{epoch_index + 1}_evaluation_seconds",
+                evaluation_seconds,
+            )
+            loss_denominator = max(epoch_examples, 1)
+            epoch_record = {
+                "task_id": task.task_id,
+                "epoch": epoch_index + 1,
+                "global_step": self.persistent_state.global_step,
+                "epoch_update_count": (
+                    self.persistent_state.global_step - epoch_start_step
+                ),
+                "epoch_examples": epoch_examples,
+                "optimization_loss_components": {
+                    name: value / loss_denominator
+                    for name, value in epoch_loss_sums.items()
+                },
+                "train_metrics": train_metrics,
+                "validation_metrics": validation_metrics,
+                "training_seconds": training_seconds,
+                "evaluation_seconds": evaluation_seconds,
+                "epoch_seconds": time.perf_counter() - epoch_started,
+                "active_support": self.active_full_support(nonshared),
+                "heldout_refresh_certificates": False,
+            }
+            self.persistent_state.epoch_evaluations.append(epoch_record)
+            if self.run_root is not None:
+                append_event(self.run_root, "epoch_validation", **epoch_record)
+
+        return nonshared, final_losses
 
     def train_task(
         self,
@@ -828,8 +742,16 @@ class HiBaCaMLTrainer:
                 self.set_current_support(task.task_id, support, phi)
             else:
                 default_support = default_nonshared_support(self.cfg)
-                self.set_boundary_choice(task.task_id, default_support, self.current_phi)
-                self.set_current_support(task.task_id, default_support, self.current_phi)
+                self.set_boundary_choice(
+                    task.task_id,
+                    default_support,
+                    self.current_phi,
+                )
+                self.set_current_support(
+                    task.task_id,
+                    default_support,
+                    self.current_phi,
+                )
 
         nonshared = self.persistent_state.current_support[task.task_id]
         final_losses = {
@@ -865,187 +787,16 @@ class HiBaCaMLTrainer:
                 task_id=task.task_id,
                 global_step=self.persistent_state.global_step,
             )
-        for epoch_idx in range(self.cfg.epochs_per_task):
-            epoch_started = time.perf_counter()
-            epoch_start_step = self.persistent_state.global_step
-            epoch_examples = 0
-            epoch_loss_sums = {name: 0.0 for name in final_losses}
-            for batch_idx, batch in enumerate(task.train_loader):
-                next_step = self.persistent_state.global_step + 1
-                cert_due = next_step % self.cfg.cert_refresh_interval == 0
-                maintenance_due = (
-                    self.cfg.exact_search.enable_exact_search
-                    and task.task_id > 0
-                    and next_step - self.persistent_state.last_maintenance_step.get(task.task_id, 0)
-                    >= self.cfg.exact_search.maintenance_interval
-                )
-                demotion_due = (
-                    self.cfg.exact_search.enable_exact_search
-                    and self.cfg.exact_search.enable_demotion_swap_audit
-                    and task.task_id > 0
-                    and next_step - self.persistent_state.last_demotion_audit_step.get(task.task_id, 0)
-                    >= self.cfg.exact_search.demotion_audit_interval
-                )
-                if batch_idx == 0 or cert_due or maintenance_due or demotion_due or batch_idx + 1 == train_batches:
-                    log_progress(
-                        f"task={task.task_id} epoch={epoch_idx + 1}/{self.cfg.epochs_per_task} "
-                        f"batch={batch_idx + 1}/{train_batches} start step={next_step} "
-                        f"hooks(cert_refresh={cert_due}, maintenance={maintenance_due}, demotion={demotion_due})",
-                        component="trainer",
-                    )
 
-                batch_started = time.perf_counter()
-                grads, losses, final_state = self.compute_training_gradients(
-                    batch,
-                    task,
-                    nonshared,
-                )
-                jax.block_until_ready(final_state.nodes[self.structure.task_map["y"]].z_mu)
-                grads = self._mask_grads(grads, nonshared)
-                self._apply_grads(grads)
-                active_columns = self.active_full_support(nonshared)
-                updated_params = self.shell_controller.apply_structural_edits(
-                    self.params,
-                    final_state,
-                    self.persistent_state,
-                    active_columns,
-                    self.current_phi,
-                )
-                if updated_params is not self.params:
-                    self.params = updated_params
-                    self.persistent_state.params = self.params
-                    self._bump_params_revision()
-                self.persistent_state.global_step += 1
-                final_losses = dict(losses)
-                batch_size = int(batch["x"].shape[0])
-                epoch_examples += batch_size
-                for name, value in final_losses.items():
-                    epoch_loss_sums[name] += float(value) * batch_size
-
-                if demotion_due:
-                    self.exact_search.demotion_swap_audit(task.task_id, final_state, nonshared)
-                    self.persistent_state.last_demotion_audit_step[task.task_id] = self.persistent_state.global_step
-
-                if (
-                    batch_idx == 0
-                    or (batch_idx + 1) % batch_log_every == 0
-                    or batch_idx + 1 == train_batches
-                ):
-                    composer_diag = self.composer_diagnostics_from_state(
-                        final_state,
-                        task,
-                        nonshared,
-                    )
-                    self.persistent_state.composer_diagnostics[
-                        self.persistent_state.global_step
-                    ] = {
-                        "task_id": task.task_id,
-                        "epoch": epoch_idx + 1,
-                        "batch": batch_idx + 1,
-                        **composer_diag,
-                    }
-                    log_progress(
-                        f"task={task.task_id} epoch={epoch_idx + 1}/{self.cfg.epochs_per_task} "
-                        f"batch={batch_idx + 1}/{train_batches} "
-                        f"loss_total={final_losses['total']:.4f} "
-                        f"loss_task={final_losses['task']:.4f} "
-                        f"step={self.persistent_state.global_step} "
-                        f"batch_s={time.perf_counter() - batch_started:.2f}",
-                        component="trainer",
-                    )
-                    if self.run_root is not None:
-                        append_event(
-                            self.run_root,
-                            "training_step",
-                            task_id=task.task_id,
-                            epoch=epoch_idx + 1,
-                            batch=batch_idx + 1,
-                            train_batches=train_batches,
-                            global_step=self.persistent_state.global_step,
-                            losses=final_losses,
-                            composer=composer_diag,
-                        )
-
-                if self.persistent_state.global_step % self.cfg.cert_refresh_interval == 0:
-                    self._refresh_certificates(final_state.batch_size, graph_state=final_state)
-
-                if (
-                    self.cfg.exact_search.enable_exact_search
-                    and task.task_id > 0
-                    and self.persistent_state.global_step - self.persistent_state.last_maintenance_step.get(task.task_id, 0)
-                    >= self.cfg.exact_search.maintenance_interval
-                ):
-                    self.exact_search.local_one_swap(task.task_id)
-                    nonshared = self.persistent_state.current_support[task.task_id]
-                    self.persistent_state.last_maintenance_step[task.task_id] = self.persistent_state.global_step
-
-            training_seconds = time.perf_counter() - epoch_started
-            self._record_timing(
-                task.task_id,
-                f"epoch_{epoch_idx + 1}_seconds",
-                training_seconds,
+        for epoch_index in range(self.cfg.epochs_per_task):
+            nonshared, final_losses = self._train_epoch(
+                task,
+                nonshared,
+                epoch_index=epoch_index,
+                train_batches=train_batches,
+                batch_log_every=batch_log_every,
+                evaluate_train_each_epoch=evaluate_train_each_epoch,
             )
-
-            validation_loader = getattr(task, "validation_loader", None)
-            record_epoch = evaluate_train_each_epoch or validation_loader is not None
-            if record_epoch:
-                evaluation_started = time.perf_counter()
-                train_metrics: Dict[str, object] = {}
-                validation_metrics: Dict[str, object] = {}
-                saved_training_rng = self.rng_key
-                try:
-                    if evaluate_train_each_epoch:
-                        train_metrics = self.evaluate_loader(
-                            task,
-                            task.train_loader,
-                            nonshared,
-                            split_name="train",
-                            mode=f"epoch_{epoch_idx + 1}",
-                            refresh_certificates=False,
-                        )
-                    if validation_loader is not None:
-                        validation_metrics = self.evaluate_loader(
-                            task,
-                            validation_loader,
-                            nonshared,
-                            split_name="validation",
-                            mode=f"epoch_{epoch_idx + 1}",
-                            refresh_certificates=False,
-                        )
-                finally:
-                    # Epoch evaluation must not perturb later training randomness.
-                    self.rng_key = saved_training_rng
-
-                evaluation_seconds = time.perf_counter() - evaluation_started
-                self._record_timing(
-                    task.task_id,
-                    f"epoch_{epoch_idx + 1}_evaluation_seconds",
-                    evaluation_seconds,
-                )
-                loss_denominator = max(epoch_examples, 1)
-                epoch_record = {
-                    "task_id": task.task_id,
-                    "epoch": epoch_idx + 1,
-                    "global_step": self.persistent_state.global_step,
-                    "epoch_update_count": (
-                        self.persistent_state.global_step - epoch_start_step
-                    ),
-                    "epoch_examples": epoch_examples,
-                    "optimization_loss_components": {
-                        name: value / loss_denominator
-                        for name, value in epoch_loss_sums.items()
-                    },
-                    "train_metrics": train_metrics,
-                    "validation_metrics": validation_metrics,
-                    "training_seconds": training_seconds,
-                    "evaluation_seconds": evaluation_seconds,
-                    "epoch_seconds": time.perf_counter() - epoch_started,
-                    "active_support": self.active_full_support(nonshared),
-                    "heldout_refresh_certificates": False,
-                }
-                self.persistent_state.epoch_evaluations.append(epoch_record)
-                if self.run_root is not None:
-                    append_event(self.run_root, "epoch_validation", **epoch_record)
 
         self.freeze_task_support(task.task_id)
         if self.cfg.reporting.write_selector_state:
@@ -1083,29 +834,62 @@ class HiBaCaMLTrainer:
             )
         return summary
 
-    def _evaluate_batch_details(
+    def _prepare_evaluation_batch(
         self,
-        task: MnistTask,
         batch: Dict[str, jnp.ndarray],
-        nonshared: Sequence[int],
-        params=None,
+        task: MnistTask,
+        supports: Sequence[Sequence[int]],
         *,
+        params,
+        refresh_certificates: bool,
+    ):
+        """Build target-free clamps and external targets for ordered supports."""
+        if not supports:
+            raise ValueError("evaluation requires at least one support")
+        if len(supports) == 1:
+            clamps = self._build_clamps(
+                batch,
+                task,
+                supports[0],
+                params=params,
+                refresh_certificates=refresh_certificates,
+                include_targets=False,
+            )
+        else:
+            clamps = self._build_multi_support_clamps(
+                batch,
+                task,
+                supports,
+                params=params,
+                refresh_certificates=refresh_certificates,
+                include_targets=False,
+            )
+        targets = batch_targets(batch, repeats=len(supports))
+        return clamps, targets
+
+    def _evaluate_supports_batch(
+        self,
+        batch: Dict[str, jnp.ndarray],
+        task: MnistTask,
+        supports: Sequence[Sequence[int]],
+        *,
+        params=None,
         refresh_certificates: bool = True,
     ):
-        """Return one target-free batch plus its already-computed details."""
-
+        """Execute one prepared target-free batch for ordered supports."""
+        support_list = tuple(tuple(sorted(support)) for support in supports)
+        if not support_list:
+            raise ValueError("evaluation requires at least one support")
         params = params if params is not None else self.params
-        clamps = self._build_clamps(
+        clamps, targets = self._prepare_evaluation_batch(
             batch,
             task,
-            nonshared,
+            support_list,
             params=params,
             refresh_certificates=refresh_certificates,
-            include_targets=False,
         )
-        targets = _batch_targets(batch)
         self.rng_key, state_key = jax.random.split(self.rng_key)
-        details = self._jit_eval_batch(
+        details = self._evaluate_prepared_batch(
             params,
             clamps,
             targets,
@@ -1125,10 +909,10 @@ class HiBaCaMLTrainer:
         refresh_certificates: bool = True,
     ):
         """Return target-free predictions and externally scored losses."""
-        logits, per_sample_total, _, _ = self._evaluate_batch_details(
-            task,
+        logits, per_sample_total, _, _ = self._evaluate_supports_batch(
             batch,
-            nonshared,
+            task,
+            (nonshared,),
             params=params,
             refresh_certificates=refresh_certificates,
         )
@@ -1160,8 +944,9 @@ class HiBaCaMLTrainer:
         params=None,
         *,
         refresh_certificates: bool = True,
-    ):
-        support_list = [tuple(sorted(support)) for support in supports]
+    ) -> List[float]:
+        """Score one batch against several candidate supports, in order."""
+        support_list = tuple(supports)
         if not support_list:
             return []
         if len(support_list) == 1:
@@ -1174,43 +959,17 @@ class HiBaCaMLTrainer:
                     refresh_certificates=refresh_certificates,
                 )
             ]
-        params = params if params is not None else self.params
-        clamps = self._build_multi_support_clamps(
+        _, per_sample_total, _, _ = self._evaluate_supports_batch(
             batch,
             task,
             support_list,
             params=params,
             refresh_certificates=refresh_certificates,
-            include_targets=False,
         )
-        targets = _batch_targets(batch, repeats=len(support_list))
-        self.rng_key, state_key = jax.random.split(self.rng_key)
-        _, per_sample_total, _, _ = self._jit_eval_batch(
-            params,
-            clamps,
-            targets,
-            state_key,
-        )
-        jax.block_until_ready(per_sample_total)
-        batch_size = int(batch["x"].shape[0])
-        losses = per_sample_total.reshape(len(support_list), batch_size).mean(axis=1)
-        return [float(value) for value in losses]
-
-    def _evaluation_cache_key(
-        self,
-        task_id: int,
-        nonshared: Sequence[int],
-        mode: str,
-        split_name: str,
-        refresh_certificates: bool,
-    ) -> Tuple[int, int, Tuple[int, ...], str, str, bool]:
-        return (
-            self.persistent_state.params_revision,
-            task_id,
-            tuple(sorted(nonshared)),
-            mode,
-            split_name,
-            bool(refresh_certificates),
+        return support_mean_losses(
+            per_sample_total,
+            len(support_list),
+            int(batch["x"].shape[0]),
         )
 
     def evaluate_loader(
@@ -1236,117 +995,27 @@ class HiBaCaMLTrainer:
             )
         nonshared = tuple(sorted(nonshared))
         mode = mode or "current"
-
-        # TODO: Make this cache certificate- and loader-aware before adaptive/controller runs.
-        cache_key = self._evaluation_cache_key(
-            task.task_id,
-            nonshared,
-            mode,
-            split_name,
-            refresh_certificates,
+        accumulator = EvaluationAccumulator(
+            task.output_dim,
+            self.cfg.column_pool.total_columns,
         )
-        if self.cfg.exact_search.cache_evaluations and cache_key in self._eval_cache:
-            return dict(self._eval_cache[cache_key])
-
-        loss_names = (
-            "task",
-            "hier_mid",
-            "hier_global",
-            "parent_child",
-            "composer",
-            "total",
-        )
-        loss_sums = jnp.zeros((len(loss_names),), dtype=jnp.float32)
-        gate_sums = jnp.zeros(
-            (self.cfg.column_pool.total_columns,),
-            dtype=jnp.float32,
-        )
-        selection_counts = jnp.zeros_like(gate_sums)
-        confusion = jnp.zeros(
-            (task.output_dim, task.output_dim),
-            dtype=jnp.int32,
-        )
-        # Per-batch composer scalars cross to the host in one device_get rather
-        # than seven separate blocking reads. Accumulation stays in Python floats
-        # at the established order and dtype, so the reported means are unchanged.
-        composer_names = (
-            "gate_entropy",
-            "top1_mass",
-            "effective_k",
-            "gate_dev",
-            "prior_kl",
-        )
-        composer_sums = dict.fromkeys(composer_names, 0.0)
-        correct = 0
-        total = 0
-        max_selected_columns = 0
         refresh_next = bool(refresh_certificates)
 
         for batch in loader:
-            logits, _, losses, composer = self._evaluate_batch_details(
-                task,
+            details = self._evaluate_supports_batch(
                 batch,
-                nonshared,
+                task,
+                (nonshared,),
                 refresh_certificates=refresh_next,
             )
             refresh_next = False
-            batch_size = int(logits.shape[0])
-            pred = jnp.argmax(logits, axis=-1)
-            target = jnp.argmax(jnp.asarray(batch["y"]), axis=-1)
-            total += batch_size
-            confusion = confusion.at[target, pred].add(1)
-            loss_sums = loss_sums + losses * batch_size
+            accumulator.add(batch, details)
 
-            gate_probs = composer["gate_probs"]
-            selected = gate_probs > 0.0
-            gate_sums = gate_sums + jnp.sum(gate_probs, axis=0)
-            selection_counts = selection_counts + jnp.sum(selected, axis=0)
-
-            batch_scalars = jax.device_get(
-                tuple(jnp.sum(composer[name]) for name in composer_names)
-                + (jnp.sum(pred == target), jnp.max(jnp.sum(selected, axis=-1)))
-            )
-            for index, name in enumerate(composer_names):
-                composer_sums[name] += float(batch_scalars[index])
-            correct += int(batch_scalars[-2])
-            max_selected_columns = max(max_selected_columns, int(batch_scalars[-1]))
-
-        denominator = max(total, 1)
-        component_means = loss_sums / denominator
-        per_class_precision, per_class_recall = _per_class_metrics_from_confusion(
-            confusion,
+        return accumulator.finalize(
+            split_name,
+            mode,
+            refresh_certificates,
         )
-        loss_components = {
-            name: float(component_means[index])
-            for index, name in enumerate(loss_names)
-        }
-        metrics = {
-            "split_name": split_name,
-            "mode": mode,
-            "accuracy": correct / denominator,
-            "cross_entropy": loss_components["task"],
-            "mean_loss": loss_components["total"],
-            "loss_components": loss_components,
-            "num_examples": int(total),
-            "correct_examples": int(correct),
-            "confusion_matrix": confusion.tolist(),
-            "per_class_recall": per_class_recall.tolist(),
-            "per_class_precision": per_class_precision.tolist(),
-            "column_gate_mean": (gate_sums / denominator).tolist(),
-            "column_selection_fraction": (
-                selection_counts / denominator
-            ).tolist(),
-            "gate_entropy": composer_sums["gate_entropy"] / denominator,
-            "top1_mass": composer_sums["top1_mass"] / denominator,
-            "effective_k": composer_sums["effective_k"] / denominator,
-            "gate_deviation": composer_sums["gate_dev"] / denominator,
-            "prior_kl": composer_sums["prior_kl"] / denominator,
-            "max_selected_columns": int(max_selected_columns),
-            "refresh_certificates": bool(refresh_certificates),
-        }
-        if self.cfg.exact_search.cache_evaluations:
-            self._eval_cache[cache_key] = dict(metrics)
-        return metrics
 
     def _support_usage_entropy(self, *, extra_support: Optional[Sequence[int]] = None) -> float:
         supports = [
@@ -1362,31 +1031,6 @@ class HiBaCaMLTrainer:
         probs = counts / jnp.maximum(jnp.sum(counts), 1.0)
         active = probs > 0.0
         return float(-jnp.sum(jnp.where(active, probs * jnp.log(probs + 1e-8), 0.0)))
-
-    def _support_diagnostics(self) -> Dict[str, object]:
-        snapshots = self.persistent_state.task_support_snapshots
-        supports = {task_id: tuple(snapshot.nonshared) for task_id, snapshot in sorted(snapshots.items())}
-        counts = {idx: 0 for idx in range(self.cfg.column_pool.total_columns)}
-        for support in supports.values():
-            for col in support:
-                counts[col] += 1
-        pairwise = []
-        for left_id, right_id in itertools.combinations(sorted(supports), 2):
-            left = set(supports[left_id])
-            right = set(supports[right_id])
-            pairwise.append(
-                {
-                    "left_task_id": left_id,
-                    "right_task_id": right_id,
-                    "jaccard": float(len(left & right) / max(len(left | right), 1)),
-                }
-            )
-        return {
-            "support_usage_entropy": self._support_usage_entropy(),
-            "column_usage_counts": counts,
-            "pairwise_jaccard": pairwise,
-            "support_sequence": {task_id: list(snapshot.full_support) for task_id, snapshot in sorted(snapshots.items())},
-        }
 
     def evaluate_task(
         self,
@@ -1447,85 +1091,3 @@ class HiBaCaMLTrainer:
                 refresh_certificates=refresh_certificates,
             )
         return results
-
-    def export_task_artifacts(
-        self,
-        task_id: int,
-        root: Optional[str | Path] = None,
-        *,
-        refresh_evaluation_certificates: bool = True,
-    ) -> Path:
-        run_root = Path(root) if root is not None else self.cfg.experiment_root_path() / f"task_{task_id}"
-        log_progress(f"export task={task_id} start root={run_root}", component="report")
-        if self.run_root is not None:
-            append_event(self.run_root, "export_start", task_id=task_id, root=str(run_root))
-        run_root.mkdir(parents=True, exist_ok=True)
-        export_run_artifacts(
-            self.snapshot(
-                refresh_evaluation_certificates=refresh_evaluation_certificates,
-            ),
-            run_root,
-        )
-        log_progress(f"export task={task_id} done root={run_root}", component="report")
-        if self.run_root is not None:
-            append_event(self.run_root, "export_done", task_id=task_id, root=str(run_root))
-        return run_root
-
-    def snapshot(
-        self,
-        *,
-        refresh_evaluation_certificates: bool = True,
-    ) -> Dict[str, object]:
-        return {
-            "cfg": self.cfg.to_dict(),
-            "current_support": self.persistent_state.current_support,
-            "boundary_support": self.persistent_state.boundary_support,
-            "support_tables": self.persistent_state.support_tables,
-            "support_posterior_tables": self.persistent_state.support_posterior_tables,
-            "reserve_recruitment_tables": self.persistent_state.reserve_recruitment_tables,
-            "controller_tables": self.persistent_state.controller_tables,
-            "local_swap_tables": self.persistent_state.local_swap_tables,
-            "demotion_swap_tables": self.persistent_state.demotion_swap_tables,
-            "replay_proposals": self.persistent_state.replay_proposals,
-            "recently_demoted": self.persistent_state.recently_demoted,
-            "certificates": self.persistent_state.certificates,
-            "task_support_snapshots": self.persistent_state.task_support_snapshots,
-            "support_sequence": {
-                task_id: snapshot.full_support
-                for task_id, snapshot in sorted(self.persistent_state.task_support_snapshots.items())
-            },
-            "phi_trajectory": {
-                task_id: snapshot.phi
-                for task_id, snapshot in sorted(self.persistent_state.task_support_snapshots.items())
-            },
-            "evaluations": self.evaluate_all_saved_supports(
-                refresh_certificates=refresh_evaluation_certificates,
-            ),
-            "global_step": self.persistent_state.global_step,
-            "params_revision": self.persistent_state.params_revision,
-            "timing_summaries": self.persistent_state.timing_summaries,
-            "support_diagnostics": self._support_diagnostics(),
-            "composer_diagnostics": self.persistent_state.composer_diagnostics,
-            "epoch_evaluations": self.persistent_state.epoch_evaluations,
-            "selector_bank_summary": self.selector_bank.summary(),
-            "run_id": self.run_id,
-            "experiment_metadata": self.experiment_metadata,
-            "evaluation_protocol": "target_free_inference_external_supervision_v1",
-        }
-
-    def save_checkpoint(self, task_id: int, root: Optional[str | Path] = None) -> Path:
-        checkpoint_root = Path(root) if root is not None else self.cfg.experiment_root_path()
-        checkpoint_root.mkdir(parents=True, exist_ok=True)
-        path = checkpoint_root / self.cfg.reporting.checkpoint_filename
-        payload = {
-            "task_id": task_id,
-            "persistent_state": self.persistent_state,
-            "params": self.params,
-            "opt_state": self.opt_state,
-            "experiment_metadata": self.experiment_metadata,
-        }
-        with path.open("wb") as fh:
-            pickle.dump(payload, fh)
-        if self.run_root is not None:
-            append_event(self.run_root, "checkpoint_saved", task_id=task_id, path=str(path))
-        return path

@@ -112,8 +112,6 @@ class ExactSearchConfig:
     controller_l1_penalty: float = 0.01
     local_swap_margin: float = 0.005
     maintenance_interval: int = 64
-    cache_evaluations: bool = True
-    rollout_gradient_mode: str = "trainer"
     certificate_support_weight: float = 0.0
     support_posterior_temperature: float = 1.0
     reserve_saturation_threshold: float = 0.85

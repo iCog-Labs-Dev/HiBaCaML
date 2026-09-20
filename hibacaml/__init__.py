@@ -16,7 +16,11 @@ from hibacaml.data import build_full_mnist_task, build_split_mnist_tasks
 from hibacaml.experiment import build_trainer, prepare_run_root
 from hibacaml.graph import create_hibacaml_structure, initialize_hibacaml_state
 from hibacaml.reporting import export_run_artifacts
-from hibacaml.training import HiBaCaMLBackpropRunner, HiBaCaMLTrainer
+from hibacaml.training import (
+    HiBaCaMLBackpropTrainer,
+    HiBaCaMLPCTrainer,
+    HiBaCaMLTrainer,
+)
 from hibacaml.types import (
     BoundaryBundle,
     ColumnCertificate,
@@ -48,8 +52,9 @@ __all__ = [
     "ExactSearchConfig",
     "ExactSearchService",
     "export_run_artifacts",
-    "HiBaCaMLBackpropRunner",
+    "HiBaCaMLBackpropTrainer",
     "HiBaCaMLConfig",
+    "HiBaCaMLPCTrainer",
     "HiBaCaMLTrainer",
     "HierarchyConfig",
     "initialize_hibacaml_state",
