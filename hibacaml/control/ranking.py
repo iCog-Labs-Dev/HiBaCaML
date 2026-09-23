@@ -106,12 +106,14 @@ def reserve_recruitment_diagnostic(
         reason = "saturation_below_threshold"
     else:
         reason = "posterior_confident"
-    reserve_candidates = enumerate_reserve_recruitment_supports(cfg)
     return triggered, ReserveRecruitmentRow(
         task_id=task_id,
         triggered=triggered,
         adaptive_candidate_count=len(adaptive_rows),
-        reserve_candidate_count=len(reserve_candidates) if triggered else 0,
+        # Enumerated only once the gate opens; the count is zero otherwise.
+        reserve_candidate_count=(
+            len(enumerate_reserve_recruitment_supports(cfg)) if triggered else 0
+        ),
         saturation=float(saturation),
         posterior_entropy=float(entropy),
         top1_prob=float(top1_prob),
@@ -163,6 +165,15 @@ def phi_l1_distance(left, right) -> float:
         + abs(left.middle_quantile - right.middle_quantile)
         + abs(left.replacement_margin_base - right.replacement_margin_base)
         + abs(left.demotion_min_role_gain - right.demotion_min_role_gain)
+    )
+
+
+def rollout_trajectory_key(phi) -> Tuple[float, float, float]:
+    """The phi coordinates a rollout trajectory actually depends on."""
+    return (
+        phi.outer_quantile,
+        phi.middle_quantile,
+        phi.replacement_margin_base,
     )
 
 

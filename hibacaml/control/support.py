@@ -2,20 +2,17 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
 from itertools import combinations
 from typing import Sequence, Tuple
 
 import jax.numpy as jnp
 
-from hibacaml.config import HiBaCaMLConfig
+from hibacaml.config import ColumnPoolConfig, HiBaCaMLConfig
 
 
 def candidate_nonshared_pool(cfg: HiBaCaMLConfig) -> Tuple[int, ...]:
-    """Nonshared pool for ordinary support search.
-
-    V20.2b uses adaptive-only enumeration; reserves enter via the explicit
-    reserve-recruitment path in `enumerate_reserve_recruitment_supports`.
-    """
+    """Nonshared pool for ordinary support search."""
     return cfg.column_pool.adaptive_indices
 
 
@@ -24,9 +21,20 @@ def default_nonshared_support(cfg: HiBaCaMLConfig) -> Tuple[int, ...]:
     return tuple(candidate_nonshared_pool(cfg)[: cfg.column_pool.topk_nonshared])
 
 
+def _full_support(pool: ColumnPoolConfig, nonshared: Sequence[int]) -> Tuple[int, ...]:
+    return tuple(sorted(pool.shared_indices + tuple(nonshared)))
+
+
+@lru_cache(maxsize=1024)
+def _support_mask(pool: ColumnPoolConfig, full_support: Tuple[int, ...]) -> jnp.ndarray:
+    """Candidate scoring rebuilds the same masks; the pool is frozen, so memoize."""
+    mask = jnp.zeros((pool.total_columns,), dtype=jnp.float32)
+    return mask.at[jnp.array(full_support)].set(1.0)
+
+
 def build_full_support(cfg: HiBaCaMLConfig, nonshared: Sequence[int]) -> Tuple[int, ...]:
     """Return the sorted support including always-on shared columns."""
-    return tuple(sorted(cfg.column_pool.shared_indices + tuple(nonshared)))
+    return _full_support(cfg.column_pool, nonshared)
 
 
 def support_mask_from_nonshared(
@@ -34,9 +42,7 @@ def support_mask_from_nonshared(
     nonshared: Sequence[int],
 ) -> jnp.ndarray:
     """Return a boolean-valued support vector with shared columns forced on."""
-    mask = jnp.zeros((cfg.column_pool.total_columns,), dtype=jnp.float32)
-    indices = build_full_support(cfg, nonshared)
-    return mask.at[jnp.array(indices)].set(1.0)
+    return _support_mask(cfg.column_pool, _full_support(cfg.column_pool, nonshared))
 
 
 def enumerate_nonshared_supports(cfg: HiBaCaMLConfig) -> Tuple[Tuple[int, ...], ...]:
