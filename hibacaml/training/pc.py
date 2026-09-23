@@ -28,17 +28,16 @@ from hibacaml.training.shared import (
     parent_child_energy,
     per_sample_parent_child_from_state,
 )
-from hibacaml.training.trainer import HiBaCaMLTrainer
+from hibacaml.training.trainer import (
+    HiBaCaMLTrainer,
+    build_evaluation_programs,
+    build_update_programs,
+)
 from hibacaml.types import MnistTask
 
 
 def _targets_are_clamped(clamps, structure) -> bool:
-    """True when every supervised target is clamped, False when none is.
-
-    Training clamps all three; target-free evaluation clamps none. A partial set
-    is a malformed batch, and failing here beats training against a silently
-    truncated objective.
-    """
+    """True when every supervised target is clamped, False when none is."""
     names = (
         structure.task_map["y"],
         structure.task_map["hier_mid"],
@@ -91,11 +90,8 @@ def _predict_from_state(node_name, node_params, state, structure):
 
 
 def _push_prediction_cotangent(state, *, node_name, cotangent, params, structure):
-    """Send dE/dz_mu for one node back to the latents that produced it.
+    """Send dE/dz_mu for one node back to the latents that produced it."""
 
-    Mirrors FabricPC's own inference boundary: same input gathering, same muPC
-    scaling in and out, same accumulation into the sources' existing latent_grad.
-    """
     node_info = structure.nodes[node_name].node_info
     node_params = params.nodes[node_name]
     node_state = state.nodes[node_name]
@@ -129,8 +125,7 @@ def _add_parent_child_latent_gradients(params, state, structure):
     def energy(mid_prediction, global_prediction):
         return jnp.sum(parent_child_energy(mid_prediction, global_prediction, weight))
 
-    # Operands are z_mu. The hierarchy nodes are clamped during training, so
-    # their z_latent is the label.
+    # Operands are z_mu. The hierarchy nodes are clamped during training, so their z_latent is the label.
     mid_cotangent, global_cotangent = jax.grad(energy, argnums=(0, 1))(
         state.nodes[mid_name].z_mu,
         state.nodes[global_name].z_mu,
@@ -233,13 +228,8 @@ def _add_composer_weight_gradients(params, final_state, clamps, structure, grads
 
 
 def _add_full_native_weight_gradients(params, final_state, clamps, structure, grads):
-    """Add the two factors' local parameter gradients to FabricPC's own.
+    """Add the two factors' local parameter gradients to FabricPC's own."""
 
-    Each factor reaches only the parameters that produce its operands. Everything
-    upstream learns from the factors through the settling state they altered and
-    its ordinary local prediction errors, which is what keeps this predictive
-    coding rather than global backpropagation.
-    """
     grads = _add_parent_child_weight_gradients(params, final_state, structure, grads)
     return _add_composer_weight_gradients(
         params, final_state, clamps, structure, grads
@@ -247,12 +237,7 @@ def _add_full_native_weight_gradients(params, final_state, clamps, structure, gr
 
 
 class HiBaCaMLPCInference(InferenceSGD):
-    """FabricPC SGD inference extended with HiBaCaML's two auxiliary factors.
-
-    The factors act only when the supervised targets are clamped, which is
-    exactly training. Clamp keys are static under tracing, so each compiled
-    program resolves that branch once.
-    """
+    """FabricPC SGD inference extended with HiBaCaML's two auxiliary factors."""
 
     @staticmethod
     def forward_value_and_grad(params, state, clamps, structure):
@@ -320,10 +305,7 @@ def _eval_batch_step(
 class HiBaCaMLPCTrainer(HiBaCaMLTrainer):
     """Sequential trainer using FabricPC settling and local weight gradients."""
 
-    # Preserve the established learner-specific objective addition order.
     COMPOSER_BEFORE_PARENT = False
-
-    # Training clamps supervised targets; evaluation omits them.
     CLAMPS_MAY_INCLUDE_TARGETS = True
 
     @classmethod
@@ -336,13 +318,34 @@ class HiBaCaMLPCTrainer(HiBaCaMLTrainer):
                 f"{cls.__name__} requires a graph built with HiBaCaMLPCInference; "
                 f"got {type(inference).__name__}"
             )
-        return {
-            "gradients": jax.jit(
-                lambda params, clamps, rng_key: _pc_gradient_step(
-                    params, clamps, structure, rng_key
-                )
+        programs = build_update_programs(
+            lambda params, inputs, rng_key: _pc_gradient_step(
+                params,
+                inputs["clamps"],
+                structure,
+                rng_key,
             ),
-            "evaluation": jax.jit(
+            structure,
+            optimizer,
+            cfg,
+            allow_lean=False,
+        )
+        programs["gradients"] = jax.jit(
+            lambda params, clamps, rng_key: _pc_gradient_step(
+                params,
+                clamps,
+                structure,
+                rng_key,
+            )
+        )
+        programs.update(
+            build_evaluation_programs(
+                lambda params, clamps, rng_key: _run_inference_step(
+                    params,
+                    clamps,
+                    structure,
+                    rng_key,
+                ),
                 lambda params, clamps, targets, rng_key: _eval_batch_step(
                     params,
                     clamps,
@@ -350,14 +353,10 @@ class HiBaCaMLPCTrainer(HiBaCaMLTrainer):
                     structure,
                     rng_key,
                     composer_before_parent=cls.COMPOSER_BEFORE_PARENT,
-                )
-            ),
-            "inference": jax.jit(
-                lambda params, clamps, rng_key: _run_inference_step(
-                    params, clamps, structure, rng_key
-                )
-            ),
-        }
+                ),
+            )
+        )
+        return programs
 
     def _training_inputs(
         self,
@@ -378,9 +377,3 @@ class HiBaCaMLPCTrainer(HiBaCaMLTrainer):
 
     def _gradients(self, params, inputs, rng_key):
         return self._programs["gradients"](params, inputs["clamps"], rng_key)
-
-    def _run_evaluation_inference(self, params, clamps, rng_key):
-        return self._programs["inference"](params, clamps, rng_key)
-
-    def _evaluate_prepared_batch(self, params, clamps, targets, rng_key):
-        return self._programs["evaluation"](params, clamps, targets, rng_key)

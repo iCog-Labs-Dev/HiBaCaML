@@ -2,31 +2,36 @@
 
 from __future__ import annotations
 
-from typing import Dict, Sequence
+from typing import Dict
 
 import jax
 import jax.numpy as jnp
 
 from hibacaml.nodes.composer import composer_details
-from hibacaml.types import MnistTask
 
 # --------------------------------------------------------------------------
 # Clamp assembly
 # --------------------------------------------------------------------------
 
-def batch_query(task: MnistTask, batch_size: int) -> jnp.ndarray:
-    """Broadcast a task's one-hot query across a batch."""
-    
-    return jnp.broadcast_to(
-        jnp.asarray(task.task_query, dtype=jnp.float32),
-        (batch_size, task.task_query.shape[0]),
-    )
+def batch_query(task_query: jnp.ndarray, batch_size: int) -> jnp.ndarray:
+    """Broadcast a device-resident task query across a batch."""
+    return jnp.broadcast_to(task_query, (batch_size, task_query.shape[0]))
+
+
+def _repeat_per_support(rows: jnp.ndarray, batch_size: int) -> jnp.ndarray:
+    """Repeat each support's row across the batch, supports outermost."""
+    return jnp.repeat(rows, batch_size, axis=0)
+
+
+def tile_batch(value: jnp.ndarray, repeats: int) -> jnp.ndarray:
+    """Repeat a whole batch support-major."""
+    return jnp.tile(value, (repeats,) + (1,) * (value.ndim - 1))
 
 
 def build_single_support_clamps(
     structure,
     batch: Dict[str, jnp.ndarray],
-    task: MnistTask,
+    task_query: jnp.ndarray,
     support_mask: jnp.ndarray,
     cert_vectors: Dict[int, jnp.ndarray],
     *,
@@ -39,7 +44,7 @@ def build_single_support_clamps(
     clamps = {
         structure.task_map["x"]: jnp.asarray(batch["x"], dtype=jnp.float32),
         meta["support_mask_node"]: jnp.broadcast_to(support_mask, (batch_size, support_mask.shape[0])),
-        meta["task_query_node"]: batch_query(task, batch_size),
+        meta["task_query_node"]: batch_query(task_query, batch_size),
     }
     if include_targets:
         clamps.update(
@@ -64,9 +69,10 @@ def build_single_support_clamps(
 def build_multi_support_clamps(
     structure,
     batch: Dict[str, jnp.ndarray],
-    task: MnistTask,
-    support_masks: Sequence[jnp.ndarray],
-    cert_matrices: Sequence[Dict[int, jnp.ndarray]],
+    task_query: jnp.ndarray,
+    images: jnp.ndarray,
+    support_masks: jnp.ndarray,
+    cert_stack: jnp.ndarray,
     *,
     include_targets: bool,
 ) -> Dict[str, jnp.ndarray]:
@@ -74,47 +80,23 @@ def build_multi_support_clamps(
 
     meta = structure.config["hibacaml"]
     batch_size = int(batch["x"].shape[0])
-    supports_count = len(support_masks)
-    total_batch = batch_size * supports_count
+    supports_count = int(support_masks.shape[0])
     clamps = {
-        structure.task_map["x"]: jnp.concatenate(
-            [jnp.asarray(batch["x"], dtype=jnp.float32)] * supports_count,
-            axis=0,
-        ),
-        meta["support_mask_node"]: jnp.concatenate(
-            [jnp.broadcast_to(mask, (batch_size, mask.shape[0])) for mask in support_masks],
-            axis=0,
-        ),
-        meta["task_query_node"]: batch_query(task, total_batch),
+        structure.task_map["x"]: images,
+        meta["support_mask_node"]: _repeat_per_support(support_masks, batch_size),
+        meta["task_query_node"]: batch_query(task_query, batch_size * supports_count),
     }
     if include_targets:
         clamps.update(
             {
-                structure.task_map["y"]: jnp.concatenate(
-                    [jnp.asarray(batch["y"], dtype=jnp.float32)]
-                    * supports_count,
-                    axis=0,
-                ),
-                structure.task_map["hier_mid"]: jnp.concatenate(
-                    [jnp.asarray(batch["hier_mid"], dtype=jnp.float32)]
-                    * supports_count,
-                    axis=0,
-                ),
-                structure.task_map["hier_global"]: jnp.concatenate(
-                    [jnp.asarray(batch["hier_global"], dtype=jnp.float32)]
-                    * supports_count,
-                    axis=0,
-                ),
+                structure.task_map[name]: tile_batch(
+                    jnp.asarray(batch[name], dtype=jnp.float32), supports_count
+                )
+                for name in ("y", "hier_mid", "hier_global")
             }
         )
     for column_index, node_name in meta["cert_input_names"].items():
-        clamps[node_name] = jnp.concatenate(
-            [
-                jnp.broadcast_to(matrix[column_index], (batch_size, matrix[column_index].shape[0]))
-                for matrix in cert_matrices
-            ],
-            axis=0,
-        )
+        clamps[node_name] = _repeat_per_support(cert_stack[:, column_index, :], batch_size)
     return clamps
 
 # --------------------------------------------------------------------------
@@ -128,13 +110,8 @@ def composer_feature_gate_names(structure):
 
 
 def composer_context(params, state, clamps, structure, *, feature_predictions=None):
-    """Assemble the composer's inputs as ``composer_details`` takes them.
-
-    One builder for every caller -- backprop, evaluation, reporting, and the PC
-    auxiliary factor -- so they cannot drift apart. ``feature_predictions``
-    overrides the stacked feature-gate predictions; only the PC weight-gradient
-    phase supplies it, recomputing them from settled inputs.
-    """
+    """Assemble the composer's inputs as ``composer_details`` takes them."""
+    
     meta = structure.config["hibacaml"]
     composer_name = meta["composer_node"]
     if feature_predictions is None:
@@ -206,6 +183,7 @@ def loss_vector_from_state(
 
 
 def loss_dict_from_vector(losses: jnp.ndarray) -> Dict[str, float]:
+    losses = jax.device_get(losses)
     return {
         "task": float(losses[0]),
         "hier_mid": float(losses[1]),
@@ -375,6 +353,7 @@ def support_mean_losses(
             f"{actual} entries; expected {support_count} * {batch_size} = {expected}"
         )
     means = per_sample_total.reshape(support_count, batch_size).mean(axis=1)
+    means = jax.device_get(means)
     return [float(value) for value in means]
 
 
@@ -440,6 +419,23 @@ class EvaluationAccumulator:
         denominator = max(self.example_count, 1)
         component_means = self.loss_sums / denominator
         precision, recall = per_class_metrics_from_confusion(self.confusion)
+        (
+            component_means,
+            confusion,
+            recall,
+            precision,
+            gate_means,
+            selection_fractions,
+        ) = jax.device_get(
+            (
+                component_means,
+                self.confusion,
+                recall,
+                precision,
+                self.gate_sums / denominator,
+                self.selection_counts / denominator,
+            )
+        )
         loss_components = {
             name: float(component_means[index])
             for index, name in enumerate(LOSS_NAMES)
@@ -453,13 +449,11 @@ class EvaluationAccumulator:
             "loss_components": loss_components,
             "num_examples": int(self.example_count),
             "correct_examples": int(self.correct),
-            "confusion_matrix": self.confusion.tolist(),
+            "confusion_matrix": confusion.tolist(),
             "per_class_recall": recall.tolist(),
             "per_class_precision": precision.tolist(),
-            "column_gate_mean": (self.gate_sums / denominator).tolist(),
-            "column_selection_fraction": (
-                self.selection_counts / denominator
-            ).tolist(),
+            "column_gate_mean": gate_means.tolist(),
+            "column_selection_fraction": selection_fractions.tolist(),
             "gate_entropy": self.composer_sums["gate_entropy"] / denominator,
             "top1_mass": self.composer_sums["top1_mass"] / denominator,
             "effective_k": self.composer_sums["effective_k"] / denominator,
