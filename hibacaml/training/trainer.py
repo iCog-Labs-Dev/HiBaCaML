@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import copy
 import itertools
 import time
 from abc import ABC, abstractmethod
+from functools import cached_property
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -35,6 +35,7 @@ from hibacaml.training.shared import (
     build_single_support_clamps,
     loss_dict_from_vector,
     support_mean_losses,
+    tile_batch,
 )
 from hibacaml.reporting import (
     append_event,
@@ -45,11 +46,93 @@ from hibacaml.reporting.export import write_json
 from hibacaml.types import (
     MnistTask,
     PersistentHiBaCaMLState,
+    clone_persistent_state,
     SupportSnapshot,
     TaskSummary,
 )
 
 _TRAINER_INSTANCE_COUNTER = itertools.count()
+
+
+def _mask_gradients(grads, support_mask, node_column_index):
+    masked_nodes = {}
+    for node_name, node_grads in grads.nodes.items():
+        column_index = node_column_index.get(node_name)
+        if column_index is None:
+            masked_nodes[node_name] = node_grads
+            continue
+        active = support_mask[column_index] > 0.0
+        masked_nodes[node_name] = jax.tree_util.tree_map(
+            lambda grad: jnp.where(active, grad, jnp.zeros_like(grad)),
+            node_grads,
+        )
+    return grads._replace(nodes=masked_nodes)
+
+
+def build_update_programs(
+    gradient_step,
+    structure,
+    optimizer,
+    cfg,
+    *,
+    allow_lean,
+):
+    node_column_index = {
+        name: int(name.split("/")[0][3:])
+        for name in structure.nodes
+        if name.startswith("col")
+    }
+    support_mask_node = structure.config["hibacaml"]["support_mask_node"]
+    shell_names = tuple(shell_slices(cfg))
+    resistance_enabled = cfg.exact_search.enable_precision_update_resistance
+    resistance_strength = cfg.exact_search.precision_update_strength
+    resistance_floor = cfg.exact_search.precision_update_floor
+
+    def update_core(params, opt_state, inputs, rng_key):
+        grads, loss_vector, final_state = gradient_step(params, inputs, rng_key)
+        grads = _mask_gradients(
+            grads,
+            inputs["clamps"][support_mask_node][0],
+            node_column_index,
+        )
+        grads = precision_weight_gradients(
+            grads,
+            params,
+            shell_names=shell_names,
+            enabled=resistance_enabled,
+            strength=resistance_strength,
+            floor=resistance_floor,
+        )
+        updates, new_opt_state = optimizer.update(grads, opt_state, params)
+        new_params = optax.apply_updates(params, updates)
+        return new_params, new_opt_state, loss_vector, final_state
+
+    programs = {"update": jax.jit(update_core)}
+    if allow_lean:
+        def update_lean(params, opt_state, inputs, rng_key):
+            return update_core(params, opt_state, inputs, rng_key)[:3]
+
+        programs["update_lean"] = jax.jit(update_lean)
+    return programs
+
+
+def build_evaluation_programs(inference_step, evaluation_step):
+    def score_core(params, clamps, targets, rng_key):
+        result = evaluation_step(params, clamps, targets, rng_key)
+        # Retaining the device-only loss vector preserves detailed-path arithmetic.
+        return result[1], result[2]
+
+    compiled_score = jax.jit(score_core)
+
+    def evaluation_score(params, clamps, targets, rng_key):
+        per_sample_total, _ = compiled_score(params, clamps, targets, rng_key)
+        return per_sample_total
+
+    return {
+        "inference": jax.jit(inference_step),
+        "evaluation": jax.jit(evaluation_step),
+        "evaluation_score": evaluation_score,
+    }
 
 
 class HiBaCaMLTrainer(ABC):
@@ -78,12 +161,6 @@ class HiBaCaMLTrainer(ABC):
         self.structure = structure
         # Unique identifier for this trainer instance.
         self.instance_id = next(_TRAINER_INSTANCE_COUNTER)
-        # Parsed once: _mask_grads would otherwise re-split every node name each step.
-        self._node_column_index = {
-            name: int(name.split("/")[0][3:])
-            for name in structure.nodes
-            if name.startswith("col")
-        }
         graph_state_initializer = structure.config.get("graph_state_initializer")
         if not isinstance(graph_state_initializer, FeedforwardStateInit):
             raise ValueError(
@@ -94,13 +171,15 @@ class HiBaCaMLTrainer(ABC):
         self.experiment_metadata = dict(experiment_metadata or {})
         self.rng_key = rng_key if rng_key is not None else jax.random.PRNGKey(cfg.seed)
         self.optimizer = optimizer or optax.adamw(cfg.optimizer_lr, weight_decay=cfg.weight_decay)
-        # Rollout clones supply the parent's state; initializing here would allocate a
-        # full zeros tree (adamw mu + nu) only to have it overwritten.
+        # Rollout clones supply the parent's state; initializing here would allocate a full zeros tree (adamw mu + nu) only to have it overwritten.
         self.opt_state = opt_state if opt_state is not None else self.optimizer.init(params)
         self.persistent_state = persistent_state or initialize_hibacaml_state(params, cfg)
         self.persistent_state.params = self.params
         self.persistent_state.opt_state = self.opt_state
         self.tasks: Dict[int, MnistTask] = {}
+        self._task_queries: Dict[int, jnp.ndarray] = {}
+        # Support-invariant tiled images reused across candidate chunks; a bundle's two eval batches are the whole working set.
+        self._tiled_images: Dict[Tuple[int, int], Tuple[jnp.ndarray, jnp.ndarray]] = {}
         self.current_phi = cfg.phi
         self.current_nonshared = default_nonshared_support(cfg)
         self._programs = (
@@ -110,8 +189,7 @@ class HiBaCaMLTrainer(ABC):
         )
         self.certificate_controller = CertificateController(cfg, structure)
         self.shell_controller = ShellController(cfg, self.certificate_controller)
-        # Rollout clones get no run root, which is what keeps their events out
-        # of the audit stream.
+        # Rollout clones get no run root, which is what keeps their events out of the audit stream.
         self.run_root: Optional[Path] = (
             Path(cfg.reporting.experiment_root) if emit_run_artifacts else None
         )
@@ -130,25 +208,29 @@ class HiBaCaMLTrainer(ABC):
             )
             selector_bank.load()
         self.selector_bank = selector_bank
-        self.exact_search = ExactSearchService(
-            cfg,
+
+    @cached_property
+    def exact_search(self) -> ExactSearchService:
+        """Built on first use: the service holds the trainer, so an eager
+        instance would put every rollout clone in a reference cycle."""
+        return ExactSearchService(
+            self.cfg,
             self,
             selector_bank=self.selector_bank,
             run_id=self.run_id,
         )
 
     @classmethod
-    def build_programs(cls, structure, optimizer, cfg) -> Optional[Dict[str, Callable]]:
-        """Compiled programs this learner reuses, or None when it has none.
-
-        Predictive coding compiles its settling and evaluation programs once per
-        graph; backprop executes eagerly and keeps this None.
-        """
-        return None
+    @abstractmethod
+    def build_programs(cls, structure, optimizer, cfg) -> Dict[str, Callable]:
+        """Return compiled programs reused by this learner."""
 
     def register_tasks(self, tasks: Sequence[MnistTask]) -> None:
         for task in tasks:
             self.tasks[task.task_id] = task
+            self._task_queries[task.task_id] = jnp.asarray(
+                task.task_query, dtype=jnp.float32
+            )
 
     def clone(self) -> "HiBaCaMLTrainer":
         # JAX arrays are immutable — any update (apply_updates, structural edits)
@@ -156,20 +238,7 @@ class HiBaCaMLTrainer(ABC):
         # leaves via tree_map is safe and avoids copying the full weight tensors
         # for every rollout candidate.
 
-        ps = self.persistent_state
-        saved_ps_params = ps.params
-        saved_ps_opt = ps.opt_state
-        saved_epoch_evaluations = ps.epoch_evaluations
-        ps.params = None
-        ps.opt_state = None
-        ps.epoch_evaluations = []
-        try:
-            ps_clone = copy.deepcopy(ps)
-        finally:
-            ps.params = saved_ps_params
-            ps.opt_state = saved_ps_opt
-            ps.epoch_evaluations = saved_epoch_evaluations
-
+        ps_clone = clone_persistent_state(self.persistent_state)
         cloned = type(self)(
             cfg=self.cfg,                                               # frozen dataclass
             structure=self.structure,
@@ -190,6 +259,12 @@ class HiBaCaMLTrainer(ABC):
         cloned.current_phi = self.current_phi                          # frozen dataclass
         cloned.current_nonshared = tuple(self.current_nonshared)
         return cloned
+
+    def resume_clone(self) -> "HiBaCaMLTrainer":
+        """Clone that continues this trainer's trajectory."""
+        resumed = self.clone()
+        resumed._last_graph_state = getattr(self, "_last_graph_state", None)
+        return resumed
 
     def _record_timing(
         self,
@@ -276,6 +351,27 @@ class HiBaCaMLTrainer(ABC):
         state = graph_state if graph_state is not None else self._last_graph_state_or_placeholder(batch_size)
         self.certificate_controller.refresh_certificates(params, state, self.persistent_state)
 
+    def _task_query(self, task: MnistTask) -> jnp.ndarray:
+        """Device-resident task query, converted once per registered task."""
+        query = self._task_queries.get(task.task_id)
+        if query is None:
+            query = jnp.asarray(task.task_query, dtype=jnp.float32)
+            self._task_queries[task.task_id] = query
+        return query
+
+    def _tiled_batch_images(self, batch: Dict[str, jnp.ndarray], repeats: int) -> jnp.ndarray:
+        """Support-major tiled images, reused across a sweep's candidate chunks."""
+        images = batch["x"]
+        key = (id(images), repeats)
+        cached = self._tiled_images.get(key)
+        if cached is not None and cached[0] is images:
+            return cached[1]
+        tiled = tile_batch(jnp.asarray(images, dtype=jnp.float32), repeats)
+        if len(self._tiled_images) >= 2:
+            self._tiled_images.clear()
+        self._tiled_images[key] = (images, tiled)
+        return tiled
+
     def _build_clamps(
         self,
         batch: Dict[str, jnp.ndarray],
@@ -300,7 +396,7 @@ class HiBaCaMLTrainer(ABC):
         return build_single_support_clamps(
             self.structure,
             batch,
-            task,
+            self._task_query(task),
             support_mask,
             cert_vectors,
             include_targets=include_targets,
@@ -325,19 +421,20 @@ class HiBaCaMLTrainer(ABC):
         batch_size = int(batch["x"].shape[0])
         if refresh_certificates:
             self._refresh_certificates(batch_size, params=params)
-        support_masks = [self.build_support_mask(nonshared) for nonshared in supports]
-        # The unmasked vectors are identical for every support; only the mask differs.
-        cert_base = self.certificate_controller.certificate_vectors(self.persistent_state)
-        cert_matrices = [
-            self.certificate_controller.mask_certificate_vectors(cert_base, support_mask)
-            for support_mask in support_masks
-        ]
+        support_masks = jnp.stack(
+            [self.build_support_mask(nonshared) for nonshared in supports]
+        )
+        # One certificate state masked for every support at once.
+        cert_stack = self.certificate_controller.certificate_stack_for_masks(
+            self.persistent_state, support_masks
+        )
         return build_multi_support_clamps(
             self.structure,
             batch,
-            task,
+            self._task_query(task),
+            self._tiled_batch_images(batch, len(supports)),
             support_masks,
-            cert_matrices,
+            cert_stack,
             include_targets=include_targets,
         )
 
@@ -359,13 +456,14 @@ class HiBaCaMLTrainer(ABC):
 
         return GraphState(nodes=zero_nodes, batch_size=batch_size)
 
-    @abstractmethod
     def _run_evaluation_inference(self, params, clamps, rng_key):
-        """Return this learner's target-free graph state."""
+        return self._programs["inference"](params, clamps, rng_key)
 
-    @abstractmethod
     def _evaluate_prepared_batch(self, params, clamps, targets, rng_key):
-        """Return ``(logits, per_sample_total, losses, composer)``."""
+        return self._programs["evaluation"](params, clamps, targets, rng_key)
+
+    def _score_prepared_batch(self, params, clamps, targets, rng_key):
+        return self._programs["evaluation_score"](params, clamps, targets, rng_key)
 
     def run_batch_evaluation_inference(
         self,
@@ -415,7 +513,7 @@ class HiBaCaMLTrainer(ABC):
             ],
             axis=1,
         )
-        query = batch_query(task, final_state.batch_size)
+        query = batch_query(self._task_query(task), final_state.batch_size)
         details = composer_details(
             self.params.nodes[meta["composer_node"]],
             features,
@@ -424,15 +522,27 @@ class HiBaCaMLTrainer(ABC):
             self.structure.nodes[meta["composer_node"]].node_info.node_config,
         )
         gate_probs = details["gate_probs"]
+        values = jax.device_get(
+            (
+                jnp.mean(details["gate_entropy"]),
+                jnp.mean(details["gate_dev"]),
+                jnp.mean(certs),
+                jnp.mean(details["prior_kl"]),
+                jnp.mean(details["top1_mass"]),
+                jnp.mean(details["effective_k"]),
+                jnp.max(gate_probs),
+                jnp.min(jnp.where(gate_probs > 0.0, gate_probs, 1.0)),
+            )
+        )
         return {
-            "gate_entropy": float(jnp.mean(details["gate_entropy"])),
-            "gate_deviation": float(jnp.mean(details["gate_dev"])),
-            "cert_prior_mean": float(jnp.mean(certs)),
-            "prior_kl": float(jnp.mean(details["prior_kl"])),
-            "top1_mass": float(jnp.mean(details["top1_mass"])),
-            "effective_k": float(jnp.mean(details["effective_k"])),
-            "gate_max": float(jnp.max(gate_probs)),
-            "gate_min_active": float(jnp.min(jnp.where(gate_probs > 0.0, gate_probs, 1.0))),
+            "gate_entropy": float(values[0]),
+            "gate_deviation": float(values[1]),
+            "cert_prior_mean": float(values[2]),
+            "prior_kl": float(values[3]),
+            "top1_mass": float(values[4]),
+            "effective_k": float(values[5]),
+            "gate_max": float(values[6]),
+            "gate_min_active": float(values[7]),
         }
 
     @abstractmethod
@@ -454,23 +564,34 @@ class HiBaCaMLTrainer(ABC):
         task: MnistTask,
         nonshared: Sequence[int],
     ):
-        """Run the shared gradient, masking, precision, and optimizer stages."""
+        """Run one state-producing learner update."""
+        return self._execute_training_update(
+            batch,
+            task,
+            nonshared,
+            need_state=True,
+        )
+
+    def _execute_training_update(
+        self,
+        batch: Dict[str, jnp.ndarray],
+        task: MnistTask,
+        nonshared: Sequence[int],
+        *,
+        need_state: bool,
+    ):
         inputs = self._training_inputs(batch, task, nonshared)
         self.rng_key, state_key = jax.random.split(self.rng_key)
-        grads, loss_vector, final_state = self._gradients(self.params, inputs, state_key)
-        grads = self._mask_grads(grads, nonshared)
-        grads = precision_weight_gradients(
-            grads,
-            self.params,
-            shell_names=tuple(shell_slices(self.cfg)),
-            enabled=self.cfg.exact_search.enable_precision_update_resistance,
-            strength=self.cfg.exact_search.precision_update_strength,
-            floor=self.cfg.exact_search.precision_update_floor,
-        )
-        updates, self.opt_state = self.optimizer.update(
-            grads, self.opt_state, self.params
-        )
-        self.params = optax.apply_updates(self.params, updates)
+        use_lean = not need_state and "update_lean" in self._programs
+        if use_lean:
+            self.params, self.opt_state, loss_vector = self._programs[
+                "update_lean"
+            ](self.params, self.opt_state, inputs, state_key)
+            final_state = None
+        else:
+            self.params, self.opt_state, loss_vector, final_state = self._programs[
+                "update"
+            ](self.params, self.opt_state, inputs, state_key)
         self.persistent_state.params = self.params
         self.persistent_state.opt_state = self.opt_state
         self._bump_params_revision()
@@ -479,16 +600,15 @@ class HiBaCaMLTrainer(ABC):
         return loss_dict_from_vector(loss_vector), final_state
 
     def _mask_grads(self, grads, nonshared: Sequence[int]):
-        keep_columns = set(self.cfg.column_pool.shared_indices + tuple(nonshared))
-        masked_nodes = {}
-        for node_name, node_grads in grads.nodes.items():
-            column_index = self._node_column_index.get(node_name)
-            if column_index is not None:
-                if column_index not in keep_columns:
-                    masked_nodes[node_name] = jax.tree_util.tree_map(jnp.zeros_like, node_grads)
-                    continue
-            masked_nodes[node_name] = node_grads
-        return grads._replace(nodes=masked_nodes)
+        return _mask_gradients(
+            grads,
+            self.build_support_mask(nonshared),
+            {
+                name: int(name.split("/")[0][3:])
+                for name in self.structure.nodes
+                if name.startswith("col")
+            },
+        )
 
     def _train_batch(
         self,
@@ -518,6 +638,19 @@ class HiBaCaMLTrainer(ABC):
             - self.persistent_state.last_demotion_audit_step.get(task.task_id, 0)
             >= self.cfg.exact_search.demotion_audit_interval
         )
+        report_due = (
+            batch_index == 0
+            or (batch_index + 1) % batch_log_every == 0
+            or batch_index + 1 == train_batches
+        )
+        need_state = (
+            "update_lean" not in self._programs
+            or self.cfg.exact_search.enable_structural_edits
+            or cert_due
+            or maintenance_due
+            or demotion_due
+            or report_due
+        )
         if (
             batch_index == 0
             or cert_due
@@ -535,21 +668,24 @@ class HiBaCaMLTrainer(ABC):
             )
 
         batch_started = time.perf_counter()
-        losses, final_state = self.training_update(batch, task, nonshared)
-        jax.block_until_ready(
-            final_state.nodes[self.structure.task_map["y"]].z_mu
+        losses, final_state = self._execute_training_update(
+            batch,
+            task,
+            nonshared,
+            need_state=need_state,
         )
-        updated_params = self.shell_controller.apply_structural_edits(
-            self.params,
-            final_state,
-            self.persistent_state,
-            self.active_full_support(nonshared),
-            self.current_phi,
-        )
-        if updated_params is not self.params:
-            self.params = updated_params
-            self.persistent_state.params = self.params
-            self._bump_params_revision()
+        if self.cfg.exact_search.enable_structural_edits:
+            updated_params = self.shell_controller.apply_structural_edits(
+                self.params,
+                final_state,
+                self.persistent_state,
+                self.active_full_support(nonshared),
+                self.current_phi,
+            )
+            if updated_params is not self.params:
+                self.params = updated_params
+                self.persistent_state.params = self.params
+                self._bump_params_revision()
         self.persistent_state.global_step += 1
         final_losses = dict(losses)
         batch_size = int(batch["x"].shape[0])
@@ -564,11 +700,7 @@ class HiBaCaMLTrainer(ABC):
                 task.task_id
             ] = self.persistent_state.global_step
 
-        if (
-            batch_index == 0
-            or (batch_index + 1) % batch_log_every == 0
-            or batch_index + 1 == train_batches
-        ):
+        if report_due:
             composer_diag = self.composer_diagnostics_from_state(
                 final_state,
                 task,
@@ -605,19 +737,13 @@ class HiBaCaMLTrainer(ABC):
                     composer=composer_diag,
                 )
 
-        if self.persistent_state.global_step % self.cfg.cert_refresh_interval == 0:
+        if cert_due:
             self._refresh_certificates(
                 final_state.batch_size,
                 graph_state=final_state,
             )
 
-        if (
-            self.cfg.exact_search.enable_exact_search
-            and task.task_id > 0
-            and self.persistent_state.global_step
-            - self.persistent_state.last_maintenance_step.get(task.task_id, 0)
-            >= self.cfg.exact_search.maintenance_interval
-        ):
+        if maintenance_due:
             self.exact_search.local_one_swap(task.task_id)
             nonshared = self.persistent_state.current_support[task.task_id]
             self.persistent_state.last_maintenance_step[
@@ -877,6 +1003,7 @@ class HiBaCaMLTrainer(ABC):
         *,
         params=None,
         refresh_certificates: bool = True,
+        score_only: bool = False,
     ):
         """Execute one prepared target-free batch for ordered supports."""
         support_list = tuple(tuple(sorted(support)) for support in supports)
@@ -891,15 +1018,12 @@ class HiBaCaMLTrainer(ABC):
             refresh_certificates=refresh_certificates,
         )
         self.rng_key, state_key = jax.random.split(self.rng_key)
-        details = self._evaluate_prepared_batch(
-            params,
-            clamps,
-            targets,
-            state_key,
+        evaluate = (
+            self._score_prepared_batch
+            if score_only
+            else self._evaluate_prepared_batch
         )
-        _, per_sample_total, _, _ = details
-        jax.block_until_ready(per_sample_total)
-        return details
+        return evaluate(params, clamps, targets, state_key)
 
     def evaluate_batch_outputs(
         self,
@@ -929,14 +1053,19 @@ class HiBaCaMLTrainer(ABC):
         *,
         refresh_certificates: bool = True,
     ) -> float:
-        _, per_sample_total = self.evaluate_batch_outputs(
-            task,
+        per_sample_total = self._evaluate_supports_batch(
             batch,
-            nonshared,
+            task,
+            (nonshared,),
             params=params,
             refresh_certificates=refresh_certificates,
+            score_only=True,
         )
-        return float(jnp.mean(per_sample_total))
+        return support_mean_losses(
+            per_sample_total,
+            1,
+            int(batch["x"].shape[0]),
+        )[0]
 
     def evaluate_batch_losses(
         self,
@@ -961,12 +1090,13 @@ class HiBaCaMLTrainer(ABC):
                     refresh_certificates=refresh_certificates,
                 )
             ]
-        _, per_sample_total, _, _ = self._evaluate_supports_batch(
+        per_sample_total = self._evaluate_supports_batch(
             batch,
             task,
             support_list,
             params=params,
             refresh_certificates=refresh_certificates,
+            score_only=True,
         )
         return support_mean_losses(
             per_sample_total,

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Dict, List, Optional, Tuple
 
 import jax.numpy as jnp
@@ -164,13 +164,7 @@ class DemotionSwapAuditRow:
 
 @dataclass(frozen=True)
 class ReplayProposalRow:
-    """V20.2b reselection audit row.
-
-    Captures the three streams considered at every support-acceptance decision
-    (boundary or local one-swap): the exact-search winner, the local one-hop
-    refinement baseline, and the best replay-bank candidate. Plus the penalised
-    scores, overlap diagnostics, and which stream was finally accepted.
-    """
+    """reselection audit row."""
 
     task_id: int
     global_step: int
@@ -257,6 +251,7 @@ class PersistentHiBaCaMLState:
     shell_stats: Dict[int, ShellStats] = field(default_factory=dict)
     global_step: int = 0
     params_revision: int = 0
+    certificates_revision: int = 0
     timing_summaries: Dict[int, Dict[str, float]] = field(default_factory=dict)
     params: Optional[GraphParams] = None
     opt_state: Any = None
@@ -264,6 +259,45 @@ class PersistentHiBaCaMLState:
     def to_dict(self) -> Dict[str, Any]:
         """Best-effort conversion for JSON export and tests."""
         return asdict(self)
+
+
+def clone_persistent_state(state: PersistentHiBaCaMLState) -> PersistentHiBaCaMLState:
+    """Independent mutable state for a rollout trial."""
+
+    return replace(
+        state,
+        # refresh_certificates mutates these and their EMA dicts in place.
+        shell_stats={
+            index: replace(
+                stats,
+                activation_ema=dict(stats.activation_ema),
+                task_variance_ema=dict(stats.task_variance_ema),
+            )
+            for index, stats in state.shell_stats.items()
+        },
+        # Rebound wholesale by a trial; the stored values are immutable.
+        current_support=dict(state.current_support),
+        boundary_support=dict(state.boundary_support),
+        task_support_snapshots=dict(state.task_support_snapshots),
+        last_maintenance_step=dict(state.last_maintenance_step),
+        last_demotion_audit_step=dict(state.last_demotion_audit_step),
+        recently_demoted=dict(state.recently_demoted),
+        composer_diagnostics=dict(state.composer_diagnostics),
+        certificates=dict(state.certificates),
+        # Controller history and reporting are written only on the parent.
+        support_tables={},
+        support_posterior_tables={},
+        reserve_recruitment_tables={},
+        controller_tables={},
+        local_swap_tables={},
+        demotion_swap_tables={},
+        replay_proposals={},
+        timing_summaries={},
+        epoch_evaluations=[],
+        # Installed by clone() from the shared leaves.
+        params=None,
+        opt_state=None,
+    )
 
 
 @dataclass(frozen=True)
