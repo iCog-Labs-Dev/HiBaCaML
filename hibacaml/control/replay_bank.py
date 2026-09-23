@@ -5,9 +5,6 @@ At every boundary and accepted local one-swap, the trainer appends a row.
 At reselection time, `query()` returns top-k cosine-similar contexts whose
 supports become candidate edits.
 
-The bank is intentionally small and non-JIT: pickle round-trip plus numpy
-cosine similarity. `save()` writes atomically (tmp file + replace) so
-concurrent reads never observe a half-written bank.
 """
 
 from __future__ import annotations
@@ -17,7 +14,7 @@ import os
 import pickle
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
 
@@ -57,6 +54,14 @@ class _BankPayload:
     last_write: float = 0.0
 
 
+def _own_context(context: np.ndarray) -> np.ndarray:
+    """A private read-only float32 copy."""
+    
+    owned = np.array(context, dtype=np.float32)
+    owned.setflags(write=False)
+    return owned
+
+
 class SelectorBank:
     """File-backed bank of replay rows shared across runs."""
 
@@ -71,13 +76,15 @@ class SelectorBank:
         self.bank_path = self.root / bank_filename
         self.metadata_path = self.root / metadata_filename
         self._payload = _BankPayload(schema_version=_BANK_SCHEMA_VERSION)
+        self._revision = 0
+        self._vectors: Optional[Tuple[int, List[Tuple[np.ndarray, np.floating]]]] = None
 
     # ------------------------------------------------------------------
     # Persistence
     # ------------------------------------------------------------------
     def load(self) -> None:
         if not self.bank_path.exists():
-            self._payload = _BankPayload(schema_version=_BANK_SCHEMA_VERSION)
+            self._install(_BankPayload(schema_version=_BANK_SCHEMA_VERSION))
             return
         with self.bank_path.open("rb") as fh:
             payload = pickle.load(fh)
@@ -90,7 +97,15 @@ class SelectorBank:
                 f"Selector bank schema {payload.schema_version!r} != "
                 f"{_BANK_SCHEMA_VERSION!r}"
             )
+        self._install(payload)
+
+    def _install(self, payload: _BankPayload) -> None:
+        """Adopt a payload, taking ownership of every row's context."""
+        payload.rows = [
+            replace(row, context=_own_context(row.context)) for row in payload.rows
+        ]
         self._payload = payload
+        self._revision += 1
 
     def save(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
@@ -116,7 +131,8 @@ class SelectorBank:
     # Mutation
     # ------------------------------------------------------------------
     def add(self, row: ReplayRow) -> None:
-        self._payload.rows.append(row)
+        self._payload.rows.append(replace(row, context=_own_context(row.context)))
+        self._revision += 1
         if row.run_id and row.run_id not in self._payload.contributing_run_ids:
             self._payload.contributing_run_ids.append(row.run_id)
 
@@ -146,13 +162,14 @@ class SelectorBank:
         ctx = np.asarray(context, dtype=np.float32).reshape(-1)
         ctx_norm = float(np.linalg.norm(ctx)) + 1e-8
         scored: List[Tuple[float, ReplayRow]] = []
-        for row in rows:
+        for row, (other, other_norm) in zip(rows, self._row_vectors(), strict=True):
             if current_nonshared is not None and row.nonshared == current_nonshared:
                 continue
-            other = np.asarray(row.context, dtype=np.float32).reshape(-1)
             if other.shape != ctx.shape:
                 continue
-            sim = float(np.dot(ctx, other) / (ctx_norm * (np.linalg.norm(other) + 1e-8)))
+            # The epsilon stays float32 at its own site: widening the norm first
+            # lets 1e-8 survive where the reference arithmetic drops it.
+            sim = float(np.dot(ctx, other) / (ctx_norm * (other_norm + 1e-8)))
             scored.append((sim, row))
         scored.sort(key=lambda pair: pair[0], reverse=True)
         seen: set = set()
@@ -165,6 +182,16 @@ class SelectorBank:
             if len(unique) >= k:
                 break
         return unique
+
+    def _row_vectors(self) -> List[Tuple[np.ndarray, np.floating]]:
+        """Each row's 1-D context and its raw norm, rebuilt when rows change."""
+        if self._vectors is None or self._vectors[0] != self._revision:
+            vectors = [
+                (vector, np.linalg.norm(vector))
+                for vector in (row.context.reshape(-1) for row in self._payload.rows)
+            ]
+            self._vectors = (self._revision, vectors)
+        return self._vectors[1]
 
     # ------------------------------------------------------------------
     # Introspection
@@ -287,7 +314,7 @@ def make_replay_row(
         run_id=str(run_id),
         task_id=int(task_id),
         global_step=int(global_step),
-        context=np.asarray(context, dtype=np.float32),
+        context=_own_context(context),
         nonshared=tuple(int(c) for c in sorted(nonshared)),
         full_support=tuple(int(c) for c in sorted(full_support)),
         phi=phi,

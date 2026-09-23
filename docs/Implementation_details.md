@@ -159,6 +159,13 @@ Each shell-bank node stores separate weights/biases for `kernel`, `tier1`,
 - demotion is not applied directly in this routine in V20.2b; it goes through
   the audited `demotion_swap_audit` path.
 
+Structural observations are reduced by an un-jitted JAX projection and cross
+one grouped host-materialization boundary before the existing ordered
+comparisons. Demotion candidates use a separate projection because their audit
+observes the parameter tree after structural edits. Prune and swap mutations
+use mask-wise selection while preserving the selected units and parameter
+values exactly.
+
 **Alignment status.** Substantially faithful with implementation-specific node
 names. The radial shell semantics are implemented, including pruning,
 inhibition, promotion-like swaps, and audited demotion. The "hard kernel is
@@ -184,8 +191,11 @@ estimation compared with external fit scores alone.
 
 **Implementation details.**
 
-`ShellController.refresh_certificates` updates EMAs and computes a
-`ColumnCertificate` per column. Certificate fields include:
+`CertificateController.refresh_certificates` owns observation and certificate
+production. Its un-jitted JAX projection reduces graph parameters and `z_mu`
+to six compact column/node/shell arrays. One grouped `jax.device_get` transfers
+those arrays, after which shell EMAs and certificate fields are aggregated in
+the original Python/float64 order. Certificate fields include:
 
 - `q_mean`, derived from sigmoid shell precisions;
 - `prec_mean`, derived from exponentiated shell precision parameters;
@@ -200,10 +210,19 @@ estimation compared with external fit scores alone.
 - `similarity_signature`, computed as cosine similarity between certificate
   vectors.
 
-The certificate vector used by the composer is constructed by
-`certificate_matrix`, masked by the active support. `certificate_vectors` builds
-the unmasked vectors and `mask_certificate_vectors` applies one mask, so paths
-that score many supports against one certificate state build the vectors once.
+Similarity uses a vectorized float32 host calculation and is export-only; no
+controller decision consumes it. Similarity uses all 14 certificate fields,
+while the composer gathers its established 10-field subset. That composer stack
+is cached by persistent-state identity and `certificates_revision`; refreshing
+certificates increments the revision once and invalidates the stack, while a
+parameter revision alone does not.
+
+`certificate_matrix` masks the cached stack by active support.
+`certificate_vectors` exposes its unmasked rows and
+`mask_certificate_vectors` applies one mask for multi-support paths. Certificate
+refresh cadence remains in trainer and shell-controller protocol flow; the
+compact production path does not suppress or coalesce refreshes.
+
 The static support scoring path also uses `_certificate_reuse_score`, which
 rewards `q_mean` and
 `shared_abstraction_mass` while penalizing specificity, demotion pressure, and
@@ -248,7 +267,7 @@ train_task(task)
      -> optional reserve recruitment
      -> shortlist top support candidates
      -> phi_candidates()
-     -> rollout_score(...) for each shortlist x phi
+     -> rollout_rows(...) per shortlist entry, one trajectory per phi class
      -> replay-bank reselection
      -> set_boundary_choice(...)
   -> set_current_support(...)
@@ -264,26 +283,51 @@ current_first_loss
 + switch_penalty
 ```
 
-`rollout_score` clones the trainer, trains over the rollout batches, applies the
-same gradient masking and shell edits as training, and re-evaluates the boundary
-objective. The phi neighborhood is deterministic: the current four-value
-`PhiConfig` plus bounded +/- perturbations of each coordinate.
+`rollout_rows` scores every phi candidate at one support. A trajectory clones
+the trainer, trains over the rollout batches, applies the same gradient masking
+and shell edits as training, and re-evaluates the boundary objective. The phi
+neighborhood is deterministic: the current four-value `PhiConfig` plus bounded
++/- perturbations of each coordinate. `rollout_score` remains as the sequential
+single-trial path and is what the equivalence tests compare against.
+
+Two exact reductions shrink the physical work while keeping the logical grid.
+Phi reaches a trajectory only through `apply_structural_edits`, which reads
+`outer_quantile`, `middle_quantile`, and `replacement_margin_base`;
+`demotion_min_role_gain` is read only by `demotion_swap_candidates`, which no
+rollout runs. Candidates sharing `rollout_trajectory_key` therefore drive one
+trajectory, and `_controller_row` rebuilds each logical row from it with that
+row's own penalty. Separately, `training_update` takes no phi at all, so a
+support's first update runs once on a prefix clone and every trajectory resumes
+from it. At the production defaults this turns 72 logical rows into 56
+trajectories and 288 update invocations into 176, leaving all 72 rows, their
+encounter order, and strict-`<` winner selection unchanged. `boundary_search`
+records the logical counts in `timing_summaries`.
+
+`resume_clone` exists because `clone()` deliberately drops `_last_graph_state`.
+A trial resuming from its own preceding update must keep it: predictive coding
+refreshes certificates while the next clamp set is built, and without that
+observation the refresh would run against a zero placeholder and move
+decision-bearing certificate fields.
 
 The old-task audit terms (`old_worst_loss`, `old_mix_loss`) are memoized in
-`ExactSearchService._old_audit_cache`, keyed by trainer identity, bundle
-identity, and `params_revision`. Trainer identity must come from
+`SupportScorer._old_audit_cache`, keyed by trainer identity, bundle identity,
+`params_revision`, and `certificates_revision`. Trainer identity must come from
 `HiBaCaMLTrainer.instance_id`, a monotonic counter, and **not** from `id(trainer)`:
-every rollout clone reaches the same `params_revision` and is freed with an
-explicit `gc.collect()` before the next clone is allocated, so CPython reuses the
-address and distinct candidates would collide on one cache entry and silently
-share each other's old-task losses.
+every rollout clone reaches the same revisions and is released as soon as its
+trajectory ends, so CPython reuses the address and distinct candidates would
+collide on one cache entry and silently share each other's old-task losses.
+`make_bundle` clears the cache, so an entry never outlives the bundle it was
+keyed on, and a rollout or demotion trial declines to store at all: its entry
+keys on an instance id the parent never uses, so it could only ever be written
+and never read.
 
 This audit cache is intentionally distinct from ordinary evaluation. General
 loader evaluation is not cached: its former key omitted certificate, loader,
 RNG, and other state that can affect the result, while observed savings were
 negligible. Every evaluation request therefore executes, advances its normal
-RNG transition, and performs a requested certificate refresh. The
-`params_revision` counter remains because the audit cache still uses it.
+RNG transition, and performs a requested certificate refresh. Both revision
+counters remain because the audit cache depends on parameters and
+the current certificate inputs.
 
 During training, `HiBaCaMLTrainer.train_task` runs `local_one_swap` every
 `maintenance_interval` steps for tasks after task 0. It also runs
@@ -484,9 +528,9 @@ the graph needs. `composer_details` continues on to the gate
 auxiliary penalty (`aux_penalty`, part of the objective) and the reported
 diagnostics (`gate_entropy`, `prior_kl`, `gate_dev`, `top1_mass`,
 `effective_k`); it is called separately from the settled state by
-`_composer_details_from_runtime`. Keep new diagnostics out of the forward path:
-the backprop runner does not execute the graph under `jax.jit`, so anything
-added there is computed on every forward whether or not it is read.
+`composer_details_from_runtime`. Keep new diagnostics out of the forward path:
+anything added there is computed on every graph execution, including compiled
+backprop updates, whether or not it is read.
 
 **Alignment status.** Faithful in purpose. The implementation's composer works
 over per-column feature vectors and certificates rather than an explicitly
@@ -510,6 +554,14 @@ inside the column graph before feature pooling.
 
 `hibacaml/graph/builder.py`
 : Builds the static FabricPC graph and initializes persistent HiBaCaML state.
+  `column_logits` uses `LinearExplicitGrad` because it has a single input edge
+  and an identity activation under unit-precision Gaussian energy, so its
+  explicit derivative reproduces autodiff exactly. It passes
+  `weight_init=KaimingInitializer()` because that subclass defaults to Normal
+  where `Linear` defaults to Kaiming, and inheriting the subclass default would
+  silently redraw every column's initial weights. `feature_pool` keeps `Linear`:
+  it flattens four inputs through a tanh, and the substitution is recorded as
+  verified-not-equivalent there.
 
 `hibacaml/nodes/pathways.py`
 : Defines patch-token preparation and support-gated graph pathways.
@@ -533,21 +585,23 @@ the graph or claim a runtime improvement.
 `hibacaml/control/certificates.py`
 : `CertificateController` — everything that *reads* the graph's shells: shell-EMA
   statistics, per-column `ColumnCertificate` construction and similarity
-  signatures, the certificate vectors the composer and support scorer consume,
-  and the semantic penalty. It also owns the shell geometry helpers
-  (`shell_slices`, `shell_node_names`, `shell_occupancy`, `effective_precision`,
-  `mean_or_zero`) that `shells.py` reuses, so both halves agree on what a shell
-  is.
+  signatures, the revision-scoped certificate stack the composer consumes, and
+  the semantic penalty. Observation projection is un-jitted, crosses one grouped
+  host boundary, and leaves reference-order recurrence on the host. It also owns
+  the shell geometry helpers
+  (`shell_slices`, `shell_node_names`, `effective_precision`, `mean_or_zero`)
+  used by the control layer.
 
 `hibacaml/control/shells.py`
 : `ShellController` — everything that *mutates* shells: inhibition, outside-in
-  pruning, promotion swaps, and audited demotion swaps. It is constructed with
+  pruning, promotion swaps, and audited demotion swaps. Structural and demotion
+  projections remain separate, un-jitted, and materialize their decision tuples
+  once before host-controlled thresholds and ordering. It is constructed with
   the certificate controller because `apply_structural_edits` returns with
   certificates already refreshed for the edited parameters; the disabled path
-  returns first and deliberately does not refresh, and that asymmetry is refresh
-  cadence rather than an optimization. `precision_weight_gradients` stays a
-  module-level function so the training update can close over plain configuration
-  values instead of a controller object.
+  returns first and deliberately does not refresh. `precision_weight_gradients`
+  stays a module-level function so the training update can close over plain
+  configuration values instead of a controller object.
 
 `hibacaml/control/ranking.py`
 : Stateless calculations, defined by a property rather than a topic: a function
@@ -562,7 +616,19 @@ the graph or claim a runtime improvement.
   parameter on every call rather than an attribute, because rollout scoring
   evaluates candidates on cloned trainers and the clone should be visible at the
   call site. The audit cache is the class's only state; its key covers trainer
-  identity, bundle identity, and parameter revision.
+  identity, bundle identity, parameter revision, and certificate revision.
+
+`hibacaml/control/replay_bank.py`
+: `SelectorBank` — the file-backed cross-run row store and its cosine
+  retrieval. A row's context is copied into a private read-only float32 array at
+  every ingress: `np.asarray` does not copy an array that is already float32, a
+  frozen dataclass blocks reassigning the field rather than writing through it,
+  and `add` and `load` therefore do not trust the factory. Row norms are
+  memoized per bank revision, which `add` and `load` bump. The epsilon stays at
+  its own arithmetic site in float32: under NEP 50 the reference addition drops
+  `1e-8` for a unit-magnitude norm, while widening the norm first lets it
+  survive and can reorder proportional contexts. A dense similarity matrix is
+  rejected for the same reason.
 
 `hibacaml/control/search.py`
 : `ExactSearchService` — the decisions and their consequences: rollout
@@ -573,24 +639,36 @@ the graph or claim a runtime improvement.
 
 `hibacaml/training/trainer.py`
 : The abstract `HiBaCaMLTrainer` base: support selection, certificate refresh,
-  clamp orchestration, gradient masking, structural edits, the
-  `training_update` template, the task loop, and evaluation orchestration. Five
-  operations are abstract —
-  `build_runtime`, `_training_inputs`, `_gradients`,
-  `_run_evaluation_inference`, and `_evaluate_prepared_batch` — and everything
-  else is shared by both learners. The trainer prepares target-free clamps and
-  external targets, owns support ordering and RNG transitions, refreshes
-  certificates on the first requested loader batch, and installs graph state
-  only for explicit raw inference.
-  Also holds `feedforward_state`, the one FabricPC entry point both learners
-  use, and `LearnerRuntime`, the compiled programs a trainer shares with its
+  clamp orchestration, complete-update construction, dynamic gradient masking,
+  structural edits, the task loop, and evaluation orchestration. Three operations
+  form the abstract learner boundary — `build_programs`, `_training_inputs`, and
+  `_gradients` — and everything else is shared by both learners. The trainer
+  prepares target-free clamps and external targets, owns support ordering and
+  RNG transitions, refreshes certificates on the first requested loader batch,
+  and owns graph-state installation.
+
+  `build_update_programs` closes over stable graph, optimizer, and resistance
+  configuration while keeping parameters, optimizer state, clamps, support
+  masks, and RNG dynamic. Its compiled core performs learner gradients, support
+  masking, precision treatment, optimizer transition, and parameter application
+  in that order. Program dictionaries are built once and shared unchanged with
   rollout clones.
+
+  `build_evaluation_programs` constructs compiled raw-inference, detailed, and
+  score-only programs from each learner's pure numerical functions. Detailed
+  evaluation serves metrics and batch outputs; controller loss APIs use the
+  score-only route. Its compiled core retains the six-value loss vector as an
+  unmaterialized auxiliary output because dropping it changes multi-support
+  totals by one float32 ULP under the current compiler. Candidate means stay
+  outside JIT and cross the host boundary as one ordered vector.
 
   Two class constants declare where the learner contracts genuinely differ:
   `COMPOSER_BEFORE_PARENT` (objective summation order),
   `CLAMPS_MAY_INCLUDE_TARGETS` (whether supervised targets may be clamped into
-  the graph at all). Every update returns its graph state; the former unused
-  lean-update declaration and ignored `need_state` argument have been removed.
+  the graph at all). Public `training_update` remains state-producing for
+  controller rollouts. The ordinary task loop uses BP's lean update only when
+  no structural edit, refresh, audit, maintenance, or reporting consumer needs
+  the state; PC always returns its settled state.
 
 `hibacaml/training/shared.py`
 : Trainer-independent computation, in three sections following one batch's
@@ -607,6 +685,11 @@ the graph or claim a runtime improvement.
   dataclass or named tuple is introduced. `composer_before_parent` preserves the
   learners' established difference in objective summation order.
 
+  Training loss reporting materializes the six-element loss vector once before
+  converting it to the existing Python dictionary. Evaluation candidate means,
+  loader finalization, and composer reporting use grouped host materialization;
+  composer reductions remain unfused.
+
   The module's identity is what it refuses to import: no trainer, controller,
   selector bank, persistent state, or reporting. Everything stateful is passed
   in as a plain argument. A test enforces that boundary rather than leaving it
@@ -615,11 +698,12 @@ the graph or claim a runtime improvement.
   without changing a single function body.
 
 `hibacaml/training/pc.py`
-: `HiBaCaMLPCTrainer`, the compiled PC programs, and the full-native factor
+: `HiBaCaMLPCTrainer`, the compiled state-producing PC update, evaluation and
+  inference programs, and the full-native factor
   machinery. Feedforward initialization, the established latent-state relaxation
   with supervised targets clamped, and local graph-energy weight gradients. For
-  evaluation it supplies only target-free inference and prepared-batch execution
-  hooks.
+  evaluation it supplies pure target-free inference and detailed-scoring
+  functions registered by the trainer's shared program builder.
   Also holds `HiBaCaMLPCInference`, an `InferenceSGD` subclass overriding only
   the latent-gradient phase. After the ordinary FabricPC sweep it adds the
   parent-child and composer auxiliary contributions, so both take part in
@@ -630,25 +714,30 @@ the graph or claim a runtime improvement.
   its ordinary local prediction errors. That is what keeps this predictive
   coding rather than global backpropagation.
   The factors act only when every supervised target is clamped, which is exactly
-  training; a partial target set is rejected. `build_runtime` refuses a graph
+  training; a partial target set is rejected. `build_programs` refuses a graph
   built with stock `InferenceSGD`, since that would silently restore the former
   report-only behavior. The auxiliary weights are the whole control surface:
   with `parent_child_loss_weight` and the three composer penalty weights at
-  zero, both factors take an early return and the update reduces exactly to the
-  pre-2026-09-19 algorithm. That is a regression property, not a supported mode.
+  zero, both factors take an early return and the mathematical update reduces to
+  the pre-2026-09-19 algorithm. Fixed-parameter factor behavior remains exact;
+  compiled versus eager optimizer execution is compared under float32 numerical
+  tolerances rather than universal bitwise identity.
 
 `hibacaml/training/backprop.py`
 : `HiBaCaMLBackpropTrainer`, an end-to-end autodiff learner preserving the same
   support, certificate, shell-edit, and audit semantics. Its forward pass is
   exactly the PC learner's initialization without the relaxation that follows
-  it there. For evaluation it supplies only feedforward inference and
-  prepared-batch scoring hooks.
+  it there. Its pure gradient step feeds both compiled complete-update variants:
+  a state-producing form and a lean form that omits the graph-state result. For
+  evaluation its pure feedforward and detailed-scoring functions feed the same
+  compiled evaluation builder as PC.
 
 Both learners are siblings under the abstract base rather than one inheriting
 the other. The stage order of an update — gradient production, support masking,
 the configured precision treatment, AdamW, then parameter application — is
-fixed once in `training_update`, and rollout trials run that same template, so
-no trial can substitute a different update algorithm.
+fixed in the shared compiled-update builder, and rollout trials run the same
+state-producing template, so no trial can substitute a different update
+algorithm.
 
 `hibacaml/experiment.py`
 : Holds the wiring both runners share: `build_trainer` (inference, graph,
@@ -695,9 +784,7 @@ run_experiment(cfg, ...)
   -> for each task:
        train_task(task)
          -> boundary support search if needed
-         -> per-batch gradient computation
-         -> mask gradients outside active support
-         -> optimizer update
+         -> compiled learner gradient, support mask, precision, and optimizer update
          -> shell structural edits
          -> certificate refresh
          -> optional demotion and one-swap audits
@@ -836,9 +923,9 @@ fallback to independently sampled hidden states.
 For each task, `_run_tasks` calls `trainer.train_task(task)`. Training:
 
 1. selects a support at the task boundary if no support is set;
-2. computes gradients on each training batch;
-3. masks gradients for inactive columns;
-4. applies optimizer updates with precision resistance;
+2. runs the complete compiled learner update on each training batch;
+3. masks inactive-column gradients inside that update using the dynamic support;
+4. applies precision resistance, optimizer transition, and parameters inside it;
 5. applies shell structural edits to active columns;
 6. periodically refreshes certificates;
 7. periodically performs demotion and local one-swap audits;
@@ -929,12 +1016,13 @@ counts and a task-local confusion matrix so aggregate accuracy can be audited.
 `HiBaCaMLTrainer` owns the evaluation request and its stateful effects. It
 normalizes ordered supports, constructs single- or multi-support clamps, splits
 the evaluation RNG once for each executed batch, and refreshes certificates on
-the first loader batch only when requested. `pc.py` and `backprop.py` turn that
-prepared batch into the same four-value detail tuple. `shared.py` scores an
+the first loader batch only when requested. `pc.py` and `backprop.py` provide
+pure numerical functions for compiled raw, detailed, and score-only execution.
+Detailed evaluation returns the same four-value tuple; score-only evaluation
+returns its per-example totals for controller reduction. `shared.py` scores an
 already-produced graph state and accumulates example-weighted metrics. Ordinary
-metric evaluation does not replace `_last_graph_state`; the explicit
-`run_batch_evaluation_inference` path does because controller rollouts consume
-that state.
+metric evaluation does not replace `_last_graph_state`; the explicit raw
+inference path does because controller rollouts consume that state.
 
 The script then derives:
 
@@ -988,16 +1076,18 @@ checked the same way (Section 5.2).
 guard. When false, `apply_structural_edits` returns the same parameter object,
 does not refresh controller state, and causes no extra parameter-revision bump.
 
-Evaluation metrics come from the same forward/inference operation for both
-learners. The PC JIT exposes its already-computed loss vector and composer
-details; backprop uses the same state-scoring helper
-(`shared.py:evaluation_details_from_state`).
+Evaluation metrics come from the same compiled forward/inference operation for
+both learners. Both use the same state-scoring helper
+(`shared.py:evaluation_details_from_state`) after their learner-specific
+target-free inference.
 `evaluate_batch_outputs` remains the compatible
 `(logits, per_sample_total)` interface, while `evaluate_loader` delegates
 aggregation to `EvaluationAccumulator` and additionally reports pure class
 cross-entropy, the full composite, per-class precision/recall, and per-column
-composer use. It never runs `composer_diagnostics_from_state` as a second
-forward and never reuses a cached general-evaluation result.
+composer use. Batch scalar accumulation, loader finalization, and standalone
+composer diagnostics each use compact host materialization without changing
+their reduction order. Evaluation never runs `composer_diagnostics_from_state`
+as a second forward and never reuses a cached general-evaluation result.
 
 For compatibility, Split-MNIST `evaluate_task` still refreshes certificates on
 its first test batch by default. Full-MNIST passes
@@ -1187,9 +1277,9 @@ for task in tasks:
         trainer.set_current_support(task, accepted_support, phi)
 
     for epoch, batch in task.train_loader:
-        grads, losses, state = trainer.compute_training_gradients(batch, support)
-        grads = zero inactive-column gradients
-        params = optimizer_update(params, precision_weighted_grads)
+        params, optimizer_state, losses, state = compiled_update(
+            params, optimizer_state, batch, support, rng
+        )
         params = shell_controller.apply_structural_edits(params, state, support, phi)
         refresh certificates periodically
         audit demotion swaps periodically
