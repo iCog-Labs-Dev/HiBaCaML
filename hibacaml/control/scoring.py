@@ -1,8 +1,4 @@
-"""Evaluate support candidates for exact search.
-
-Trainers are passed explicitly, including clones used for rollout scoring;
-the scorer only retains its evolving old-task audit cache.
-"""
+"""Evaluate support candidates for exact search."""
 
 from __future__ import annotations
 
@@ -21,7 +17,7 @@ class SupportScorer:
 
     def __init__(self, cfg: HiBaCaMLConfig):
         self.cfg = cfg
-        self._old_audit_cache: Dict[Tuple[int, int, int], Dict[str, float]] = {}
+        self._old_audit_cache: Dict[Tuple[int, int, int, int], Dict[str, float]] = {}
 
 
     # Bundles
@@ -34,6 +30,9 @@ class SupportScorer:
         purpose: str = "boundary",
     ) -> BoundaryBundle:
         """Build the audit bundle: current eval batches + worst-old + mixed-old."""
+        # One bundle owns the cache: entries keyed on a freed bundle's address
+        # are unreachable, and clearing here keeps id(bundle) sound.
+        self._old_audit_cache.clear()
         caps = self._bundle_batch_caps(purpose)
         task = trainer.task(task_id)
         current_eval = tuple(
@@ -206,6 +205,7 @@ class SupportScorer:
         bundle: BoundaryBundle,
         *,
         refresh_certificates: bool,
+        cache_audit: bool = True,
     ) -> Dict[str, float]:
         """Boundary objective from Eq. (1)."""
         return self.objectives(
@@ -214,6 +214,7 @@ class SupportScorer:
             [support_cols],
             bundle,
             refresh_certificates=refresh_certificates,
+            cache_audit=cache_audit,
         )[0]
 
     def objectives(
@@ -224,6 +225,7 @@ class SupportScorer:
         bundle: BoundaryBundle,
         *,
         refresh_certificates: bool,
+        cache_audit: bool = True,
     ) -> List[Dict[str, float]]:
         """Batched Eq. (1) boundary objective for support candidates."""
         support_list = [tuple(sorted(support)) for support in supports]
@@ -245,7 +247,7 @@ class SupportScorer:
             for row_idx, loss in enumerate(losses):
                 target[row_idx] += float(loss)
 
-        old_terms = self._old_audit_terms(trainer, bundle)
+        old_terms = self._old_audit_terms(trainer, bundle, cache_audit=cache_audit)
         old_worst_loss = old_terms["old_worst_loss"]
         old_mix_loss = old_terms["old_mix_loss"]
 
@@ -271,15 +273,21 @@ class SupportScorer:
             )
         return rows
 
-    def _old_audit_terms(self, trainer, bundle: BoundaryBundle) -> Dict[str, float]:
+    def _old_audit_terms(
+        self,
+        trainer,
+        bundle: BoundaryBundle,
+        *,
+        cache_audit: bool = True,
+    ) -> Dict[str, float]:
         """Compute old-task audit losses under their frozen saved supports."""
+        
         cache_key = (
-            # Not id(trainer): every rollout clone reaches the same params_revision
-            # and is freed before the next is allocated, so reused addresses would
-            # make distinct candidates collide and share old-task audit losses.
+            # Instance IDs avoid collisions when freed clone addresses are reused.
             getattr(trainer, "instance_id", id(trainer)),
             id(bundle),
             int(getattr(trainer.persistent_state, "params_revision", 0)),
+            int(getattr(trainer.persistent_state, "certificates_revision", 0)),
         )
         cached = self._old_audit_cache.get(cache_key)
         if cached is not None:
@@ -317,7 +325,8 @@ class SupportScorer:
             "old_worst_loss": float(old_worst_loss),
             "old_mix_loss": float(sum(mix_losses) / max(len(mix_losses), 1)),
         }
-        self._old_audit_cache[cache_key] = dict(terms)
+        if cache_audit:
+            self._old_audit_cache[cache_key] = dict(terms)
         return terms
 
     def _switch_penalty(self, trainer, task_id: int, support_cols: Sequence[int]) -> float:
