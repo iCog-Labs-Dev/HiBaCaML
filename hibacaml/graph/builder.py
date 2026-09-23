@@ -6,8 +6,9 @@ from typing import Dict, List
 
 from fabricpc.core.topology import Edge, GraphNamespace
 from fabricpc.graph_assembly import graph, TaskMap
-from fabricpc.nodes import IdentityNode, Linear
+from fabricpc.nodes import IdentityNode, Linear, LinearExplicitGrad
 from fabricpc.core.activations import IdentityActivation, SoftmaxActivation, TanhActivation
+from fabricpc.core.initializers import KaimingInitializer
 from fabricpc.core.inference import InferenceBase
 from fabricpc.graph_initialization.state_initializer import StateInitBase
 from hibacaml.config import HiBaCaMLConfig
@@ -110,10 +111,13 @@ def create_hibacaml_structure(
                 name="feature_gate",
                 gate_index=column_index,
             )
-            column_logits = Linear(
+            # Single input edge and identity activation, so the explicit
+            # derivative matches autodiff exactly. `feature_pool` has neither.
+            column_logits = LinearExplicitGrad(
                 shape=(cfg.output_dim,),
                 name="column_logits",
                 activation=IdentityActivation(),
+                weight_init=KaimingInitializer(),  # Linear's default, not this subclass's
             )
             logit_gate = ElementwiseGateNode(
                 shape=(cfg.output_dim,),
