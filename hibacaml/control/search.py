@@ -20,6 +20,7 @@ from hibacaml.control.ranking import (
     mean_or_zero,
     phi_candidates,
     phi_l1_distance,
+    rollout_trajectory_key,
     posterior_summary,
     rank_support_rows,
     reserve_recruitment_diagnostic,
@@ -53,6 +54,35 @@ class _ScoredCandidate:
     penalised_total: float
 
 
+@dataclass(frozen=True)
+class _Trajectory:
+    """What one rollout produces that does not depend on phi."""
+
+    task_id: int
+    nonshared: Tuple[int, ...]
+    objective: Dict[str, float]
+    semantic_regularizer: float
+    composer_diag: Dict[str, float]
+    occ: Tuple[float, float, float]
+    q: Tuple[float, float, float]
+
+
+def _apply_structural_edits(clone, final_state, support_cols, phi) -> None:
+    """Phi's only entry into a trajectory, applied after each update."""
+
+    updated = clone.shell_controller.apply_structural_edits(
+        clone.params,
+        final_state,
+        clone.persistent_state,
+        clone.active_full_support(support_cols),
+        phi,
+    )
+    if updated is not clone.params:
+        clone.params = updated
+        clone.persistent_state.params = clone.params
+        clone._bump_params_revision()
+
+
 class ExactSearchService:
     """Exact support search service with V20.2b replay-bank reselection."""
 
@@ -71,6 +101,28 @@ class ExactSearchService:
         self.scorer = SupportScorer(cfg)
 
 
+    def rollout_rows(
+        self,
+        task_id: int,
+        support_cols: Sequence[int],
+        phis: Sequence[PhiConfig],
+        bundle: BoundaryBundle,
+    ) -> List[ControllerSearchRow]:
+        """One row per phi, with identical trajectories executed once."""
+        with rollout_logging():
+            prefix, state, remaining = self._rollout_prefix(task_id, support_cols, bundle)
+            leaders: Dict[Tuple[float, float, float], _Trajectory] = {}
+            for phi in phis:
+                key = rollout_trajectory_key(phi)
+                if key not in leaders:
+                    leaders[key] = self._rollout_trajectory(
+                        prefix, state, remaining, task_id, support_cols, phi, bundle
+                    )
+            return [
+                self._controller_row(leaders[rollout_trajectory_key(phi)], phi)
+                for phi in phis
+            ]
+
     def rollout_score(
         self,
         task_id: int,
@@ -78,59 +130,70 @@ class ExactSearchService:
         phi: PhiConfig,
         bundle: BoundaryBundle,
     ) -> ControllerSearchRow:
+        """One trial with no prefix and no grouping: the sequential reference."""
         with rollout_logging():
-            return self._rollout_score(task_id, support_cols, phi, bundle)
+            trajectory = self._rollout_trajectory(
+                None, None, bundle.train_batches, task_id, support_cols, phi, bundle
+            )
+            return self._controller_row(trajectory, phi)
 
-    def _rollout_score(
+    def _rollout_prefix(self, task_id: int, support_cols: Sequence[int], bundle: BoundaryBundle):
+        """Run the phi-invariant first update once."""
+
+        if not bundle.train_batches:
+            return None, None, ()
+        clone = self.trainer.clone()
+        _, state = clone.training_update(
+            bundle.train_batches[0],
+            clone.task(task_id),
+            support_cols,
+        )
+        return clone, state, bundle.train_batches[1:]
+
+    def _rollout_trajectory(
         self,
+        prefix,
+        state,
+        remaining,
         task_id: int,
         support_cols: Sequence[int],
         phi: PhiConfig,
         bundle: BoundaryBundle,
-    ) -> ControllerSearchRow:
-        clone = self.trainer.clone()
+    ) -> _Trajectory:
+        clone = prefix.resume_clone() if prefix is not None else self.trainer.clone()
         clone.set_current_support(task_id, support_cols, phi)
         clone.current_phi = phi
         task = clone.task(task_id)
-        final_state = None
-        for batch in bundle.train_batches:
+        final_state = state
+        if final_state is not None:
+            _apply_structural_edits(clone, final_state, support_cols, phi)
+        for batch in remaining:
             # Use the clone's normal learner update for rollouts.
-            _, final_state = clone.training_update(
-                batch,
-                task,
-                support_cols,
-            )
-            updated_params = clone.shell_controller.apply_structural_edits(
-                clone.params,
-                final_state,
-                clone.persistent_state,
-                clone.active_full_support(support_cols),
-                phi,
-            )
-            if updated_params is not clone.params:
-                clone.params = updated_params
-                clone.persistent_state.params = clone.params
-                clone._bump_params_revision()
+            _, final_state = clone.training_update(batch, task, support_cols)
+            _apply_structural_edits(clone, final_state, support_cols, phi)
         if final_state is None and bundle.current_eval:
             final_state, _ = clone.run_batch_evaluation_inference(
                 bundle.current_eval[0],
                 task,
                 support_cols,
             )
+        trajectory = self._observe(clone, task_id, support_cols, bundle, final_state, task)
+        del clone
+        return trajectory
+
+    def _observe(self, clone, task_id, support_cols, bundle, final_state, task) -> _Trajectory:
+        """Everything the trajectory produces before phi's penalty is applied."""
         objective = self.scorer.objective(
             clone,
             task_id,
             support_cols,
             bundle,
             refresh_certificates=True,
+            cache_audit=False,
         )
         semantic_regularizer = clone.certificate_controller.semantic_penalty(
             clone.persistent_state,
             clone.active_full_support(support_cols),
-        )
-        phi_l1_penalty = self.cfg.exact_search.controller_l1_penalty * phi_l1_distance(
-            phi,
-            self.cfg.phi,
         )
         if final_state is not None:
             composer_diag = clone.composer_diagnostics_from_state(final_state, task, support_cols)
@@ -141,37 +204,65 @@ class ExactSearchService:
                 "cert_prior_mean": 0.0,
             }
         certs = list(clone.persistent_state.certificates.values())
-        occ_tier1 = mean_or_zero([cert.tier_occ[0] for cert in certs])
-        occ_tier2 = mean_or_zero([cert.tier_occ[1] for cert in certs])
-        occ_tier3 = mean_or_zero([cert.tier_occ[2] for cert in certs])
-        q_tier1 = mean_or_zero([cert.tier_q[0] for cert in certs])
-        q_tier2 = mean_or_zero([cert.tier_q[1] for cert in certs])
-        q_tier3 = mean_or_zero([cert.tier_q[2] for cert in certs])
-        row = ControllerSearchRow(
+        return _Trajectory(
             task_id=task_id,
             nonshared=tuple(sorted(support_cols)),
+            objective=objective,
+            semantic_regularizer=semantic_regularizer,
+            composer_diag=composer_diag,
+            occ=tuple(
+                mean_or_zero([cert.tier_occ[tier] for cert in certs]) for tier in range(3)
+            ),
+            q=tuple(mean_or_zero([cert.tier_q[tier] for cert in certs]) for tier in range(3)),
+        )
+
+    def _controller_row(self, traj: _Trajectory, phi: PhiConfig) -> ControllerSearchRow:
+        """The one constructor for leader and reconstructed rows alike."""
+        phi_l1_penalty = self.cfg.exact_search.controller_l1_penalty * phi_l1_distance(
+            phi,
+            self.cfg.phi,
+        )
+        objective = traj.objective
+        return ControllerSearchRow(
+            task_id=traj.task_id,
+            nonshared=traj.nonshared,
             phi=phi,
-            rollout_total=float(objective["total"] + semantic_regularizer + phi_l1_penalty),
+            rollout_total=float(
+                objective["total"] + traj.semantic_regularizer + phi_l1_penalty
+            ),
             boundary_total=objective["total"],
             current_loss=objective["current_first_loss"] + objective["current_remaining_loss"],
             old_worst_loss=objective["old_worst_loss"],
             old_mix_loss=objective["old_mix_loss"],
             switch_penalty=objective["switch_penalty"],
             phi_l1_penalty=float(phi_l1_penalty),
-            semantic_regularizer=float(semantic_regularizer),
-            gate_entropy=float(composer_diag.get("gate_entropy", 0.0)),
-            gate_deviation=float(composer_diag.get("gate_deviation", 0.0)),
-            cert_prior_mean=float(composer_diag.get("cert_prior_mean", 0.0)),
-            occ_tier1=occ_tier1,
-            occ_tier2=occ_tier2,
-            occ_tier3=occ_tier3,
-            q_tier1=q_tier1,
-            q_tier2=q_tier2,
-            q_tier3=q_tier3,
+            semantic_regularizer=float(traj.semantic_regularizer),
+            gate_entropy=float(traj.composer_diag.get("gate_entropy", 0.0)),
+            gate_deviation=float(traj.composer_diag.get("gate_deviation", 0.0)),
+            cert_prior_mean=float(traj.composer_diag.get("cert_prior_mean", 0.0)),
+            occ_tier1=traj.occ[0],
+            occ_tier2=traj.occ[1],
+            occ_tier3=traj.occ[2],
+            q_tier1=traj.q[0],
+            q_tier2=traj.q[1],
+            q_tier3=traj.q[2],
         )
-        del clone
-        gc.collect()
-        return row
+
+    def _record_rollout_counters(self, task_id, shortlisted, phis, bundle) -> None:
+        """Logical work beside the physical work, derived not instrumented."""
+        supports = len(shortlisted)
+        groups = len({rollout_trajectory_key(phi) for phi in phis})
+        steps = len(bundle.train_batches)
+        counters = {
+            "rollout_logical_trials": supports * len(phis),
+            "rollout_trajectory_groups": supports * groups,
+            "rollout_rows_reconstructed": supports * (len(phis) - groups),
+            "rollout_update_invocations": (
+                supports * (1 + groups * (steps - 1)) if steps else 0
+            ),
+        }
+        for key, value in counters.items():
+            self.trainer._record_timing(task_id, key, float(value))
 
     def _history_intersection(self, task_id: int, candidate: Sequence[int]) -> int:
         recent = getattr(self.trainer.persistent_state, "recently_demoted", {})
@@ -234,12 +325,8 @@ class ExactSearchService:
         return objectives
 
     def _audited_semantic_penalty(self, trainer, support_cols: Sequence[int]) -> float:
-        """Semantic regularizer for the audit objectives, or 0.0 when disabled.
+        """Semantic regularizer for the audit objectives, or 0.0 when disabled."""
 
-        The rollout objective always carries this term; the local-swap and
-        demotion audits carry it only under `log_semantic_penalty`. That
-        difference is deliberate, so this covers the gated callers only.
-        """
         if not self.cfg.exact_search.log_semantic_penalty:
             return 0.0
         return trainer.certificate_controller.semantic_penalty(
@@ -333,10 +420,8 @@ class ExactSearchService:
 
         Compares the exact-search winner ("original"), its best 1-hop
         refinement ("local"), and replay-bank candidates ("replay") under the
-        penalised objective. Accepts the best with strict double-baseline
-        gating: a replay candidate must beat both original and local; a local
-        edit must beat original by `local_swap_margin`.
-        """
+        penalised objective."""
+
         cfg = self.cfg.exact_search
         full_support = build_full_support(self.cfg, original_nonshared)
 
@@ -516,8 +601,9 @@ class ExactSearchService:
         controller_rows: List[ControllerSearchRow] = []
         best_row = None
         for support_row in shortlisted:
-            for phi in phi_neighbourhood:
-                row = self.rollout_score(task_id, support_row.nonshared, phi, bundle)
+            for row in self.rollout_rows(
+                task_id, support_row.nonshared, phi_neighbourhood, bundle
+            ):
                 controller_rows.append(row)
                 if self.trainer.run_root is not None:
                     append_event(
@@ -531,11 +617,14 @@ class ExactSearchService:
                     )
                 if best_row is None or row.rollout_total < best_row.rollout_total:
                     best_row = row
+        # Trials are acyclic, so one collect per search replaces one per trial.
+        gc.collect()
         self.trainer._record_timing(
             task_id,
             "boundary_total_seconds",
             time.perf_counter() - search_started,
         )
+        self._record_rollout_counters(task_id, shortlisted, phi_neighbourhood, bundle)
         self.trainer.persistent_state.support_tables[task_id] = support_rows
         self.trainer.persistent_state.support_posterior_tables[task_id] = posterior_summary(
             task_id,
@@ -659,6 +748,7 @@ class ExactSearchService:
                     current_support,
                     bundle,
                     refresh_certificates=True,
+                    cache_audit=False,
                 )
                 candidate_semantic = self._audited_semantic_penalty(clone, current_support)
                 candidate_total = float(candidate_objective["total"] + candidate_semantic)
@@ -729,9 +819,9 @@ class ExactSearchService:
         return rows
 
     def local_one_swap(self, task_id: int) -> Tuple[int, ...]:
-        """V20.2b in-task support refinement.
+        """In-task support refinement.
 
-        Merges V18 1-hop neighbours with replay-bank candidates filtered by
+        Merges 1-hop neighbours with replay-bank candidates filtered by
         `replay_overlap_floor`, scores the union under the penalised objective,
         and accepts the best candidate if it beats current by `local_swap_margin`.
         """
