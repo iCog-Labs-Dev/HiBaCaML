@@ -124,6 +124,7 @@ class ExactSearchConfig:
     demotion_audit_interval: int = 64
     demotion_audit_max_candidates: int = 8
     demotion_swap_margin: float = 0.005
+    inhibition_precision_floor: float = 0.25        # Effective precision below which inhibition alone cannot push a unit.
     outer_quantile_bounds: Tuple[float, float] = (0.05, 0.30)
     middle_quantile_bounds: Tuple[float, float] = (0.02, 0.15)
     replacement_margin_bounds: Tuple[float, float] = (0.04, 0.18)

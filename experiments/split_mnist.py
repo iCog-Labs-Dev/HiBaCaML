@@ -36,9 +36,9 @@ TASKS_LIMIT = None                     # e.g. 2, 5, or None for all
 
 # Any HiBaCaMLConfig field to override for this run.
 OVERRIDES = {
-    "batch_size": 768,
-    "exact_search__static_support_batch_size": 16,
-    "exact_search__neighbor_support_batch_size": 16,
+    "batch_size": 1024,
+    "exact_search__static_support_batch_size": 32,
+    "exact_search__neighbor_support_batch_size": 32,
     "exact_search__boundary_current_data_batch_size": 128,
     "exact_search__rollout_train_data_batch_size": 128,
     "exact_search__boundary_worst_old_data_batch_size": 128,
