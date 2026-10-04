@@ -168,10 +168,12 @@ values exactly.
 
 **Alignment status.** Substantially faithful with implementation-specific node
 names. The radial shell semantics are implemented, including pruning,
-inhibition, promotion-like swaps, and audited demotion. The "hard kernel is
-non-prunable" idea is approximated by only pruning tier2/tier3 in
-`apply_structural_edits`; kernel units are still involved in audited swaps and
-precision-weighted gradient scaling.
+inhibition, promotion-like swaps, and audited demotion. The hard kernel is
+non-prunable and non-inhibited: pruning touches only tier2/tier3 and inhibition
+only tiers 1-3. It stays swappable through two paths, the audited
+`kernel <-> tier1` demotion swap and the per-step `tier1 -> kernel` promotion
+inside `apply_structural_edits`, which is not audited. Kernel units also take
+part in precision-weighted gradient scaling.
 
 ### 2.4 Internal Probabilistic State and Certificates
 
@@ -217,9 +219,8 @@ is cached by persistent-state identity and `certificates_revision`; refreshing
 certificates increments the revision once and invalidates the stack, while a
 parameter revision alone does not.
 
-`certificate_matrix` masks the cached stack by active support.
-`certificate_vectors` exposes its unmasked rows and
-`mask_certificate_vectors` applies one mask for multi-support paths. Certificate
+`certificate_matrix` masks the cached stack by active support, and
+`certificate_stack_for_masks` masks it for a stack of supports at once. Certificate
 refresh cadence remains in trainer and shell-controller protocol flow; the
 compact production path does not suppress or coalesce refreshes.
 
@@ -257,10 +258,10 @@ Boundary search follows this control flow:
 train_task(task)
   -> boundary_search(task_id) if no support is already set
      -> make_bundle(task_id)
-        -> current task eval batches
-        -> rollout train batches
-        -> worst-old eval batch
-        -> mixed-old fragments
+        -> current task eval batches       (validation split)
+        -> rollout train batches           (fit split)
+        -> worst-old eval batch            (validation split)
+        -> mixed-old fragments             (validation split)
      -> enumerate_nonshared_supports(cfg)
      -> static_support_scores_batched(...)
      -> support posterior ranking
@@ -287,8 +288,8 @@ current_first_loss
 the trainer, trains over the rollout batches, applies the same gradient masking
 and shell edits as training, and re-evaluates the boundary objective. The phi
 neighborhood is deterministic: the current four-value `PhiConfig` plus bounded
-+/- perturbations of each coordinate. `rollout_score` remains as the sequential
-single-trial path and is what the equivalence tests compare against.
++/- perturbations of each coordinate. The equivalence tests compare every row
+against a sequential single-trial reference kept in the tests.
 
 Two exact reductions shrink the physical work while keeping the logical grid.
 Phi reaches a trajectory only through `apply_structural_edits`, which reads
@@ -650,8 +651,8 @@ the graph or claim a runtime improvement.
   `build_update_programs` closes over stable graph, optimizer, and resistance
   configuration while keeping parameters, optimizer state, clamps, support
   masks, and RNG dynamic. Its compiled core performs learner gradients, support
-  masking, precision treatment, optimizer transition, and parameter application
-  in that order. Program dictionaries are built once and shared unchanged with
+  masking, precision treatment, optimizer transition, update masking, and
+  parameter application in that order. Program dictionaries are built once and shared unchanged with
   rollout clones.
 
   `build_evaluation_programs` constructs compiled raw-inference, detailed, and
@@ -734,7 +735,8 @@ the graph or claim a runtime improvement.
 
 Both learners are siblings under the abstract base rather than one inheriting
 the other. The stage order of an update — gradient production, support masking,
-the configured precision treatment, AdamW, then parameter application — is
+the configured precision treatment, AdamW, update masking, then parameter
+application — is
 fixed in the shared compiled-update builder, and rollout trials run the same
 state-producing template, so no trial can substitute a different update
 algorithm.
@@ -751,7 +753,8 @@ algorithm.
   snapshot assembly, task artifact export, checkpoint serialization, the final
   bundle, and the two files written while a run is in flight (`events.jsonl`,
   `heartbeat.json`). `build_run_snapshot` is deliberately stateful: it evaluates
-  every saved support, advances evaluation RNG, and may refresh certificates.
+  every saved support and advances evaluation RNG. It never refreshes
+  certificates, and neither does any other reporting evaluation.
   `support_diagnostics.json` is no longer produced; task-level support entropy
   and controller-relevant diagnostics remain. `plots.py` holds the figures for
   both protocols and selects the headless Agg backend on import.
@@ -773,7 +776,7 @@ The end-to-end flow is:
 make_hibacaml_config(mode)
 override(cfg, ...)
 run_experiment(cfg, ...)
-  -> build_split_mnist_tasks(cfg, limit=tasks_limit)
+  -> build_split_mnist_tasks(cfg, limit=tasks_limit, validation_fraction)
   -> prepare_run_root(cfg, run_id)            # hibacaml/experiment.py
   -> build_trainer(cfg, tasks, learning)      # hibacaml/experiment.py
        -> create_hibacaml_structure(cfg, inference, graph_state_initializer)
@@ -788,7 +791,7 @@ run_experiment(cfg, ...)
          -> shell structural edits
          -> certificate refresh
          -> optional demotion and one-swap audits
-       evaluate_all_saved_supports()
+       evaluate_all_saved_supports(refresh_certificates=False)
        export_task_artifacts(trainer, task_id)
        save_checkpoint(trainer, task_id)
   -> build_run_snapshot(trainer)
@@ -830,7 +833,8 @@ The AGI draft describes task-incremental Split-MNIST with five binary tasks:
 
 Images are converted into sixteen non-overlapping `7 x 7` patches. Each patch
 is embedded, coordinates are appended, and the columnar recurrent/predictive
-coding stack processes the resulting token sequence. The paper uses task-local
+coding stack processes the resulting token sequence. The code keeps the patch
+grid but drops the shared learned embedding (section 4.3). The paper uses task-local
 two-way readouts to isolate representation forgetting from class-head
 interference.
 
@@ -845,6 +849,13 @@ sets `KERAS_BACKEND=jax`, loads MNIST through
 Images are filtered to each task's two classes first and then normalized by
 MNIST mean/std and reshaped to `28 x 28 x 1`, so no float32 copy of the full
 dataset is held alongside the per-task copies.
+
+Each task's official training examples are split by a seed-controlled
+stratified draw (`validation_fraction = 0.10`, seed `cfg.seed + task_id`) into
+fit and validation sets. Training reads the fit split, every structural audit
+reads the validation split (`AUDIT_SPLIT` in `control/scoring.py`), and the
+official test split is read only for reporting. `MnistTask.loader(split)`
+returns a named split and raises when it is missing rather than falling back.
 
 The optional `limit` argument caps how many tasks are built and is what
 `run_experiment`'s `tasks_limit` forwards. It deliberately does not go through
@@ -871,19 +882,22 @@ evaluation protocol.
 
 ### 4.3 Patch Processing
 
-`PatchTokenizerNode` implements the paper's patch-token step:
+`PatchTokenizerNode` implements the patch-token step without parameters:
 
 ```text
 image: (28, 28, 1)
-  -> reshape into 4 x 4 grid of 7 x 7 patches
-  -> flatten each patch
-  -> learned linear projection to patch_embed_dim
+  -> reshape into a grid of patch_size patches
+  -> flatten each patch (raw pixels)
   -> append normalized (y, x) coordinates
-  -> output: (16, patch_embed_dim + coord_dim)
+  -> output: (num_patches, ph * pw * channels + coord_dim)
 ```
 
-The default config sets `patch_embed_dim = 12` and `patch_coord_dim = 2`, so
-each token has 14 dimensions.
+There is no learned projection. A shared embedding would be trained by every
+task and sit outside the support mask, so each column's `b_micro` learns its own
+projection of the raw pixels instead. The config default `patch_size = (7, 7)`
+gives 16 tokens of 51 dimensions. The Split-MNIST runner overrides it to
+`(28, 28)`, one flattened token of 786 dimensions, which is the Stage 0 best
+configuration.
 
 ### 4.4 Task Splitting and Heads
 
@@ -925,7 +939,9 @@ For each task, `_run_tasks` calls `trainer.train_task(task)`. Training:
 1. selects a support at the task boundary if no support is set;
 2. runs the complete compiled learner update on each training batch;
 3. masks inactive-column gradients inside that update using the dynamic support;
-4. applies precision resistance, optimizer transition, and parameters inside it;
+4. applies precision resistance and the optimizer transition, then masks the
+   updates too, because AdamW momentum and weight decay would otherwise still
+   move inactive columns; parameters are applied last;
 5. applies shell structural edits to active columns;
 6. periodically refreshes certificates;
 7. periodically performs demotion and local one-swap audits;
@@ -1004,6 +1020,9 @@ clamped, so cotangents reaching them are inert by construction.
 
 After each task, `_run_tasks` calls `evaluate_all_saved_supports`, producing
 an accuracy matrix over all completed tasks under their frozen saved supports.
+Reporting evaluations (this one, the task's final evaluation, snapshots and
+exports) read the test split and never refresh certificates, so observing a run
+cannot change it. Structural audits read only the validation split.
 Evaluation uses the `target_free_inference_external_supervision_v1` protocol:
 the graph is clamped only to the image, support mask, task query, and certificate
 inputs. The class target and the two class-derived hierarchy targets are kept
@@ -1089,11 +1108,11 @@ composer diagnostics each use compact host materialization without changing
 their reduction order. Evaluation never runs `composer_diagnostics_from_state`
 as a second forward and never reuses a cached general-evaluation result.
 
-For compatibility, Split-MNIST `evaluate_task` still refreshes certificates on
-its first test batch by default. Full-MNIST passes
-`refresh_certificates=False` explicitly for fit, validation, official test,
-snapshot, and export calls. `build_run_snapshot` and `export_task_artifacts`
-remain separate evaluation requests; neither reuses the other's result.
+Reporting never refreshes certificates in either protocol: `train_task`'s
+final evaluation, `build_run_snapshot`, and `export_task_artifacts` pass
+`refresh_certificates=False` internally, and the runners pass it for their own
+evaluations. `build_run_snapshot` and `export_task_artifacts` remain separate
+evaluation requests; neither reuses the other's result.
 Consequently held-out data cannot advance shell
 EMAs or recompute certificates. Epoch loss means are weighted by actual batch
 size, including partial batches, and epoch evaluations are checkpointed and
@@ -1131,10 +1150,12 @@ configs:
 
 - seed: `0`
 - input shape: `(28, 28, 1)`
-- patch size: `(7, 7)`
+- patch size: `(7, 7)` in config; `OVERRIDES["patch_size"] = (28, 28)` in the
+  Split-MNIST runner (flattened tokens)
 - number of tasks: `5`
 - batch size in config: `256`
-- experiment script override: `OVERRIDES["batch_size"] = 768`
+- experiment script override: `OVERRIDES["batch_size"] = 1024`
+- validation fraction: `0.10` of each task's training examples
 - epochs per task: `5`
 - inference steps: `16` in normal mode and `4` in smoke mode
 - inference rate: `0.05`
@@ -1145,7 +1166,7 @@ configs:
 - composer hidden dimension: `64`
 - composer top-k: `3`
 - exact boundary shortlist: config default `8`
-- experiment script static/neighbor support batch sizes: `16`
+- experiment script static/neighbor support batch sizes: `32`
 - experiment script audit data batch caps: `128` for all six of
   `boundary_current`, `rollout_train`, `boundary_worst_old`,
   `boundary_mixed_old`, `local_swap_audit`, and `demotion_audit`
@@ -1206,8 +1227,6 @@ records both expected and completed update counts in its artifacts.
 - Two-level architecture: implemented through support control plus internal
   shell/certificate control.
 - Split-MNIST five-task setup: implemented exactly as binary digit pairs.
-- Patch tokenization: implemented as 16 non-overlapping `7 x 7` patches with
-  learned embeddings and coordinates.
 - Column pool size and partition: defaults match 20 total, 2 shared, 15
   adaptive, 3 reserve.
 - Sparse active support: 2 shared plus 3 nonshared columns.
@@ -1231,6 +1250,10 @@ records both expected and completed update counts in its artifacts.
   a larger inactive pool.
 - Task-local heads are represented by target remapping plus task query and a
   shared two-output graph, not five physically distinct heads.
+- Patch tokenization keeps the paper's raw patches and coordinates but drops
+  the shared learned embedding, which leaked across tasks outside the support
+  mask; the Split-MNIST runner uses one flattened `28 x 28` token instead of
+  sixteen `7 x 7` patches.
 - The three paper micro-column roles map to `b_micro`, recurrent `k_micro`
   depth nodes, and `l_micro`, with implementation-specific lateral wiring.
 - Internal Bayesian state is a precision/certificate approximation rather than
