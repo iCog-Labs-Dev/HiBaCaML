@@ -304,20 +304,6 @@ class CertificateController:
         self._certificate_stack_cache = (persistent_state, revision, stack)
         return stack
 
-    def certificate_vectors(
-        self,
-        persistent_state: PersistentHiBaCaMLState,
-    ) -> Dict[int, jnp.ndarray]:
-        """Return the unmasked per-column certificate vectors.
-
-        Retained for the frozen control baseline capture.
-        """
-        stack = self._certificate_stack(persistent_state)
-        return {
-            index: stack[index]
-            for index in range(self.cfg.column_pool.total_columns)
-        }
-
     def certificate_stack_for_masks(
         self,
         persistent_state: PersistentHiBaCaMLState,

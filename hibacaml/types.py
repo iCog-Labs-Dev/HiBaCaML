@@ -22,6 +22,16 @@ class MnistTask:
     output_dim: int
     validation_loader: Any | None = None
 
+    def loader(self, split: str):
+        loader = {
+            "train": self.train_loader,
+            "validation": self.validation_loader,
+            "test": self.test_loader,
+        }[split]
+        if loader is None:
+            raise ValueError(f"task {self.task_id} has no {split} split")
+        return loader
+
 
 @dataclass(frozen=True)
 class BoundaryBundle:

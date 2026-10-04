@@ -33,10 +33,12 @@ from hibacaml.reporting import (
 MODE = "default"                       # "default" or "smoke"
 LEARNING = "backprop"                  # "pc" or "backprop"
 TASKS_LIMIT = None                     # e.g. 2, 5, or None for all
+VALIDATION_FRACTION = 0.10             # per task, carved from its training data; audits read it
 
 # Any HiBaCaMLConfig field to override for this run.
 OVERRIDES = {
     "batch_size": 1024,
+    "patch_size": (28, 28),            # flattened tokens: the Stage 0 best configuration
     "exact_search__static_support_batch_size": 32,
     "exact_search__neighbor_support_batch_size": 32,
     "exact_search__boundary_current_data_batch_size": 128,
@@ -153,7 +155,8 @@ def _run_tasks(
     for task in tasks:
         log_progress(f"task={task.task_id} train start", component="runner")
         summary = trainer.train_task(task)
-        eval_results = trainer.evaluate_all_saved_supports()
+        # Reporting observes the run, so it never refreshes certificates.
+        eval_results = trainer.evaluate_all_saved_supports(refresh_certificates=False)
 
         accuracy_matrix[task.task_id] = {
             eval_task_id: metrics["accuracy"]
@@ -260,6 +263,7 @@ def run_experiment(
     tasks_limit: int | None = TASKS_LIMIT,
     plots_dir: str | None = None,
     run_id: str | None = None,
+    validation_fraction: float = VALIDATION_FRACTION,
 ):
     if learning not in ("pc", "backprop"):
         raise ValueError("learning must be 'pc' or 'backprop'")
@@ -269,7 +273,9 @@ def run_experiment(
         component="runner",
     )
 
-    tasks = build_split_mnist_tasks(cfg, limit=tasks_limit)
+    tasks = build_split_mnist_tasks(
+        cfg, limit=tasks_limit, validation_fraction=validation_fraction
+    )
 
     log_progress(f"loaded {len(tasks)} Split-MNIST tasks", component="runner")
 
@@ -279,7 +285,13 @@ def run_experiment(
     cfg, run_output_root = prepare_run_root(cfg, run_id)
     run_plots_dir = Path(plots_dir) if plots_dir else run_output_root / "plots"
 
-    _, trainer = build_trainer(cfg, tasks, learning, run_id=run_id)
+    _, trainer = build_trainer(
+        cfg,
+        tasks,
+        learning,
+        run_id=run_id,
+        experiment_metadata={"validation_fraction": validation_fraction},
+    )
 
     results = _run_tasks(
         trainer,
