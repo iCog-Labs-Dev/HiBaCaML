@@ -58,7 +58,6 @@ def create_hibacaml_structure(
         shape=(cfg.num_patches, cfg.patch_token_dim),
         name="patch_tokens",
         patch_size=cfg.patch_size,
-        patch_embed_dim=cfg.patch_embed_dim,
         coord_dim=cfg.patch_coord_dim,
     )
     nodes.extend([image_input, support_mask, task_query, patch_tokens])
