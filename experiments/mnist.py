@@ -218,11 +218,7 @@ def run_experiment(
     expected_support = tuple(range(bank))
     if default_nonshared_support(cfg) != expected_nonshared:
         raise AssertionError("default support is not the full adaptive bank")
-    summary = trainer.train_task(
-        task,
-        final_evaluation_refresh_certificates=False,
-        evaluate_train_each_epoch=True,
-    )
+    summary = trainer.train_task(task, evaluate_train_each_epoch=True)
     persisted_nonshared = trainer.persistent_state.current_support[task.task_id]
     full_support = trainer.active_full_support(persisted_nonshared)
     if tuple(persisted_nonshared) != expected_nonshared:
@@ -255,17 +251,9 @@ def run_experiment(
     }
     experiment_metadata.update(completed_schedule)
     trainer.experiment_metadata.update(completed_schedule)
-    snapshot = build_run_snapshot(
-        trainer,
-        refresh_evaluation_certificates=False,
-    )
+    snapshot = build_run_snapshot(trainer)
     export_run_artifacts(snapshot, run_output_root / "final")
-    export_task_artifacts(
-        trainer,
-        task.task_id,
-        root=run_output_root / "task_0",
-        refresh_evaluation_certificates=False,
-    )
+    export_task_artifacts(trainer, task.task_id, root=run_output_root / "task_0")
     checkpoint_path = save_checkpoint(
         trainer,
         task.task_id,

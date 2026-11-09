@@ -124,6 +124,8 @@ class ExactSearchConfig:
     demotion_audit_interval: int = 64
     demotion_audit_max_candidates: int = 8
     demotion_swap_margin: float = 0.005
+    # Effective precision below which inhibition alone cannot push a unit.
+    inhibition_precision_floor: float = 0.25
     outer_quantile_bounds: Tuple[float, float] = (0.05, 0.30)
     middle_quantile_bounds: Tuple[float, float] = (0.02, 0.15)
     replacement_margin_bounds: Tuple[float, float] = (0.04, 0.18)
@@ -153,8 +155,6 @@ class ReportingConfig:
     checkpoint_filename: str = "hibacaml_checkpoint.pkl"
     selector_bank_filename: str = "bank.pkl"
     selector_bank_metadata_filename: str = "bank_metadata.json"
-    export_progress_every: int = 1
-    export_selector_replay_dataset: bool = True
 
 
 @dataclass(frozen=True)
@@ -165,7 +165,6 @@ class HiBaCaMLConfig:
     seed: int = 0
     input_shape: Tuple[int, int, int] = (28, 28, 1)
     patch_size: Tuple[int, int] = (7, 7)
-    patch_embed_dim: int = 12
     patch_coord_dim: int = 2
     task_local_heads: bool = True
     num_tasks: int = 5
@@ -197,7 +196,8 @@ class HiBaCaMLConfig:
 
     @property
     def patch_token_dim(self) -> int:
-        return self.patch_embed_dim + self.patch_coord_dim
+        ph, pw = self.patch_size
+        return ph * pw * self.input_shape[2] + self.patch_coord_dim
 
     @property
     def composer_cert_dim(self) -> int:
@@ -240,7 +240,6 @@ def make_hibacaml_config(mode: str = "default") -> HiBaCaMLConfig:
                 shell_sizes=(1, 1, 1),
                 kernel_depth=2,
             ),
-            patch_embed_dim=8,
             cert_refresh_interval=1,
             train_batches_limit=1,
             test_batches_limit=1,

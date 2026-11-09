@@ -130,11 +130,7 @@ def write_run_state(root: str | Path, /, **fields: Any) -> None:
     )
 
 
-def build_run_snapshot(
-    trainer,
-    *,
-    refresh_evaluation_certificates: bool = True,
-) -> Dict[str, object]:
+def build_run_snapshot(trainer) -> Dict[str, object]:
     """Build a run snapshot, evaluating saved supports and advancing evaluation state."""
     return {
         "cfg": trainer.cfg.to_dict(),
@@ -164,9 +160,8 @@ def build_run_snapshot(
                 trainer.persistent_state.task_support_snapshots.items()
             )
         },
-        "evaluations": trainer.evaluate_all_saved_supports(
-            refresh_certificates=refresh_evaluation_certificates,
-        ),
+        # Reporting observes the run, so it never refreshes certificates.
+        "evaluations": trainer.evaluate_all_saved_supports(refresh_certificates=False),
         "global_step": trainer.persistent_state.global_step,
         "params_revision": trainer.persistent_state.params_revision,
         "timing_summaries": trainer.persistent_state.timing_summaries,
@@ -233,8 +228,6 @@ def export_task_artifacts(
     trainer,
     task_id: int,
     root: str | Path | None = None,
-    *,
-    refresh_evaluation_certificates: bool = True,
 ) -> Path:
     """Build and export one task's run artifact bundle."""
     run_root = (
@@ -251,13 +244,7 @@ def export_task_artifacts(
             root=str(run_root),
         )
     run_root.mkdir(parents=True, exist_ok=True)
-    export_run_artifacts(
-        build_run_snapshot(
-            trainer,
-            refresh_evaluation_certificates=refresh_evaluation_certificates,
-        ),
-        run_root,
-    )
+    export_run_artifacts(build_run_snapshot(trainer), run_root)
     log_progress(f"export task={task_id} done root={run_root}", component="report")
     if trainer.run_root is not None:
         append_event(

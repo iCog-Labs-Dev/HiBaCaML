@@ -100,7 +100,6 @@ class ExactSearchService:
         self.run_id = run_id
         self.scorer = SupportScorer(cfg)
 
-
     def rollout_rows(
         self,
         task_id: int,
@@ -122,20 +121,6 @@ class ExactSearchService:
                 self._controller_row(leaders[rollout_trajectory_key(phi)], phi)
                 for phi in phis
             ]
-
-    def rollout_score(
-        self,
-        task_id: int,
-        support_cols: Sequence[int],
-        phi: PhiConfig,
-        bundle: BoundaryBundle,
-    ) -> ControllerSearchRow:
-        """One trial with no prefix and no grouping: the sequential reference."""
-        with rollout_logging():
-            trajectory = self._rollout_trajectory(
-                None, None, bundle.train_batches, task_id, support_cols, phi, bundle
-            )
-            return self._controller_row(trajectory, phi)
 
     def _rollout_prefix(self, task_id: int, support_cols: Sequence[int], bundle: BoundaryBundle):
         """Run the phi-invariant first update once."""

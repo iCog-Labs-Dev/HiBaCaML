@@ -11,6 +11,9 @@ from hibacaml.config import HiBaCaMLConfig
 from hibacaml.control.ranking import candidate_chunks
 from hibacaml.types import BoundaryBundle, SupportSearchRow
 
+#: The split every structural audit reads. Test data stays reserved for reporting.
+AUDIT_SPLIT = "validation"
+
 
 class SupportScorer:
     """Builds audit bundles and scores support candidates against them."""
@@ -38,7 +41,7 @@ class SupportScorer:
         current_eval = tuple(
             self._slice_batch(batch, caps["current"])
             for batch in islice(
-                task.test_loader, self.cfg.exact_search.boundary_current_batches
+                task.loader(AUDIT_SPLIT), self.cfg.exact_search.boundary_current_batches
             )
         )
         train_batches = ()
@@ -54,13 +57,16 @@ class SupportScorer:
         worst_old_eval = None
         mixed_old_eval: List[Tuple[int, Dict[str, jnp.ndarray]]] = []
         if task_id > 0:
-            saved = trainer.evaluate_all_saved_supports()
+            # Part of the decision, unlike reporting evaluations, so it refreshes certificates.
+            saved = trainer.evaluate_all_saved_supports(
+                split=AUDIT_SPLIT, refresh_certificates=True
+            )
             if saved:
                 worst_old = min(saved, key=lambda key: saved[key]["accuracy"])
             if worst_old is not None:
                 worst_old_task = trainer.task(worst_old)
                 worst_old_eval = self._concat_loader_prefix(
-                    worst_old_task.test_loader,
+                    worst_old_task.loader(AUDIT_SPLIT),
                     self.cfg.exact_search.boundary_old_batches,
                     batch_size=caps["worst_old"],
                 )
@@ -154,7 +160,7 @@ class SupportScorer:
         """Build one deterministic mixed-old batch from all prior tasks."""
         prior_batches: List[Tuple[int, Dict[str, jnp.ndarray]]] = []
         for prev_task_id in range(task_id):
-            batch = next(iter(trainer.task(prev_task_id).test_loader), None)
+            batch = next(iter(trainer.task(prev_task_id).loader(AUDIT_SPLIT)), None)
             if batch is not None:
                 prior_batches.append((prev_task_id, batch))
         if not prior_batches:
@@ -172,7 +178,7 @@ class SupportScorer:
             take = per_source + (1 if idx < remainder else 0)
             remaining = take
             pieces = []
-            for batch in trainer.task(prev_task_id).test_loader:
+            for batch in trainer.task(prev_task_id).loader(AUDIT_SPLIT):
                 take_now = min(remaining, int(batch["x"].shape[0]))
                 if take_now <= 0:
                     continue

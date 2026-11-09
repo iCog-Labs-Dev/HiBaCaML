@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Dict, Sequence
 
 import jax
@@ -418,9 +419,15 @@ class ShellController:
 
     def _apply_inhibition(self, node_params: NodeParams, inhibition: Dict[str, jnp.ndarray]) -> NodeParams:
         biases = dict(node_params.biases)
+        floor = self.cfg.exact_search.inhibition_precision_floor
+        floor_logit = math.log(floor / (1.0 - floor))
         for shell_name, adjust in inhibition.items():
             key = f"log_precision_{shell_name}"
-            biases[key] = biases[key] - adjust.reshape((1, 1, -1))
+
+            biases[key] = jnp.maximum(
+                biases[key] - adjust.reshape((1, 1, -1)),
+                jnp.minimum(biases[key], floor_logit),
+            )
         return NodeParams(weights=dict(node_params.weights), biases=biases)
 
     def _prune_units(self, node_params: NodeParams, shell_name: str, indices: Sequence[int]) -> NodeParams:

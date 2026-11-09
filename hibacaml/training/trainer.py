@@ -54,10 +54,19 @@ from hibacaml.types import (
 _TRAINER_INSTANCE_COUNTER = itertools.count()
 
 
-def _mask_gradients(grads, support_mask, node_column_index):
+def node_column_index(structure) -> Dict[str, int]:
+    """Column index of every column-owned node; nodes outside columns are absent."""
+    return {
+        name: int(name.split("/")[0][3:])
+        for name in structure.nodes
+        if name.startswith("col")
+    }
+
+
+def _mask_gradients(grads, support_mask, column_of_node):
     masked_nodes = {}
     for node_name, node_grads in grads.nodes.items():
-        column_index = node_column_index.get(node_name)
+        column_index = column_of_node.get(node_name)
         if column_index is None:
             masked_nodes[node_name] = node_grads
             continue
@@ -77,11 +86,7 @@ def build_update_programs(
     *,
     allow_lean,
 ):
-    node_column_index = {
-        name: int(name.split("/")[0][3:])
-        for name in structure.nodes
-        if name.startswith("col")
-    }
+    column_of_node = node_column_index(structure)
     support_mask_node = structure.config["hibacaml"]["support_mask_node"]
     shell_names = tuple(shell_slices(cfg))
     resistance_enabled = cfg.exact_search.enable_precision_update_resistance
@@ -90,11 +95,8 @@ def build_update_programs(
 
     def update_core(params, opt_state, inputs, rng_key):
         grads, loss_vector, final_state = gradient_step(params, inputs, rng_key)
-        grads = _mask_gradients(
-            grads,
-            inputs["clamps"][support_mask_node][0],
-            node_column_index,
-        )
+        support_mask = inputs["clamps"][support_mask_node][0]
+        grads = _mask_gradients(grads, support_mask, column_of_node)
         grads = precision_weight_gradients(
             grads,
             params,
@@ -104,6 +106,9 @@ def build_update_programs(
             floor=resistance_floor,
         )
         updates, new_opt_state = optimizer.update(grads, opt_state, params)
+        # AdamW momentum and weight decay still move inactive columns after
+        # gradient masking, so the updates are masked too.
+        updates = _mask_gradients(updates, support_mask, column_of_node)
         new_params = optax.apply_updates(params, updates)
         return new_params, new_opt_state, loss_vector, final_state
 
@@ -599,17 +604,6 @@ class HiBaCaMLTrainer(ABC):
             self._last_graph_state = final_state
         return loss_dict_from_vector(loss_vector), final_state
 
-    def _mask_grads(self, grads, nonshared: Sequence[int]):
-        return _mask_gradients(
-            grads,
-            self.build_support_mask(nonshared),
-            {
-                name: int(name.split("/")[0][3:])
-                for name in self.structure.nodes
-                if name.startswith("col")
-            },
-        )
-
     def _train_batch(
         self,
         task: MnistTask,
@@ -861,7 +855,6 @@ class HiBaCaMLTrainer(ABC):
         self,
         task: MnistTask,
         *,
-        final_evaluation_refresh_certificates: bool = True,
         evaluate_train_each_epoch: bool = False,
     ) -> TaskSummary:
         if task.task_id not in self.persistent_state.current_support:
@@ -937,10 +930,8 @@ class HiBaCaMLTrainer(ABC):
                     row_count=len(self.selector_bank),
                     path=str(self.selector_bank.bank_path),
                 )
-        metrics = self.evaluate_task(
-            task.task_id,
-            refresh_certificates=final_evaluation_refresh_certificates,
-        )
+        # Reporting observes the run, so it never refreshes certificates.
+        metrics = self.evaluate_task(task.task_id, refresh_certificates=False)
         summary = TaskSummary(
             task_id=task.task_id,
             classes=task.classes,
@@ -1024,25 +1015,6 @@ class HiBaCaMLTrainer(ABC):
             else self._evaluate_prepared_batch
         )
         return evaluate(params, clamps, targets, state_key)
-
-    def evaluate_batch_outputs(
-        self,
-        task: MnistTask,
-        batch: Dict[str, jnp.ndarray],
-        nonshared: Sequence[int],
-        params=None,
-        *,
-        refresh_certificates: bool = True,
-    ):
-        """Return target-free predictions and externally scored losses."""
-        logits, per_sample_total, _, _ = self._evaluate_supports_batch(
-            batch,
-            task,
-            (nonshared,),
-            params=params,
-            refresh_certificates=refresh_certificates,
-        )
-        return logits, per_sample_total
 
     def evaluate_batch_loss(
         self,
@@ -1171,6 +1143,7 @@ class HiBaCaMLTrainer(ABC):
         *,
         mode: Optional[str] = None,
         refresh_certificates: bool = True,
+        split: str = "test",
     ) -> Dict[str, object]:
         task = self.tasks[task_id]
         if nonshared is None:
@@ -1181,18 +1154,18 @@ class HiBaCaMLTrainer(ABC):
             mode = mode or "custom"
         metrics = self.evaluate_loader(
             task,
-            task.test_loader,
+            task.loader(split),
             nonshared,
-            split_name="test",
+            split_name=split,
             mode=mode,
             refresh_certificates=refresh_certificates,
         )
         old_accuracies = [1.0] if task_id == 0 else [
             self.evaluate_loader(
                 self.tasks[prev_task_id],
-                self.tasks[prev_task_id].test_loader,
+                self.tasks[prev_task_id].loader(split),
                 snapshot.nonshared,
-                split_name="test",
+                split_name=split,
                 mode="saved",
                 refresh_certificates=refresh_certificates,
             )["accuracy"]
@@ -1214,6 +1187,7 @@ class HiBaCaMLTrainer(ABC):
         self,
         *,
         refresh_certificates: bool = True,
+        split: str = "test",
     ) -> Dict[int, Dict[str, object]]:
         task_ids = sorted(self.persistent_state.task_support_snapshots)
         results = {}
@@ -1221,5 +1195,6 @@ class HiBaCaMLTrainer(ABC):
             results[task_id] = self.evaluate_task(
                 task_id,
                 refresh_certificates=refresh_certificates,
+                split=split,
             )
         return results

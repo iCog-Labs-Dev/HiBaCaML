@@ -213,19 +213,13 @@ def _make_task(
     cfg: HiBaCaMLConfig,
     *,
     train: Tuple[np.ndarray, np.ndarray],
+    validation: Tuple[np.ndarray, np.ndarray],
     test: Tuple[np.ndarray, np.ndarray],
-    validation: Optional[Tuple[np.ndarray, np.ndarray]] = None,
     shuffle_seed: int,
 ) -> MnistTask:
-    """Build one task from its raw `(images, labels)` splits.
-
-    The only difference between the Split- and Full-MNIST protocols is which
-    splits arrive here: Split passes train/test, Full adds validation.
-    """
+    """Build one task from its raw `(images, labels)` fit, validation and test splits."""
 
     def loader(split, shuffle, seed, limit):
-        if split is None:
-            return None
         return _make_loader(
             *split, classes, cfg, shuffle=shuffle, seed=seed, max_batches=limit
         )
@@ -246,12 +240,16 @@ def build_split_mnist_tasks(
     cfg: HiBaCaMLConfig,
     *,
     limit: int | None = None,
+    validation_fraction: float = 0.10,
 ) -> Tuple[MnistTask, ...]:
     """Build the task-incremental Split-MNIST tasks.
 
     `limit` caps how many tasks are built. It deliberately does not go through
     `cfg.num_tasks`, which also sizes the replay-bank context vector's task
     one-hot (see `hibacaml/control/replay_bank.py`).
+
+    Each task's validation split is carved from its own training examples. The
+    structural audits read it; they never read test data.
     """
     train_x, train_y, test_x, test_y = _load_mnist_arrays()
     task_count = cfg.num_tasks if limit is None else min(cfg.num_tasks, limit)
@@ -260,11 +258,18 @@ def build_split_mnist_tasks(
     for task_id, classes in enumerate(_TASK_CLASS_PAIRS[:task_count]):
         train_mask = np.isin(train_y, np.asarray(classes))
         test_mask = np.isin(test_y, np.asarray(classes))
+        task_x, task_y = train_x[train_mask], train_y[train_mask]
+        fit, validation = _stratified_train_validation_indices(
+            task_y,
+            validation_fraction=validation_fraction,
+            seed=cfg.seed + task_id,
+        )
         task = _make_task(
             task_id,
             classes,
             cfg,
-            train=(train_x[train_mask], train_y[train_mask]),
+            train=(task_x[fit], task_y[fit]),
+            validation=(task_x[validation], task_y[validation]),
             test=(test_x[test_mask], test_y[test_mask]),
             shuffle_seed=cfg.seed + task_id,
         )
@@ -272,6 +277,7 @@ def build_split_mnist_tasks(
         log_progress(
             f"task={task_id} built classes={classes} "
             f"train_examples={task.train_loader.images.shape[0]} "
+            f"validation_examples={task.validation_loader.images.shape[0]} "
             f"test_examples={task.test_loader.images.shape[0]} "
             f"train_batches={len(task.train_loader)} "
             f"test_batches={len(task.test_loader)}",

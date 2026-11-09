@@ -9,7 +9,7 @@ import jax.numpy as jnp
 
 from fabricpc.core.activations import IdentityActivation
 from fabricpc.core.energy import GaussianEnergy
-from fabricpc.core.initializers import NormalInitializer, initialize
+from fabricpc.core.initializers import NormalInitializer
 from fabricpc.core.types import NodeInfo, NodeParams, NodeState
 from fabricpc.nodes.base import NodeBase, SlotSpec
 from hibacaml.nodes.common import (
@@ -21,7 +21,11 @@ from hibacaml.nodes.common import (
 
 
 class PatchTokenizerNode(NodeBase):
-    """Convert an image into patch tokens with learned patch embeddings."""
+    """Split an image into raw pixel patch tokens with fixed coordinates.
+
+    Parameter-free: each column's B micro-column learns its own patch projection,
+    so no trainable stage is shared across columns.
+    """
 
     def __init__(
         self,
@@ -30,9 +34,7 @@ class PatchTokenizerNode(NodeBase):
         activation=IdentityActivation(),
         energy=GaussianEnergy(),
         latent_init=NormalInitializer(),
-        weight_init=NormalInitializer(std=0.02),
         patch_size: Tuple[int, int] = (7, 7),
-        patch_embed_dim: int = 12,
         coord_dim: int = 2,
     ):
         super().__init__(
@@ -41,9 +43,7 @@ class PatchTokenizerNode(NodeBase):
             activation=activation,
             energy=energy,
             latent_init=latent_init,
-            weight_init=weight_init,
             patch_size=patch_size,
-            patch_embed_dim=patch_embed_dim,
             coord_dim=coord_dim,
         )
 
@@ -59,17 +59,7 @@ class PatchTokenizerNode(NodeBase):
         weight_init=None,
         config: Optional[Dict[str, Any]] = None,
     ) -> NodeParams:
-        if config is None:
-            config = {}
-        if weight_init is None:
-            weight_init = NormalInitializer(std=0.02)
-        patch_h, patch_w = config["patch_size"]
-        embed_dim = int(config["patch_embed_dim"])
-        input_shape = next(iter(input_shapes.values()))
-        in_dim = int(patch_h * patch_w * input_shape[-1])
-        proj = initialize(key, (in_dim, embed_dim), weight_init)
-        bias = jnp.zeros((1, 1, embed_dim))
-        return NodeParams(weights={"proj": proj}, biases={"b_proj": bias})
+        return NodeParams(weights={}, biases={})
 
     @staticmethod
     def forward(
@@ -92,10 +82,9 @@ class PatchTokenizerNode(NodeBase):
         patches = patches.transpose(0, 1, 3, 2, 4, 5).reshape(
             batch, nh * nw, patch_h * patch_w * channels
         )
-        embedded = jnp.matmul(patches, params.weights["proj"]) + params.biases["b_proj"]
 
-        ys = jnp.linspace(0.0, 1.0, nh, dtype=embedded.dtype)
-        xs = jnp.linspace(0.0, 1.0, nw, dtype=embedded.dtype)
+        ys = jnp.linspace(0.0, 1.0, nh, dtype=patches.dtype)
+        xs = jnp.linspace(0.0, 1.0, nw, dtype=patches.dtype)
         yy, xx = jnp.meshgrid(ys, xs, indexing="ij")
         coords = jnp.stack([yy, xx], axis=-1).reshape(1, nh * nw, 2)
         coords = jnp.broadcast_to(coords, (batch, nh * nw, 2))
@@ -104,7 +93,7 @@ class PatchTokenizerNode(NodeBase):
                 :, :, :coord_dim
             ]
 
-        pre_activation = jnp.concatenate([embedded, coords], axis=-1)
+        pre_activation = jnp.concatenate([patches, coords], axis=-1)
         z_mu = apply_activation(node_info, pre_activation)
         return finalize_state(state, node_info, z_mu)
 
