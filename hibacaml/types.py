@@ -11,8 +11,8 @@ from fabricpc.core.types import GraphParams
 
 
 @dataclass(frozen=True)
-class MnistTask:
-    """MNIST task loaders and metadata."""
+class Task:
+    """One task's loaders and metadata."""
 
     task_id: int
     classes: Tuple[int, ...]
@@ -265,6 +265,10 @@ class PersistentHiBaCaMLState:
     timing_summaries: Dict[int, Dict[str, float]] = field(default_factory=dict)
     params: Optional[GraphParams] = None
     opt_state: Any = None
+    # Per-unit shell tier labels (node -> int8 [shell_output_dim]); None keeps
+    # the physical storage layout as the tier membership.
+    shell_roles: Optional[Dict[str, Any]] = None
+    roles_revision: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         """Best-effort conversion for JSON export and tests."""
@@ -294,6 +298,10 @@ def clone_persistent_state(state: PersistentHiBaCaMLState) -> PersistentHiBaCaML
         recently_demoted=dict(state.recently_demoted),
         composer_diagnostics=dict(state.composer_diagnostics),
         certificates=dict(state.certificates),
+        # Copied (200 x 92 int8), so an in-place label edit on a clone never reaches its parent.
+        shell_roles=None if state.shell_roles is None else {
+            name: labels.copy() for name, labels in state.shell_roles.items()
+        },
         # Controller history and reporting are written only on the parent.
         support_tables={},
         support_posterior_tables={},
