@@ -62,9 +62,10 @@ def _composer_gates(
     )
     topk = int(node_config.get("topk", 0))
     if 0 < topk < gate_logits.shape[-1]:
-        topk_values, _ = jax.lax.top_k(jnp.where(active_mask, gate_logits, -1e9), topk)
-        threshold = topk_values[..., -1:]
-        active_mask = active_mask & (gate_logits >= threshold)
+        # Keep the returned indices: a cutoff comparison admits extra tied columns.
+        _, indices = jax.lax.top_k(jnp.where(active_mask, gate_logits, -jnp.inf), topk)
+        selected = jnp.any(jnp.arange(gate_logits.shape[-1]) == indices[..., :, None], axis=-2)
+        active_mask = active_mask & selected
     gate_probs = _masked_softmax(gate_logits / node_config["gate_temp"], active_mask)
 
     weighted_features = jnp.sum(features * gate_probs[..., None], axis=1)
