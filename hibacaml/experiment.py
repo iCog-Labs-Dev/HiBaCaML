@@ -21,7 +21,7 @@ from hibacaml.reporting.logger import log_progress
 from hibacaml.graph import create_hibacaml_structure
 from hibacaml.training import HiBaCaMLBackpropTrainer, HiBaCaMLPCTrainer
 from hibacaml.training.pc import HiBaCaMLPCInference
-from hibacaml.types import MnistTask
+from hibacaml.types import Task
 
 LEARNERS = ("pc", "backprop")
 
@@ -67,7 +67,8 @@ def _log_run_summary(cfg, tasks, learning: str, structure) -> None:
     """
     pool = cfg.column_pool
     classes = len(tasks[0].classes) if tasks else 0
-    protocol = "Full-MNIST" if len(tasks) == 1 and classes == 10 else "Split-MNIST"
+    dataset = "CIFAR-10" if cfg.input_shape[-1] == 3 else "MNIST"
+    protocol = f"{'Full' if len(tasks) == 1 and classes == 10 else 'Split'}-{dataset}"
     log_progress(
         f"protocol={protocol} tasks={len(tasks)} classes={classes} "
         f"learning={learning}",
@@ -80,6 +81,14 @@ def _log_run_summary(cfg, tasks, learning: str, structure) -> None:
         f"scale={1.0 / pool.active_support_size:.6f}",
         component="runner",
     )
+    rows, cols = cfg.token_grid
+    stem = cfg.stem
+    log_progress(
+        (f"stem channels={stem.channels} strides={stem.strides} pool={stem.pool_window} " if stem else "")
+        + f"tokens={rows}x{cols} token_dim={cfg.patch_token_dim} "
+        f"shared_k={structure.config['hibacaml']['shared_k_connectivity']}",
+        component="runner",
+    )
     log_progress(
         f"schedule epochs={cfg.epochs_per_task} batch={cfg.batch_size} "
         f"seed={cfg.seed} infer_steps={cfg.infer_steps} eta={cfg.eta_infer}",
@@ -89,11 +98,12 @@ def _log_run_summary(cfg, tasks, learning: str, structure) -> None:
 
 def build_trainer(
     cfg: HiBaCaMLConfig,
-    tasks: Sequence[MnistTask],
+    tasks: Sequence[Task],
     learning: str,
     *,
     run_id: str = "",
     experiment_metadata: Optional[Dict[str, object]] = None,
+    shared_k_connectivity: str = "dense",
 ):
     """Build the graph, initialize parameters, and construct one runner."""
     if learning not in LEARNERS:
@@ -110,6 +120,7 @@ def build_trainer(
         cfg,
         inference,
         graph_state_initializer=FeedforwardStateInit(),
+        shared_k_connectivity=shared_k_connectivity,
     )
     _log_run_summary(cfg, tasks, learning, structure)
 

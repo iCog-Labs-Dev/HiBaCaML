@@ -243,6 +243,7 @@ class ShellBankRecurrentNode(NodeBase):
         weight_init=NormalInitializer(std=0.05),
         kernel_dim: int = 8,
         shell_sizes: Tuple[int, int, int] = (4, 6, 8),
+        kernel_only_input: bool = False,
     ):
         super().__init__(
             shape=shape,
@@ -253,6 +254,7 @@ class ShellBankRecurrentNode(NodeBase):
             weight_init=weight_init,
             kernel_dim=kernel_dim,
             shell_sizes=shell_sizes,
+            kernel_only_input=kernel_only_input,
         )
 
     @staticmethod
@@ -295,9 +297,16 @@ class ShellBankRecurrentNode(NodeBase):
 
         shell_parts = {}
         shell_slices = _shell_slices(node_info.node_config)
+        kernel_only = node_info.node_config.get("kernel_only_input", False)
         for shell_name in _shell_dims(node_info.node_config):
             latent_slice = state.z_latent[..., shell_slices[shell_name]]
-            pre = jnp.matmul(transformed_input, params.weights[shell_name])
+            if kernel_only and shell_name == "kernel":
+                # Restrict the forward dependency, not just the gradient; the
+                # stored matrix keeps its full shape and initialization.
+                width = int(node_info.node_config["kernel_dim"])
+                pre = jnp.matmul(transformed_input[..., :width], params.weights["kernel"][:width])
+            else:
+                pre = jnp.matmul(transformed_input, params.weights[shell_name])
             pre = pre + jnp.matmul(latent_slice, params.weights[f"recur_{shell_name}"])
             pre = pre + params.biases[f"b_{shell_name}"]
             activated = apply_activation(node_info, pre)

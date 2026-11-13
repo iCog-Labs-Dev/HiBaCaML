@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 from fabricpc.core.topology import Edge, GraphNamespace
 from fabricpc.graph_assembly import graph, TaskMap
-from fabricpc.nodes import IdentityNode, Linear, LinearExplicitGrad
+from fabricpc.nodes import AvgPool, ConvNode, IdentityNode, Linear, LinearExplicitGrad
 from fabricpc.core.activations import IdentityActivation, SoftmaxActivation, TanhActivation
 from fabricpc.core.initializers import KaimingInitializer
 from fabricpc.core.inference import InferenceBase
@@ -28,18 +28,46 @@ from hibacaml.types import (
     ShellStats
     )
 
+# Shared-column K input: all 92 coordinates, or only the 32 kernel ones into kernel units.
+SHARED_K_CONNECTIVITY = ("dense", "kernel-only")
+
+
+def _stem_nodes(cfg: HiBaCaMLConfig) -> List[object]:
+    """The shared conv stem: one `ConvNode` per stage (FabricPC defaults), then an average pool."""
+    stem = cfg.stem
+    height, width, _ = cfg.input_shape
+    nodes: List[object] = []
+    for index, (channels, stride) in enumerate(zip(stem.channels, stem.strides), start=1):
+        height, width = -(-height // stride), -(-width // stride)  # SAME padding
+        nodes.append(
+            ConvNode(
+                shape=(height, width, channels),
+                name=f"stem_conv{index}",
+                kernel_size=stem.kernel_size,
+                stride=(stride, stride),
+            )
+        )
+    rows, cols = cfg.token_grid
+    nodes.append(
+        AvgPool(shape=(rows, cols, stem.channels[-1]), name="stem_pool", window_shape=stem.pool_window)
+    )
+    return nodes
 
 
 def create_hibacaml_structure(
     cfg: HiBaCaMLConfig,
     inference: InferenceBase,
     graph_state_initializer: StateInitBase,
+    *,
+    shared_k_connectivity: str = "dense",
 ):
     """Create the full static column-bank graph.
 
     Any ``StateInitBase`` is accepted here so the builder stays independent of
     training concerns, but both HiBaCaML runners require ``FeedforwardStateInit``.
     """
+    if shared_k_connectivity not in SHARED_K_CONNECTIVITY:
+        raise ValueError(f"shared_k_connectivity must be one of {SHARED_K_CONNECTIVITY}")
     nodes = []
     edges = []
     column_metadata: List[Dict[str, str]] = []
@@ -57,11 +85,18 @@ def create_hibacaml_structure(
     patch_tokens = PatchTokenizerNode(
         shape=(cfg.num_patches, cfg.patch_token_dim),
         name="patch_tokens",
-        patch_size=cfg.patch_size,
+        patch_size=cfg.tokenizer_patch_size,
         coord_dim=cfg.patch_coord_dim,
     )
-    nodes.extend([image_input, support_mask, task_query, patch_tokens])
-    edges.append(Edge(source=image_input, target=patch_tokens.slot("in")))
+    # The stem sits outside every column: shared and never support-masked. Its
+    # place in the node order fixes the initialization keys of every later node.
+    stem_nodes = _stem_nodes(cfg) if cfg.stem is not None else []
+    nodes.extend([image_input, support_mask, task_query, *stem_nodes, patch_tokens])
+    pathway = [image_input, *stem_nodes, patch_tokens]
+    edges.extend(
+        Edge(source=source, target=target.slot("in"))
+        for source, target in zip(pathway, pathway[1:])
+    )
 
     for column_index in range(cfg.column_pool.total_columns):
         with GraphNamespace(f"col{column_index}"):
@@ -90,6 +125,10 @@ def create_hibacaml_structure(
                         activation=TanhActivation(),
                         kernel_dim=cfg.column_pool.memory_dim,
                         shell_sizes=cfg.column_pool.shell_sizes,
+                        kernel_only_input=(
+                            shared_k_connectivity == "kernel-only"
+                            and column_index in cfg.column_pool.shared_indices
+                        ),
                     )
                 )
             l_micro = ShellBankResidualNode(
@@ -272,8 +311,10 @@ def create_hibacaml_structure(
 
     hibacaml_meta = {
         "cfg": cfg,
+        "shared_k_connectivity": shared_k_connectivity,
         "support_mask_node": support_mask.name,
         "task_query_node": task_query.name,
+        "stem_nodes": tuple(node.name for node in stem_nodes),
         "patch_tokens_node": patch_tokens.name,
         "pooled_logits_node": pooled_logits.name,
         "active_feature_summary_node": active_feature_summary.name,
@@ -294,6 +335,15 @@ def create_hibacaml_structure(
             "hibacaml": hibacaml_meta,
         }
     )
+
+
+def shell_node_positions(structure) -> Dict[str, Tuple[int, int]]:
+    """`{node: (column, position)}` for every shell node, positions B, K0.., L."""
+    positions = {}
+    for column, nodes in enumerate(structure.config["hibacaml"]["column_nodes"]):
+        ordered = (nodes["b_micro"], *nodes["k_micro_depth"], nodes["l_micro"])
+        positions.update({name: (column, position) for position, name in enumerate(ordered)})
+    return positions
 
 
 def initialize_hibacaml_state(
