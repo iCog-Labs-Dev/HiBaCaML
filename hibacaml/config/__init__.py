@@ -8,6 +8,7 @@ from hibacaml.config.defaults import (
     HierarchyConfig,
     PhiConfig,
     ReportingConfig,
+    StemConfig,
     make_hibacaml_config,
     override,
 )
@@ -21,5 +22,6 @@ __all__ = [
     "override",
     "PhiConfig",
     "ReportingConfig",
+    "StemConfig",
     "make_hibacaml_config",
 ]

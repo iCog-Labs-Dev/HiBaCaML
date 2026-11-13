@@ -30,7 +30,7 @@ from hibacaml.reporting import (
 )
 
 
-MODE = "default"                       # "default" or "smoke"
+MODE = "default"
 LEARNING = "backprop"                  # "pc" or "backprop"
 TASKS_LIMIT = None                     # e.g. 2, 5, or None for all
 VALIDATION_FRACTION = 0.10             # per task, carved from its training data; audits read it

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Dict, Tuple
@@ -146,12 +147,23 @@ class ExactSearchConfig:
 
 
 @dataclass(frozen=True)
+class StemConfig:
+    """Convolutional stem in front of the columns (CIFAR)."""
+
+    channels: Tuple[int, ...] = (32, 64, 64, 128, 128)
+    strides: Tuple[int, ...] = (1, 2, 1, 2, 1)
+    kernel_size: Tuple[int, int] = (3, 3)
+    pool_window: Tuple[int, int] = (2, 2)       # average pool over the last conv map
+
+
+@dataclass(frozen=True)
 class ReportingConfig:
     """Export and checkpoint settings."""
 
     experiment_root: str = "runs"
     selector_state_root: str | None = None
     write_selector_state: bool = True
+    log_gradient_clipping: bool = False             # instrumented clip state (changes the opt_state layout)
     checkpoint_filename: str = "hibacaml_checkpoint.pkl"
     selector_bank_filename: str = "bank.pkl"
     selector_bank_metadata_filename: str = "bank_metadata.json"
@@ -174,12 +186,14 @@ class HiBaCaMLConfig:
     eta_infer: float = 0.05
     optimizer_lr: float = 0.001
     weight_decay: float = 0.05
+    grad_clip_norm: float | None = None             # global-norm clip before AdamW; None disables
     cert_refresh_interval: int = 32
     train_batches_limit: int | None = None
     test_batches_limit: int | None = None
     column_pool: ColumnPoolConfig = field(default_factory=ColumnPoolConfig)
     phi: PhiConfig = field(default_factory=PhiConfig)
     hierarchy: HierarchyConfig = field(default_factory=HierarchyConfig)
+    stem: StemConfig | None = None                  # None: raw patch tokens (MNIST)
     composer: ComposerConfig = field(default_factory=ComposerConfig)
     exact_search: ExactSearchConfig = field(default_factory=ExactSearchConfig)
     reporting: ReportingConfig = field(default_factory=ReportingConfig)
@@ -189,15 +203,37 @@ class HiBaCaMLConfig:
         return 2 if self.task_local_heads else 10
 
     @property
-    def num_patches(self) -> int:
+    def token_grid(self) -> Tuple[int, int]:
+        """Token rows and columns: pooled stem cells with a stem, image patches otherwise."""
         h, w, _ = self.input_shape
-        ph, pw = self.patch_size
-        return (h // ph) * (w // pw)
+        if self.stem is None:
+            ph, pw = self.patch_size
+            return h // ph, w // pw
+        stride = math.prod(self.stem.strides)
+        pool_h, pool_w = self.stem.pool_window
+        if h % (stride * pool_h) or w % (stride * pool_w):
+            raise ValueError(
+                f"input {h}x{w} is not divisible by stem stride {stride} times pool "
+                f"{self.stem.pool_window}"
+            )
+        return h // (stride * pool_h), w // (stride * pool_w)
+
+    @property
+    def num_patches(self) -> int:
+        rows, cols = self.token_grid
+        return rows * cols
 
     @property
     def patch_token_dim(self) -> int:
+        if self.stem is not None:
+            return self.stem.channels[-1] + self.patch_coord_dim
         ph, pw = self.patch_size
         return ph * pw * self.input_shape[2] + self.patch_coord_dim
+
+    @property
+    def tokenizer_patch_size(self) -> Tuple[int, int]:
+        """Each pooled stem cell is one token; without a stem, tokens are image patches."""
+        return (1, 1) if self.stem is not None else self.patch_size
 
     @property
     def composer_cert_dim(self) -> int:
@@ -229,35 +265,32 @@ def make_hibacaml_config(mode: str = "default") -> HiBaCaMLConfig:
             ),
         )
 
-    if mode == "smoke":
+    if mode == "cifar":
+        # Shared by static R6 and Split A; each runner sets its own pool partition.
         return HiBaCaMLConfig(
             mode=mode,
-            batch_size=32,
-            epochs_per_task=1,
-            infer_steps=4,
+            input_shape=(32, 32, 3),
+            stem=StemConfig(),
             column_pool=ColumnPoolConfig(
-                memory_dim=4,
-                shell_sizes=(1, 1, 1),
-                kernel_depth=2,
+                total_columns=40,
+                shared_count=3,
+                adaptive_count=31,
+                reserve_count=6,
+                topk_nonshared=4,
+                memory_dim=32,
+                shell_sizes=(10, 20, 30),
+                kernel_depth=3,
             ),
-            cert_refresh_interval=1,
-            train_batches_limit=1,
-            test_batches_limit=1,
-            composer=ComposerConfig(
-                hidden_dim=16,
-                query_dim=5,
-                cert_dim=10,
-                scale=0.25,
-            ),
+            optimizer_lr=3e-4,
+            grad_clip_norm=1.0,
             exact_search=ExactSearchConfig(
-                boundary_current_batches=1,
-                boundary_old_batches=1,
-                boundary_rollout_steps=1,
-                boundary_shortlist=3,
-                static_support_batch_size=16,
-                neighbor_support_batch_size=16,
-                maintenance_interval=2,
+                enable_exact_search=False,
+                enable_structural_edits=False,
+                enable_precision_update_resistance=False,
+                enable_demotion_swap_audit=False,
+                certificate_support_weight=0.05,
             ),
+            reporting=ReportingConfig(write_selector_state=False),
         )
 
     raise ValueError(f"Unsupported HiBaCaML config mode: {mode}")
