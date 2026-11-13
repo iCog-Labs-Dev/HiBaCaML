@@ -47,6 +47,10 @@ class PolicyLayout:
     shells: Dict[str, Tuple[int, int]]
     regions: Dict[str, slice]
 
+    @property
+    def feature_pools_by_column(self) -> Dict[int, str]:
+        return {column: name for name, column in self.feature_pools.items()}
+
     @classmethod
     def from_structure(cls, structure, cfg: HiBaCaMLConfig) -> "PolicyLayout":
         meta = structure.config["hibacaml"]
@@ -153,3 +157,27 @@ def restore(new_params, params, inputs, support, layout: PolicyLayout):
     """Select the original bytes (signed zeros included) for every protected coordinate."""
     frozen = _frozen(params, inputs, support, layout)
     return jax.tree_util.tree_map(lambda f, new, old: jnp.where(f, old, new), frozen, new_params, params)
+
+
+def frozen_leaves(params, policy: WritePolicy, layout: PolicyLayout):
+    """`(node, field, key)` of every leaf a policy freezes outright, whatever the support.
+
+    Stem convs, the composer maps, frozen feature pools, and shell leaves whose
+    destination units all have scale 0 (the kernel leaves of scaled columns).
+    """
+    table = np.asarray(policy.unit_scales)
+    pools = {layout.feature_pools_by_column[c] for c in policy.frozen_feature_pools}
+    leaves = []
+    for name, node in sorted(params.nodes.items()):
+        for field in ("weights", "biases"):
+            for key in sorted(getattr(node, field)):
+                if name in layout.stem or name in pools or (
+                    name == layout.composer and key in FROZEN_COMPOSER_WEIGHTS
+                ):
+                    leaves.append((name, field, key))
+                elif name in layout.shells:
+                    column, position = layout.shells[name]
+                    region = layout.regions[_region(key, layout.regions)]
+                    if not np.any(table[column, position, region]):
+                        leaves.append((name, field, key))
+    return tuple(leaves)

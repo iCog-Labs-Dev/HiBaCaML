@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+from contextlib import contextmanager
+from typing import Dict, Iterable
 
 import jax
 import numpy as np
@@ -81,3 +83,30 @@ def learning_state_signature(trainer) -> str:
             if getattr(task, f"{split}_loader") is not None
         },
     })
+
+
+def column_fingerprints(params, columns: Iterable[int]) -> Dict[int, str]:
+    """`{column: digest}` over every leaf of every `col<N>/` node of the requested columns."""
+    wanted = {int(c) for c in columns}
+    grouped: Dict[int, dict] = {c: {} for c in wanted}
+    for name, node in params.nodes.items():
+        head = name.split("/")[0]
+        if head.startswith("col") and int(head[3:]) in wanted:
+            grouped[int(head[3:])][name] = node
+    return {c: fingerprint(nodes) for c, nodes in grouped.items()}
+
+
+@contextmanager
+def preserve_reporting_state(trainer):
+    """Restore the RNG key and cached graph state after observational evaluation."""
+    rng_key = trainer.rng_key
+    had_state = hasattr(trainer, "_last_graph_state")
+    cached = getattr(trainer, "_last_graph_state", None)
+    try:
+        yield
+    finally:
+        trainer.rng_key = rng_key
+        if had_state:
+            trainer._last_graph_state = cached
+        elif hasattr(trainer, "_last_graph_state"):
+            del trainer._last_graph_state

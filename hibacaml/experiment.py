@@ -1,18 +1,22 @@
 """Shared experiment wiring for the HiBaCaML runners.
 
 Graph construction, parameter initialization, runner selection, and run-root
-preparation are identical for Split- and Full-MNIST; only the task set and the
-recorded metadata differ. Keeping them here means a runner is just a protocol
-description.
+preparation are identical for every protocol (Split-/Full-MNIST and CIFAR-10);
+only the task set and the recorded metadata differ. Keeping them here means a
+runner is just a protocol description.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import os
+import subprocess
+from importlib import metadata
 from pathlib import Path
 from typing import Dict, Optional, Sequence, Tuple
 
 import jax
+import numpy as np
 from fabricpc.graph_initialization import initialize_params
 from fabricpc.graph_initialization.state_initializer import FeedforwardStateInit
 
@@ -142,3 +146,74 @@ def build_trainer(
         f"trainer constructed class={type(trainer).__name__}", component="runner"
     )
     return structure, trainer
+
+
+class IntegrityError(AssertionError):
+    """A broken run invariant; `details` is recorded with the failure."""
+
+    def __init__(self, message: str, details: Optional[Dict[str, object]] = None):
+        super().__init__(message)
+        self.details = details or {}
+
+
+def require(condition, message: str, **details) -> None:
+    if not condition:
+        raise IntegrityError(message, details)
+
+
+def require_finite(tree, *, label: str) -> None:
+    """Reject nonfinite numeric leaves in model/report pytrees at task boundaries."""
+    for path, value in jax.tree_util.tree_leaves_with_path(jax.device_get(tree)):
+        if isinstance(value, (float, complex, np.number, np.ndarray)):
+            require(np.all(np.isfinite(value)),
+                    f"nonfinite value in {label}{jax.tree_util.keystr(path)}")
+
+
+DETERMINISTIC_XLA_FLAG = "--xla_gpu_deterministic_ops=true"
+
+
+def require_production_runtime(*, deterministic_xla: bool = False) -> None:
+    """Production runs need a GPU with JIT (and, for paired runs, deterministic XLA ops)."""
+    require(jax.default_backend() == "gpu" and not jax.config.jax_disable_jit,
+            "production runs require a GPU backend with JIT enabled")
+    if deterministic_xla:
+        require(DETERMINISTIC_XLA_FLAG in os.environ.get("XLA_FLAGS", "").split(),
+                f"production runs require XLA_FLAGS to contain {DETERMINISTIC_XLA_FLAG}")
+
+
+def log_runtime() -> Dict[str, object]:
+    """Log the backend and devices; return the runtime identity a GPU run is paired by."""
+    log_progress(f"backend={jax.default_backend()} devices={jax.devices()}", component="runner")
+    try:
+        revision = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parents[1],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip() or None
+    except (OSError, subprocess.TimeoutExpired):
+        revision = None
+    return {
+        "git_revision": revision,
+        "jax": metadata.version("jax"),
+        "jaxlib": metadata.version("jaxlib"),
+        "backend": jax.default_backend(),
+    }
+
+
+def architecture_metadata(cfg: HiBaCaMLConfig, structure, params) -> Dict[str, object]:
+    """Column layout, token layout and parameter count of a built CIFAR graph."""
+    pool, meta = cfg.column_pool, structure.config["hibacaml"]
+    return {
+        "total_columns": pool.total_columns,
+        "shared_columns": pool.shared_indices,
+        "adaptive_columns": pool.adaptive_indices,
+        "reserve_columns": pool.reserve_indices,
+        "topk_nonshared": pool.topk_nonshared,
+        "active_support_size": pool.active_support_size,
+        "aggregation_scale": 1.0 / pool.active_support_size,
+        "composer_topk": cfg.composer.topk,
+        "stem": cfg.stem,
+        "token_grid": cfg.token_grid,
+        "token_dim": cfg.patch_token_dim,
+        "shared_k_connectivity": meta["shared_k_connectivity"],
+        "parameter_count": int(sum(leaf.size for leaf in jax.tree_util.tree_leaves(params))),
+    }
