@@ -54,7 +54,13 @@ def _project_observations(
     column_node_names,
     shell_names,
     shell_bounds,
+    shell_masks=None,
 ):
+    """Per node and tier: gate, scale, occupancy, activation and variance.
+
+    Tiers are the physical slices, or with `shell_masks` (node -> `[tiers, units]`
+    label masks) the labelled unit sets measured over the concatenated regions.
+    """
     gate = []
     scale = []
     occupancy = []
@@ -79,7 +85,30 @@ def _project_observations(
             node_occupancy = []
             node_activation = []
             node_variance = []
-            for shell_name, (start, stop) in zip(shell_names, shell_bounds):
+            if shell_masks is not None:
+                masks = shell_masks[node_name]
+                log_precision = jnp.concatenate(
+                    [node_params.biases[f"log_precision_{name}"].reshape(-1) for name in shell_names]
+                )
+                norms = jnp.concatenate(
+                    [jnp.linalg.norm(node_params.weights[name], axis=0) for name in shell_names]
+                )
+                precision = 1.0 / (1.0 + jnp.exp(-log_precision))
+                live = ((norms > 1e-6) & (precision > 0.2)).astype(jnp.float32)
+                magnitude = jnp.abs(z_mu)
+                spread = jnp.var(z_mu, axis=0)
+                for label in range(len(shell_names)):
+                    mask = masks[label]
+                    count = jnp.sum(mask)
+                    node_gate.append(jnp.sum(precision * mask) / count)
+                    node_scale.append(jnp.sum(jnp.exp(log_precision) * mask) / count)
+                    node_occupancy.append(jnp.sum(live * mask) / count)
+                    node_activation.append(jnp.mean(jnp.sum(magnitude * mask, axis=-1)) / count)
+                    node_variance.append(jnp.mean(jnp.sum(spread * mask, axis=-1)) / count)
+            for shell_name, (start, stop) in zip(
+                shell_names if shell_masks is None else (),
+                shell_bounds if shell_masks is None else (),
+            ):
                 log_precision = node_params.biases[f"log_precision_{shell_name}"]
                 weight = node_params.weights[shell_name]
                 shell_values = z_mu[..., start:stop]
@@ -231,6 +260,30 @@ class CertificateController:
             tuple(shell_node_names(meta)) for meta in self.column_nodes
         )
         self._certificate_stack_cache = None
+        self._shell_mask_cache = None
+
+    def _shell_masks(self, persistent_state):
+        """Device label masks for the current role labels, or None for physical tiers."""
+        roles = getattr(persistent_state, "shell_roles", None)
+        if roles is None:
+            return None
+        # Rebuilt only when label bytes change, so a relabel lands at the next refresh.
+        key = b"".join(
+            np.asarray(roles[name], dtype=np.int8).tobytes()
+            for names in self._column_node_names
+            for name in names
+        )
+        if self._shell_mask_cache is None or self._shell_mask_cache[0] != key:
+            masks = {
+                name: jnp.asarray(
+                    np.stack([np.asarray(roles[name]) == label for label in range(len(self._shell_names))])
+                    .astype(np.float32)
+                )
+                for names in self._column_node_names
+                for name in names
+            }
+            self._shell_mask_cache = (key, masks)
+        return self._shell_mask_cache[1]
 
     def refresh_certificates(
         self,
@@ -249,6 +302,7 @@ class CertificateController:
                 self._column_node_names,
                 self._shell_names,
                 self._shell_bounds,
+                self._shell_masks(persistent_state),
             )
         )
         _advance_shell_stats(
