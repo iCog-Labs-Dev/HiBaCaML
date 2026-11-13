@@ -120,6 +120,12 @@ def default_optimizer(cfg: HiBaCaMLConfig) -> optax.GradientTransformation:
     return optax.chain(optax.clip_by_global_norm(cfg.grad_clip_norm), adamw)
 
 
+def clipping_telemetry(opt_state) -> Optional[GradientClippingState]:
+    """The instrumented clip state of a chained optimizer, or None."""
+    first = opt_state[0] if isinstance(opt_state, tuple) and opt_state else None
+    return first if isinstance(first, GradientClippingState) else None
+
+
 def adam_count(opt_state) -> int:
     """The single global Adam step count, for bare or clip-chained AdamW."""
     adam = opt_state[0] if isinstance(opt_state[0], optax.ScaleByAdamState) else opt_state[1][0]
@@ -247,6 +253,10 @@ class HiBaCaMLTrainer(ABC):
         self.current_nonshared = default_nonshared_support(cfg)
         self.write_policy: Optional[write_policy.WritePolicy] = None
         self._policy_inputs: Optional[Dict[str, jax.Array]] = None
+        # Reporting only: per-epoch clipping aggregates and the last task's completion reports.
+        self.clipping_epoch_summaries: List[Dict[str, object]] = []
+        self._clipping_epoch: Optional[Dict[str, object]] = None
+        self.completion_reports: Dict[int, Dict[str, object]] = {}
         self._programs = (
             programs
             if programs is not None
@@ -380,12 +390,20 @@ class HiBaCaMLTrainer(ABC):
     def _bump_params_revision(self) -> None:
         self.persistent_state.params_revision += 1
 
-    def set_boundary_choice(self, task_id: int, nonshared: Sequence[int], phi) -> None:
+    def set_boundary_choice(
+        self,
+        task_id: int,
+        nonshared: Sequence[int],
+        phi,
+        *,
+        record_dropped_columns: bool = True,
+    ) -> None:
         boundary = tuple(sorted(nonshared))
         self.current_phi = phi
         self.persistent_state.boundary_support[task_id] = boundary
-        # track which columns were dropped vs the previous task's snapshot.
-        if task_id > 0:
+        # track which columns were dropped vs the previous task's snapshot
+        # (legacy demotion history; fixed-allocation protocols skip it).
+        if record_dropped_columns and task_id > 0:
             prev_snapshot = self.persistent_state.task_support_snapshots.get(task_id - 1)
             if prev_snapshot is not None:
                 dropped = tuple(
@@ -773,6 +791,9 @@ class HiBaCaMLTrainer(ABC):
                 self.persistent_state.params = self.params
                 self._bump_params_revision()
         self.persistent_state.global_step += 1
+        telemetry = clipping_telemetry(self.opt_state)
+        if telemetry is not None:
+            self._accumulate_clipping(telemetry, task.task_id, epoch_index)
         final_losses = dict(losses)
         batch_size = int(batch["x"].shape[0])
 
@@ -838,6 +859,39 @@ class HiBaCaMLTrainer(ABC):
 
         return nonshared, final_losses, batch_size
 
+    def _accumulate_clipping(self, telemetry, task_id: int, epoch_index: int) -> None:
+        """Fold this step's clipping telemetry into the open epoch aggregate (one host read)."""
+        norm, scale = map(float, jax.device_get((telemetry.gradient_norm, telemetry.clip_scale)))
+        epoch = self._clipping_epoch
+        if epoch is None:
+            epoch = self._clipping_epoch = dict(
+                task_id=task_id, epoch=epoch_index + 1, count=0, clipped=0,
+                norm_sum=0.0, max_gradient_norm=0.0, scale_sum=0.0, min_clip_scale=1.0,
+            )
+        epoch["count"] += 1
+        epoch["clipped"] += int(scale < 1.0)
+        epoch["norm_sum"] += norm
+        epoch["max_gradient_norm"] = max(epoch["max_gradient_norm"], norm)
+        epoch["scale_sum"] += scale
+        epoch["min_clip_scale"] = min(epoch["min_clip_scale"], scale)
+
+    def _close_clipping_epoch(self) -> None:
+        epoch, self._clipping_epoch = getattr(self, "_clipping_epoch", None), None
+        if epoch is None:
+            return
+        count = epoch["count"]
+        self.clipping_epoch_summaries.append(dict(
+            task_id=epoch["task_id"],
+            epoch=epoch["epoch"],
+            completed_updates=count,
+            clipped_updates=epoch["clipped"],
+            clipped_fraction=epoch["clipped"] / count,
+            mean_gradient_norm=epoch["norm_sum"] / count,
+            max_gradient_norm=epoch["max_gradient_norm"],
+            mean_clip_scale=epoch["scale_sum"] / count,
+            min_clip_scale=epoch["min_clip_scale"],
+        ))
+
     def train_batches(
         self,
         task: Task,
@@ -858,6 +912,7 @@ class HiBaCaMLTrainer(ABC):
                 train_batches=count,
                 batch_log_every=max(1, count // 4),
             )
+        self._close_clipping_epoch()
         return tuple(nonshared)
 
     def _train_epoch(
@@ -869,6 +924,7 @@ class HiBaCaMLTrainer(ABC):
         train_batches: int,
         batch_log_every: int,
         evaluate_train_each_epoch: bool,
+        on_epoch_end: Optional[Callable[["HiBaCaMLTrainer", Task, int], None]] = None,
     ):
         epoch_started = time.perf_counter()
         epoch_start_step = self.persistent_state.global_step
@@ -897,11 +953,15 @@ class HiBaCaMLTrainer(ABC):
                 epoch_loss_sums[name] += float(value) * batch_size
 
         training_seconds = time.perf_counter() - epoch_started
+        self._close_clipping_epoch()
         self._record_timing(
             task.task_id,
             f"epoch_{epoch_index + 1}_seconds",
             training_seconds,
         )
+        # Runs outside the RNG guard and before validation, which sees its effects.
+        if on_epoch_end is not None:
+            on_epoch_end(self, task, epoch_index + 1)
 
         validation_loader = getattr(task, "validation_loader", None)
         if evaluate_train_each_epoch or validation_loader is not None:
@@ -970,6 +1030,8 @@ class HiBaCaMLTrainer(ABC):
         task: Task,
         *,
         evaluate_train_each_epoch: bool = False,
+        on_epoch_end: Optional[Callable[["HiBaCaMLTrainer", Task, int], None]] = None,
+        collect_examples: bool = False,
     ) -> TaskSummary:
         if task.task_id not in self.persistent_state.current_support:
             if self.cfg.exact_search.enable_exact_search:
@@ -1031,6 +1093,7 @@ class HiBaCaMLTrainer(ABC):
                 train_batches=train_batches,
                 batch_log_every=batch_log_every,
                 evaluate_train_each_epoch=evaluate_train_each_epoch,
+                on_epoch_end=on_epoch_end,
             )
 
         self.freeze_task_support(task.task_id)
@@ -1044,8 +1107,13 @@ class HiBaCaMLTrainer(ABC):
                     row_count=len(self.selector_bank),
                     path=str(self.selector_bank.bank_path),
                 )
-        # Reporting observes the run, so it never refreshes certificates.
-        metrics = self.evaluate_task(task.task_id, refresh_certificates=False)
+        # Reporting observes the run, so it never refreshes certificates. This pass
+        # advances the RNG (one split per batch); with `collect_examples` runners keep
+        # its reports and example arrays instead of evaluating again.
+        reports: Dict[int, Dict[str, object]] = {}
+        extra = {"collect_examples": True, "reports": reports} if collect_examples else {}
+        metrics = self.evaluate_task(task.task_id, refresh_certificates=False, **extra)
+        self.completion_reports = reports
         summary = TaskSummary(
             task_id=task.task_id,
             classes=task.classes,
@@ -1199,6 +1267,7 @@ class HiBaCaMLTrainer(ABC):
         split_name: str,
         mode: Optional[str] = None,
         refresh_certificates: bool,
+        collect_examples: bool = False,
     ) -> Dict[str, object]:
         """Evaluate one named data split without exposing labels to inference."""
 
@@ -1216,6 +1285,7 @@ class HiBaCaMLTrainer(ABC):
         accumulator = EvaluationAccumulator(
             task.output_dim,
             self.cfg.column_pool.total_columns,
+            collect_examples=collect_examples,
         )
         refresh_next = bool(refresh_certificates)
 
@@ -1258,7 +1328,10 @@ class HiBaCaMLTrainer(ABC):
         mode: Optional[str] = None,
         refresh_certificates: bool = True,
         split: str = "test",
+        collect_examples: bool = False,
+        reports: Optional[Dict[int, Dict[str, object]]] = None,
     ) -> Dict[str, object]:
+        """Evaluate a task and every earlier saved support; `reports` receives each raw report."""
         task = self.tasks[task_id]
         if nonshared is None:
             snapshot = self.persistent_state.task_support_snapshots.get(task_id)
@@ -1273,21 +1346,26 @@ class HiBaCaMLTrainer(ABC):
             split_name=split,
             mode=mode,
             refresh_certificates=refresh_certificates,
+            collect_examples=collect_examples,
         )
-        old_accuracies = [1.0] if task_id == 0 else [
-            self.evaluate_loader(
+        if reports is not None:
+            reports[task_id] = metrics
+        old_accuracies = [1.0] if task_id == 0 else []
+        for prev_task_id, snapshot in self.persistent_state.task_support_snapshots.items():
+            if prev_task_id >= task_id:
+                continue
+            old = self.evaluate_loader(
                 self.tasks[prev_task_id],
                 self.tasks[prev_task_id].loader(split),
                 snapshot.nonshared,
                 split_name=split,
                 mode="saved",
                 refresh_certificates=refresh_certificates,
-            )["accuracy"]
-            for prev_task_id, snapshot in (
-                self.persistent_state.task_support_snapshots.items()
+                collect_examples=collect_examples,
             )
-            if prev_task_id < task_id
-        ]
+            if reports is not None:
+                reports[prev_task_id] = old
+            old_accuracies.append(old["accuracy"])
         metrics = dict(metrics)
         metrics["best_old_accuracy"] = float(
             min(old_accuracies) if old_accuracies else 1.0
