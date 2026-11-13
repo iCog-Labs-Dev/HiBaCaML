@@ -3,9 +3,8 @@
 from __future__ import annotations
 import gc
 import sys
-import jax
 from pathlib import Path
-from typing import Dict, List, Sequence
+from typing import Dict, List
 
 sys.path.append(".")
 
@@ -18,15 +17,21 @@ from hibacaml import (
     override,
     prepare_run_root,
 )
+from hibacaml.experiment import log_runtime
 from hibacaml.reporting import (
+    best_swap_gains,
     build_run_snapshot,
     export_task_artifacts,
-    plot_accuracy_forgetting,
-    plot_support_table,
-    plot_swap_gains,
+    mean_forgetting,
+    mean_seen_accuracy,
+    phi_trajectory,
+    plot_sequential_run,
     save_checkpoint,
-    write_csv,
-    write_json,
+    support_entropy_trajectory,
+    support_sequence,
+    task_metric_rows,
+    task_summary_row,
+    write_run_records,
 )
 
 
@@ -48,94 +53,6 @@ OVERRIDES = {
     "exact_search__local_swap_audit_data_batch_size": 128,
     "exact_search__demotion_audit_data_batch_size": 128,
 }
-
-
-# Metric helpers
-def _mean_seen_accuracy(accuracy_matrix: Dict[int, Dict[int, float]]) -> List[float]:
-    curve: List[float] = []
-    for task_id in sorted(accuracy_matrix):
-        row = accuracy_matrix[task_id]
-        curve.append(sum(row.values()) / max(len(row), 1))
-    return curve
-
-
-def _mean_forgetting_curve(accuracy_matrix: Dict[int, Dict[int, float]]) -> List[float]:
-    curve: List[float] = []
-    task_ids = sorted(accuracy_matrix)
-    for boundary_id in task_ids:
-        row = accuracy_matrix[boundary_id]
-        forgetting = []
-        for eval_task_id in sorted(row):
-            best_so_far = max(
-                accuracy_matrix[past_id][eval_task_id]
-                for past_id in task_ids
-                if past_id <= boundary_id and eval_task_id in accuracy_matrix[past_id]
-            )
-            forgetting.append(best_so_far - row[eval_task_id])
-        curve.append(sum(forgetting) / max(len(forgetting), 1))
-    return curve
-
-
-def _support_sequence(trainer) -> Dict[int, List[int]]:
-    return {
-        task_id: list(snapshot.full_support)
-        for task_id, snapshot in sorted(trainer.persistent_state.task_support_snapshots.items())
-    }
-
-
-def _phi_trajectory(trainer) -> Dict[int, Dict[str, float]]:
-    return {
-        task_id: {
-            "outer_quantile": snapshot.phi.outer_quantile,
-            "middle_quantile": snapshot.phi.middle_quantile,
-            "replacement_margin_base": snapshot.phi.replacement_margin_base,
-            "demotion_min_role_gain": snapshot.phi.demotion_min_role_gain,
-        }
-        for task_id, snapshot in sorted(trainer.persistent_state.task_support_snapshots.items())
-    }
-
-
-def _support_entropy_trajectory(task_summaries: List[Dict[str, object]]) -> List[float]:
-    """Per-task support-usage entropy trajectory using the trainer's own natural-log metric."""
-    return [
-        float(row["support_entropy"])
-        for row in sorted(task_summaries, key=lambda r: r["task_id"])
-        if "support_entropy" in row
-    ]
-
-
-def _best_swap_gains(trainer) -> Dict[int, float]:
-    gains = {}
-    for task_id, rows in sorted(trainer.persistent_state.local_swap_tables.items()):
-        gains[task_id] = max((row.gain for row in rows), default=0.0)
-    return gains
-
-
-def _task_metric_rows(
-    task_ids: Sequence[int],
-    mean_seen_accuracy: Sequence[float],
-    mean_forgetting: Sequence[float],
-    support_sequence: Dict[int, List[int]],
-    best_swap_gains: Dict[int, float],
-    task_summaries: Sequence[Dict[str, object]],
-) -> List[Dict[str, object]]:
-    summary_by_task = {row["task_id"]: row for row in task_summaries}
-    rows = []
-    for offset, task_id in enumerate(task_ids):
-        summary = summary_by_task[task_id]
-        rows.append(
-            {
-                "task_id": task_id,
-                "classes": summary["classes"],
-                "accuracy": summary["accuracy"],
-                "mean_loss": summary["mean_loss"],
-                "mean_seen_accuracy": mean_seen_accuracy[offset],
-                "mean_forgetting": mean_forgetting[offset],
-                "support": support_sequence.get(task_id, []),
-                "best_swap_gain": best_swap_gains.get(task_id, 0.0),
-            }
-        )
-    return rows
 
 
 # Core experiment loop
@@ -163,17 +80,7 @@ def _run_tasks(
             for eval_task_id, metrics in eval_results.items()
         }
 
-        task_summaries.append(
-            {
-                "task_id": summary.task_id,
-                "classes": list(summary.classes),
-                "support_indices": list(summary.support_indices),
-                "accuracy": summary.accuracy,
-                "mean_loss": summary.mean_loss,
-                "best_old_accuracy": summary.best_old_accuracy,
-                "support_entropy": summary.support_entropy,
-            }
-        )
+        task_summaries.append(task_summary_row(summary))
 
         artifact_root = export_task_artifacts(trainer, task.task_id)
         checkpoint_root = run_root / f"task_{task.task_id}" / "checkpoints"
@@ -194,20 +101,12 @@ def _run_tasks(
         gc.collect()
 
     snapshot = build_run_snapshot(trainer)
-    mean_seen_accuracy = _mean_seen_accuracy(accuracy_matrix)
-    mean_forgetting = _mean_forgetting_curve(accuracy_matrix)
-    support_sequence = _support_sequence(trainer)
-    phi_trajectory = _phi_trajectory(trainer)
-    best_swap_gains = _best_swap_gains(trainer)
-    support_entropy_trajectory = _support_entropy_trajectory(task_summaries)
-    task_ids = sorted(accuracy_matrix)
-    task_metric_rows = _task_metric_rows(
-        task_ids,
-        mean_seen_accuracy,
-        mean_forgetting,
-        support_sequence,
-        best_swap_gains,
-        task_summaries,
+    seen_accuracy = mean_seen_accuracy(accuracy_matrix)
+    forgetting = mean_forgetting(accuracy_matrix)
+    supports = support_sequence(trainer)
+    swap_gains = best_swap_gains(trainer)
+    rows = task_metric_rows(
+        sorted(accuracy_matrix), seen_accuracy, forgetting, supports, swap_gains, task_summaries
     )
 
     export_run_artifacts(snapshot, run_root / "final")
@@ -215,44 +114,20 @@ def _run_tasks(
     results = {
         "learning": learning,
         "accuracy_matrix": accuracy_matrix,
-        "mean_seen_accuracy": mean_seen_accuracy,
-        "mean_forgetting": mean_forgetting,
-        "support_sequence": support_sequence,
-        "phi_trajectory": phi_trajectory,
-        "best_swap_gains": best_swap_gains,
-        "support_entropy_trajectory": support_entropy_trajectory,
+        "mean_seen_accuracy": seen_accuracy,
+        "mean_forgetting": forgetting,
+        "support_sequence": supports,
+        "phi_trajectory": phi_trajectory(trainer),
+        "best_swap_gains": swap_gains,
+        "support_entropy_trajectory": support_entropy_trajectory(task_summaries),
         "task_summaries": task_summaries,
         "artifact_roots": artifact_roots,
         "checkpoint_paths": checkpoint_paths,
     }
 
-    write_json(run_root / "run_summary.json", results)
-    write_csv(run_root / "task_summary.csv", task_metric_rows)
+    write_run_records(run_root, results, rows)
 
     return results
-
-
-# Plot generation
-def generate_plots(results: dict, plots_dir: Path) -> None:
-    """Generate accuracy, support, and swap-gain figures."""
-    plots_dir.mkdir(parents=True, exist_ok=True)
-
-    plot_accuracy_forgetting(
-        results["mean_seen_accuracy"],
-        results["mean_forgetting"],
-        plots_dir / "figure3_accuracy_forgetting.png",
-    )
-    plot_support_table(
-        results["support_sequence"],
-        plots_dir / "chosen_support_table.png",
-    )
-    plot_swap_gains(
-        results["best_swap_gains"],
-        plots_dir / "one_swap_gains.png",
-    )
-
-    log_progress(f"plots saved to {plots_dir}", component="runner")
-
 
 
 ## Main entry point
@@ -268,10 +143,7 @@ def run_experiment(
     if learning not in ("pc", "backprop"):
         raise ValueError("learning must be 'pc' or 'backprop'")
 
-    log_progress(
-        f"backend={jax.default_backend()} devices={jax.devices()}",
-        component="runner",
-    )
+    log_runtime()
 
     tasks = build_split_mnist_tasks(
         cfg, limit=tasks_limit, validation_fraction=validation_fraction
@@ -299,7 +171,7 @@ def run_experiment(
         learning,
         run_output_root,
     )
-    generate_plots(results, run_plots_dir)
+    plot_sequential_run(results, run_plots_dir)
 
     log_progress(
         f"run complete id={run_id} dir={run_output_root}", component="runner"

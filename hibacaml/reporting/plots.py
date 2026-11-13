@@ -12,6 +12,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 
+from hibacaml.reporting.logger import log_progress  # noqa: E402
+
 
 def _save_fig(fig, path: Path, dpi: int = 150, bbox_inches: str | None = "tight") -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -201,3 +203,36 @@ def plot_composer_usage(
     axis.legend()
     fig.tight_layout()
     _save_fig(fig, output_path, dpi=160, bbox_inches=None)
+
+
+def plot_static_run(epoch_records, test_metrics, plots_dir: Path) -> None:
+    """Write the three figures of a static (one-task) run."""
+    plot_learning_curve(epoch_records, plots_dir / "learning_curve.png")
+    plot_confusion_matrix(
+        test_metrics["confusion_matrix"],
+        plots_dir / "test_confusion_matrix.png",
+    )
+    plot_composer_usage(
+        test_metrics["column_gate_mean"],
+        test_metrics["column_selection_fraction"],
+        plots_dir / "composer_usage.png",
+    )
+
+
+def plot_sequential_run(results: Mapping, plots_dir: Path) -> None:
+    """Generate accuracy, support, and swap-gain figures."""
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    plot_accuracy_forgetting(
+        results["mean_seen_accuracy"],
+        results["mean_forgetting"],
+        plots_dir / "figure3_accuracy_forgetting.png",
+    )
+    plot_support_table(
+        results["support_sequence"],
+        plots_dir / "chosen_support_table.png",
+    )
+    plot_swap_gains(
+        results["best_swap_gains"],
+        plots_dir / "one_swap_gains.png",
+    )
+    log_progress(f"plots saved to {plots_dir}", component="runner")

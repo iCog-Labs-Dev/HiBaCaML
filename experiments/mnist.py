@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import sys
-from pathlib import Path
 from typing import Dict
-import jax
 
 sys.path.append(".")
 
@@ -19,15 +17,14 @@ from hibacaml import (
     override,
     prepare_run_root,
 )
+from hibacaml.experiment import log_runtime
 from hibacaml.reporting import (
     build_run_snapshot,
     export_task_artifacts,
-    plot_composer_usage,
-    plot_confusion_matrix,
-    plot_learning_curve,
+    plot_static_run,
     save_checkpoint,
-    write_csv,
-    write_json,
+    static_task_row,
+    write_run_records,
 )
 
 
@@ -126,20 +123,6 @@ def build_tasks(cfg, *, validation_fraction: float = VALIDATION_FRACTION):
     )
 
 
-def _generate_plots(epoch_records, test_metrics, plots_dir: Path) -> None:
-    """Write the three figures relevant to the static Full-MNIST study."""
-    plot_learning_curve(epoch_records, plots_dir / "learning_curve.png")
-    plot_confusion_matrix(
-        test_metrics["confusion_matrix"],
-        plots_dir / "test_confusion_matrix.png",
-    )
-    plot_composer_usage(
-        test_metrics["column_gate_mean"],
-        test_metrics["column_selection_fraction"],
-        plots_dir / "composer_usage.png",
-    )
-
-
 def run_experiment(
     cfg,
     *,
@@ -159,10 +142,7 @@ def run_experiment(
     if cfg.composer.topk != 3:
         raise ValueError("Full-MNIST Phase 1A requires composer.topk == 3")
 
-    log_progress(
-        f"backend={jax.default_backend()} devices={jax.devices()}",
-        component="runner",
-    )
+    log_runtime()
     tasks = build_tasks(cfg, validation_fraction=validation_fraction)
     task = tasks[0]
     bank = cfg.column_pool.active_support_size
@@ -301,24 +281,12 @@ def run_experiment(
         "checkpoint_path": str(checkpoint_path),
         "experiment_metadata": experiment_metadata,
     }
-    write_json(run_output_root / "run_summary.json", results)
-    write_csv(
-        run_output_root / "task_summary.csv",
-        [
-            {
-                "task_id": summary.task_id,
-                "classes": list(summary.classes),
-                "support": list(summary.support_indices),
-                "test_accuracy": test_metrics["accuracy"],
-                "test_cross_entropy": test_metrics["cross_entropy"],
-                "test_mean_loss": test_metrics["mean_loss"],
-                "validation_accuracy": final_validation_metrics.get("accuracy"),
-                "validation_cross_entropy": final_validation_metrics.get("cross_entropy"),
-                "completed_updates": trainer.persistent_state.global_step,
-            }
-        ],
+    write_run_records(
+        run_output_root,
+        results,
+        [static_task_row(summary, test_metrics, final_validation_metrics, trainer.persistent_state.global_step)],
     )
-    _generate_plots(epoch_records, test_metrics, run_output_root / "plots")
+    plot_static_run(epoch_records, test_metrics, run_output_root / "plots")
 
     log_progress(
         f"run complete arm={arm} dir={run_output_root} "
