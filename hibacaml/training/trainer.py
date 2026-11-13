@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import copy
+import dataclasses
 import itertools
 import time
 from abc import ABC, abstractmethod
 from functools import cached_property
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 
 from fabricpc.graph_initialization.state_initializer import FeedforwardStateInit
@@ -43,8 +46,9 @@ from hibacaml.reporting import (
     write_run_state,
 )
 from hibacaml.reporting.export import write_json
+from hibacaml.training import write_policy
 from hibacaml.types import (
-    MnistTask,
+    Task,
     PersistentHiBaCaMLState,
     clone_persistent_state,
     SupportSnapshot,
@@ -78,6 +82,50 @@ def _mask_gradients(grads, support_mask, column_of_node):
     return grads._replace(nodes=masked_nodes)
 
 
+class GradientClippingState(NamedTuple):
+    """Latest device telemetry alongside the unmodified clipping transform state."""
+
+    inner_state: object
+    gradient_norm: jax.Array
+    clip_scale: jax.Array
+
+
+def _instrument_gradient_clipping(threshold) -> optax.GradientTransformation:
+    # Optax does the clipping; the telemetry never modifies updates.
+    clipping = optax.identity() if threshold is None else optax.clip_by_global_norm(threshold)
+
+    def init(params):
+        return GradientClippingState(clipping.init(params), jnp.float32(0.0), jnp.float32(1.0))
+
+    def update(updates, state, params=None):
+        norm = optax.tree.norm(updates)
+        clipped, inner = clipping.update(updates, state.inner_state, params)
+        scale = (
+            jnp.ones_like(norm)
+            if threshold is None
+            else jnp.where(norm > 0, jnp.minimum(1.0, threshold / jnp.where(norm > 0, norm, 1.0)), 1.0)
+        )
+        return clipped, GradientClippingState(inner, norm, scale)
+
+    return optax.GradientTransformation(init, update)
+
+
+def default_optimizer(cfg: HiBaCaMLConfig) -> optax.GradientTransformation:
+    """AdamW, optionally behind a global-norm gradient clip (instrumented when logged)."""
+    adamw = optax.adamw(cfg.optimizer_lr, weight_decay=cfg.weight_decay)
+    if cfg.reporting.log_gradient_clipping:
+        return optax.chain(_instrument_gradient_clipping(cfg.grad_clip_norm), adamw)
+    if cfg.grad_clip_norm is None:
+        return adamw
+    return optax.chain(optax.clip_by_global_norm(cfg.grad_clip_norm), adamw)
+
+
+def adam_count(opt_state) -> int:
+    """The single global Adam step count, for bare or clip-chained AdamW."""
+    adam = opt_state[0] if isinstance(opt_state[0], optax.ScaleByAdamState) else opt_state[1][0]
+    return int(adam.count)
+
+
 def build_update_programs(
     gradient_step,
     structure,
@@ -92,6 +140,7 @@ def build_update_programs(
     resistance_enabled = cfg.exact_search.enable_precision_update_resistance
     resistance_strength = cfg.exact_search.precision_update_strength
     resistance_floor = cfg.exact_search.precision_update_floor
+    layout = write_policy.PolicyLayout.from_structure(structure, cfg)
 
     def update_core(params, opt_state, inputs, rng_key):
         grads, loss_vector, final_state = gradient_step(params, inputs, rng_key)
@@ -105,11 +154,20 @@ def build_update_programs(
             strength=resistance_strength,
             floor=resistance_floor,
         )
+        # A write policy is an optional input: without one the trace is unchanged.
+        policy = "write_mask" in inputs
+        if policy:
+            grads = write_policy.mask(grads, inputs, support_mask, layout)
         updates, new_opt_state = optimizer.update(grads, opt_state, params)
         # AdamW momentum and weight decay still move inactive columns after
         # gradient masking, so the updates are masked too.
         updates = _mask_gradients(updates, support_mask, column_of_node)
+        if policy:
+            updates = write_policy.mask(updates, inputs, support_mask, layout)
+            updates = write_policy.scale(updates, inputs, layout)
         new_params = optax.apply_updates(params, updates)
+        if policy:
+            new_params = write_policy.restore(new_params, params, inputs, support_mask, layout)
         return new_params, new_opt_state, loss_vector, final_state
 
     programs = {"update": jax.jit(update_core)}
@@ -151,7 +209,7 @@ class HiBaCaMLTrainer(ABC):
         cfg: HiBaCaMLConfig,
         structure,
         params,
-        tasks: Optional[Sequence[MnistTask]] = None,
+        tasks: Optional[Sequence[Task]] = None,
         optimizer: Optional[optax.GradientTransformation] = None,
         rng_key: Optional[jax.Array] = None,
         persistent_state: Optional[PersistentHiBaCaMLState] = None,
@@ -175,18 +233,20 @@ class HiBaCaMLTrainer(ABC):
         self.params = params
         self.experiment_metadata = dict(experiment_metadata or {})
         self.rng_key = rng_key if rng_key is not None else jax.random.PRNGKey(cfg.seed)
-        self.optimizer = optimizer or optax.adamw(cfg.optimizer_lr, weight_decay=cfg.weight_decay)
+        self.optimizer = optimizer or default_optimizer(cfg)
         # Rollout clones supply the parent's state; initializing here would allocate a full zeros tree (adamw mu + nu) only to have it overwritten.
         self.opt_state = opt_state if opt_state is not None else self.optimizer.init(params)
         self.persistent_state = persistent_state or initialize_hibacaml_state(params, cfg)
         self.persistent_state.params = self.params
         self.persistent_state.opt_state = self.opt_state
-        self.tasks: Dict[int, MnistTask] = {}
+        self.tasks: Dict[int, Task] = {}
         self._task_queries: Dict[int, jnp.ndarray] = {}
         # Support-invariant tiled images reused across candidate chunks; a bundle's two eval batches are the whole working set.
         self._tiled_images: Dict[Tuple[int, int], Tuple[jnp.ndarray, jnp.ndarray]] = {}
         self.current_phi = cfg.phi
         self.current_nonshared = default_nonshared_support(cfg)
+        self.write_policy: Optional[write_policy.WritePolicy] = None
+        self._policy_inputs: Optional[Dict[str, jax.Array]] = None
         self._programs = (
             programs
             if programs is not None
@@ -230,7 +290,7 @@ class HiBaCaMLTrainer(ABC):
     def build_programs(cls, structure, optimizer, cfg) -> Dict[str, Callable]:
         """Return compiled programs reused by this learner."""
 
-    def register_tasks(self, tasks: Sequence[MnistTask]) -> None:
+    def register_tasks(self, tasks: Sequence[Task]) -> None:
         for task in tasks:
             self.tasks[task.task_id] = task
             self._task_queries[task.task_id] = jnp.asarray(
@@ -263,6 +323,23 @@ class HiBaCaMLTrainer(ABC):
         cloned.persistent_state.opt_state = cloned.opt_state
         cloned.current_phi = self.current_phi                          # frozen dataclass
         cloned.current_nonshared = tuple(self.current_nonshared)
+        cloned.write_policy = self.write_policy                        # immutable, with read-only table
+        # Own dict, shared immutable arrays: replacing a clone's entry never reaches the parent.
+        cloned._policy_inputs = None if self._policy_inputs is None else dict(self._policy_inputs)
+        return cloned
+
+    def isolated_clone(self) -> "HiBaCaMLTrainer":
+        """Clone with its own loader cursors, so trials never advance the parent's passes."""
+        cloned = self.clone()
+        cloned.tasks = {
+            task_id: dataclasses.replace(
+                task,
+                train_loader=copy.copy(task.train_loader),
+                validation_loader=copy.copy(task.validation_loader),
+                test_loader=copy.copy(task.test_loader),
+            )
+            for task_id, task in self.tasks.items()
+        }
         return cloned
 
     def resume_clone(self) -> "HiBaCaMLTrainer":
@@ -270,6 +347,21 @@ class HiBaCaMLTrainer(ABC):
         resumed = self.clone()
         resumed._last_graph_state = getattr(self, "_last_graph_state", None)
         return resumed
+
+    def set_write_policy(self, policy: Optional[write_policy.WritePolicy]) -> None:
+        """Install (or clear, with None) the write protection used by every later update."""
+        if policy is not None:
+            if type(self).CLAMPS_MAY_INCLUDE_TARGETS:
+                raise ValueError("write policies are supported by the backprop learner only")
+            search = self.cfg.exact_search
+            if search.enable_exact_search or search.enable_structural_edits:
+                raise ValueError("write policies require legacy exact search and structural edits off")
+            write_policy.validate(policy, self.cfg)
+            table = np.array(policy.unit_scales, dtype=np.float32)
+            table.flags.writeable = False
+            policy = dataclasses.replace(policy, unit_scales=table)
+        self.write_policy = policy
+        self._policy_inputs = None if policy is None else write_policy.policy_inputs(policy, self.cfg)
 
     def _record_timing(
         self,
@@ -342,7 +434,7 @@ class HiBaCaMLTrainer(ABC):
         chosen = tuple(nonshared) if nonshared is not None else self.current_nonshared
         return build_full_support(self.cfg, chosen)
 
-    def task(self, task_id: int) -> MnistTask:
+    def task(self, task_id: int) -> Task:
         return self.tasks[task_id]
 
     def _refresh_certificates(
@@ -356,7 +448,7 @@ class HiBaCaMLTrainer(ABC):
         state = graph_state if graph_state is not None else self._last_graph_state_or_placeholder(batch_size)
         self.certificate_controller.refresh_certificates(params, state, self.persistent_state)
 
-    def _task_query(self, task: MnistTask) -> jnp.ndarray:
+    def _task_query(self, task: Task) -> jnp.ndarray:
         """Device-resident task query, converted once per registered task."""
         query = self._task_queries.get(task.task_id)
         if query is None:
@@ -380,7 +472,7 @@ class HiBaCaMLTrainer(ABC):
     def _build_clamps(
         self,
         batch: Dict[str, jnp.ndarray],
-        task: MnistTask,
+        task: Task,
         nonshared: Sequence[int],
         *,
         params=None,
@@ -410,7 +502,7 @@ class HiBaCaMLTrainer(ABC):
     def _build_multi_support_clamps(
         self,
         batch: Dict[str, jnp.ndarray],
-        task: MnistTask,
+        task: Task,
         supports: Sequence[Sequence[int]],
         *,
         params=None,
@@ -473,7 +565,7 @@ class HiBaCaMLTrainer(ABC):
     def run_batch_evaluation_inference(
         self,
         batch: Dict[str, jnp.ndarray],
-        task: MnistTask,
+        task: Task,
         nonshared: Sequence[int],
         params=None,
     ):
@@ -494,7 +586,7 @@ class HiBaCaMLTrainer(ABC):
     def composer_diagnostics_from_state(
         self,
         final_state,
-        task: MnistTask,
+        task: Task,
         nonshared: Sequence[int],
     ) -> Dict[str, float]:
         meta = self.structure.config["hibacaml"]
@@ -554,7 +646,7 @@ class HiBaCaMLTrainer(ABC):
     def _training_inputs(
         self,
         batch: Dict[str, jnp.ndarray],
-        task: MnistTask,
+        task: Task,
         nonshared: Sequence[int],
     ) -> Dict[str, object]:
         """Build the host-side inputs consumed by this learner's update."""
@@ -566,7 +658,7 @@ class HiBaCaMLTrainer(ABC):
     def training_update(
         self,
         batch: Dict[str, jnp.ndarray],
-        task: MnistTask,
+        task: Task,
         nonshared: Sequence[int],
     ):
         """Run one state-producing learner update."""
@@ -580,7 +672,7 @@ class HiBaCaMLTrainer(ABC):
     def _execute_training_update(
         self,
         batch: Dict[str, jnp.ndarray],
-        task: MnistTask,
+        task: Task,
         nonshared: Sequence[int],
         *,
         need_state: bool,
@@ -606,7 +698,7 @@ class HiBaCaMLTrainer(ABC):
 
     def _train_batch(
         self,
-        task: MnistTask,
+        task: Task,
         batch: Dict[str, jnp.ndarray],
         nonshared: Sequence[int],
         *,
@@ -746,9 +838,31 @@ class HiBaCaMLTrainer(ABC):
 
         return nonshared, final_losses, batch_size
 
+    def train_batches(
+        self,
+        task: Task,
+        batches: Sequence[Dict[str, jnp.ndarray]],
+        nonshared: Sequence[int],
+        *,
+        epoch_index: int = 0,
+    ) -> Tuple[int, ...]:
+        """Train fixed batches through the ordinary per-batch lifecycle; no loaders or validation."""
+        count = len(batches)
+        for batch_index, batch in enumerate(batches):
+            nonshared, _, _ = self._train_batch(
+                task,
+                batch,
+                nonshared,
+                epoch_index=epoch_index,
+                batch_index=batch_index,
+                train_batches=count,
+                batch_log_every=max(1, count // 4),
+            )
+        return tuple(nonshared)
+
     def _train_epoch(
         self,
-        task: MnistTask,
+        task: Task,
         nonshared: Sequence[int],
         *,
         epoch_index: int,
@@ -853,7 +967,7 @@ class HiBaCaMLTrainer(ABC):
 
     def train_task(
         self,
-        task: MnistTask,
+        task: Task,
         *,
         evaluate_train_each_epoch: bool = False,
     ) -> TaskSummary:
@@ -956,7 +1070,7 @@ class HiBaCaMLTrainer(ABC):
     def _prepare_evaluation_batch(
         self,
         batch: Dict[str, jnp.ndarray],
-        task: MnistTask,
+        task: Task,
         supports: Sequence[Sequence[int]],
         *,
         params,
@@ -989,7 +1103,7 @@ class HiBaCaMLTrainer(ABC):
     def _evaluate_supports_batch(
         self,
         batch: Dict[str, jnp.ndarray],
-        task: MnistTask,
+        task: Task,
         supports: Sequence[Sequence[int]],
         *,
         params=None,
@@ -1018,7 +1132,7 @@ class HiBaCaMLTrainer(ABC):
 
     def evaluate_batch_loss(
         self,
-        task: MnistTask,
+        task: Task,
         batch: Dict[str, jnp.ndarray],
         nonshared: Sequence[int],
         params=None,
@@ -1041,7 +1155,7 @@ class HiBaCaMLTrainer(ABC):
 
     def evaluate_batch_losses(
         self,
-        task: MnistTask,
+        task: Task,
         batch: Dict[str, jnp.ndarray],
         supports: Sequence[Sequence[int]],
         params=None,
@@ -1078,7 +1192,7 @@ class HiBaCaMLTrainer(ABC):
 
     def evaluate_loader(
         self,
-        task: MnistTask,
+        task: Task,
         loader,
         nonshared: Optional[Sequence[int]] = None,
         *,

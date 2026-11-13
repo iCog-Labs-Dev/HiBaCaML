@@ -33,7 +33,7 @@ from hibacaml.training.trainer import (
     build_evaluation_programs,
     build_update_programs,
 )
-from hibacaml.types import MnistTask
+from hibacaml.types import Task
 
 
 def _targets_are_clamped(clamps, structure) -> bool:
@@ -361,7 +361,7 @@ class HiBaCaMLPCTrainer(HiBaCaMLTrainer):
     def _training_inputs(
         self,
         batch: Dict[str, jnp.ndarray],
-        task: MnistTask,
+        task: Task,
         nonshared: Sequence[int],
     ) -> Dict[str, object]:
         # Supervised targets are graph clamps during training, and certificates

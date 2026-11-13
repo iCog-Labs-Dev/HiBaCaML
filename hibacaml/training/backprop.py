@@ -193,7 +193,7 @@ class HiBaCaMLBackpropTrainer(HiBaCaMLTrainer):
     ) -> Dict[str, object]:
         # Targets stay outside the graph; without certificate refresh, clamps are
         # parameter-independent and can be built outside `_gradients`.
-        return {
+        inputs = {
             "clamps": self._build_clamps(
                 batch,
                 task,
@@ -202,6 +202,9 @@ class HiBaCaMLBackpropTrainer(HiBaCaMLTrainer):
             ),
             "targets": batch_targets(batch),
         }
+        if self._policy_inputs is not None:
+            inputs.update(self._policy_inputs)
+        return inputs
 
     def _gradients(self, params, inputs, rng_key):
         return _bp_gradient_step(
