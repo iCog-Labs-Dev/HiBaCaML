@@ -1,12 +1,13 @@
-"""Restricted support selection: a later task may adopt one earlier learned column (guide §8).
+"""Restricted column reuse: a later task may adopt one earlier learned column.
 
-Every boundary after T0 draws four fresh columns. Each learned candidate replaces
-the highest of them; a reserve column in the same slot is a diagnostic null. All
+Every task boundary after the first (T0) draws `topk_nonshared` fresh columns. Each
+learned candidate replaces the highest of them; a reserve column in the same slot is a
+diagnostic null. All
 conditions train the same materialized current-task fit pass on isolated clones of
 the parent, then the predictive teacher picks the candidate whose validation gain
 over fresh survives a simultaneous class-stratified bootstrap and the per-old-task
 harm cap. Only the allocation and its write policy reach the main trainer; every
-trial-trained state is discarded.
+trial-trained state is discarded. See docs/COLUMN_REUSE_AND_SHELL_ADAPTATION.md.
 """
 
 from __future__ import annotations
@@ -370,7 +371,7 @@ class BoundarySelector:
         parent_signature = learning_state_signature(trainer)
         pool = self.cfg.column_pool
         parent_columns = column_fingerprints(trainer.params, pool.adaptive_indices + pool.reserve_indices)
-        # One independently seeded current-task fit pass (35 batches in production), shared by every condition.
+        # One independently seeded pass over the current task's fit data, shared by every condition.
         batches = list(dataclasses.replace(task.train_loader, seed=seeds["trial"]))
         require(len(batches) == len(task.train_loader), "the trial pass is not one full fit pass", task_id=tid)
         record.update(trial_seed=seeds["trial"], bootstrap_seed=seeds["bootstrap"], trial_batches=len(batches))

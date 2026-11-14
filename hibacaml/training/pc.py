@@ -311,7 +311,7 @@ class HiBaCaMLPCTrainer(HiBaCaMLTrainer):
     @classmethod
     def build_programs(cls, structure, optimizer, cfg):
         # Without this inference algorithm the auxiliary factors never reach
-        # settling, which is the report-only behavior this learner replaced.
+        # settling: they would appear in the reported loss without affecting learning.
         inference = structure.config["inference"]
         if not isinstance(inference, HiBaCaMLPCInference):
             raise ValueError(

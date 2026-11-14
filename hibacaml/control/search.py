@@ -84,7 +84,7 @@ def _apply_structural_edits(clone, final_state, support_cols, phi) -> None:
 
 
 class ExactSearchService:
-    """Exact support search service with V20.2b replay-bank reselection."""
+    """Exact support search service with replay-bank reselection."""
 
     def __init__(
         self,
@@ -401,7 +401,7 @@ class ExactSearchService:
         original_phi: PhiConfig,
         bundle: BoundaryBundle,
     ) -> Tuple[Tuple[int, ...], PhiConfig, str, ReplayProposalRow]:
-        """Three-stream V20.2b reselection at task boundary.
+        """Three-stream replay-bank reselection at a task boundary.
 
         Compares the exact-search winner ("original"), its best 1-hop
         refinement ("local"), and replay-bank candidates ("replay") under the
@@ -634,7 +634,7 @@ class ExactSearchService:
                 )
             return fallback, self.trainer.current_phi
 
-        # V20.2b: route the exact-search winner through replay-bank reselection.
+        # Route the exact-search winner through replay-bank reselection.
         accepted_nonshared, accepted_phi, accepted_source, proposal_row = self._reselect_with_bank(
             task_id,
             original_nonshared=tuple(best_row.nonshared),

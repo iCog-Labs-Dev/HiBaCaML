@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Optional, Tuple
 
 import jax.numpy as jnp
@@ -270,10 +270,6 @@ class PersistentHiBaCaMLState:
     shell_roles: Optional[Dict[str, Any]] = None
     roles_revision: int = 0
 
-    def to_dict(self) -> Dict[str, Any]:
-        """Best-effort conversion for JSON export and tests."""
-        return asdict(self)
-
 
 def clone_persistent_state(state: PersistentHiBaCaMLState) -> PersistentHiBaCaMLState:
     """Independent mutable state for a rollout trial."""
@@ -298,7 +294,7 @@ def clone_persistent_state(state: PersistentHiBaCaMLState) -> PersistentHiBaCaML
         recently_demoted=dict(state.recently_demoted),
         composer_diagnostics=dict(state.composer_diagnostics),
         certificates=dict(state.certificates),
-        # Copied (200 x 92 int8), so an in-place label edit on a clone never reaches its parent.
+        # Copied (one int8 vector per shell node), so an in-place label edit on a clone never reaches its parent.
         shell_roles=None if state.shell_roles is None else {
             name: labels.copy() for name, labels in state.shell_roles.items()
         },

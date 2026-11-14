@@ -33,7 +33,7 @@ LEARNING = "backprop"  # "backprop" or "pc"
 VALIDATION_FRACTION = 0.10
 RUN_ID = None
 
-# TODO: Clarify the full-bank phrasing: BANK=17 leaves three physical reserve columns inactive.
+# Active columns; the remaining 20 - BANK physical columns stay inactive in reserve (3 for BANK=17).
 BANK = 17
 
 _SHARED_COUNT = 2
@@ -41,7 +41,7 @@ _TOTAL_COLUMNS = 20
 
 
 def _bank_overrides(bank: int) -> Dict[str, int]:
-    """Config fields that make `bank` columns active, with none held in reserve."""
+    """Config fields that make `bank` columns active; the rest of the 20 are inactive reserve."""
     if isinstance(bank, bool) or not isinstance(bank, int):
         raise TypeError(f"BANK must be an integer, got {type(bank).__name__}")
     if not _SHARED_COUNT < bank <= _TOTAL_COLUMNS:
@@ -72,7 +72,7 @@ OVERRIDES = {
     "exact_search__enable_precision_update_resistance": False,
     "exact_search__enable_demotion_swap_audit": False,
     "reporting__write_selector_state": False,
-    "reporting__experiment_root": "runs/experiments/full_mnist_architecture",
+    "reporting__experiment_root": "runs",
 }
 
 
@@ -82,8 +82,7 @@ def _select(source: Dict[str, object], *names: str) -> Dict[str, object]:
 
 
 def _arm_name(learning: str, bank: int) -> str:
-    # Plain "pc": there is one PC implementation. The old "pc_local" name marks
-    # pre-2026-09-19 bundles, whose update omitted the two auxiliary terms.
+    # Plain "pc": there is one PC implementation.
     learner = {
         "backprop": "backprop",
         "pc": "pc",
@@ -140,7 +139,7 @@ def run_experiment(
     if cfg.task_local_heads:
         raise ValueError("Full-MNIST requires task_local_heads=False")
     if cfg.composer.topk != 3:
-        raise ValueError("Full-MNIST Phase 1A requires composer.topk == 3")
+        raise ValueError("Full-MNIST requires composer.topk == 3")
 
     log_runtime()
     tasks = build_tasks(cfg, validation_fraction=validation_fraction)

@@ -1,15 +1,16 @@
-"""Split-CIFAR-10 integrated reference A and its controls (Task-IL over five class pairs).
+"""Split-CIFAR-10 (task-incremental, five class pairs): the full method and its controls.
 
-Each task's support comes from the restricted support teacher (`hibacaml.control.reuse`):
-after T0 a task may adopt one earlier learned column, chosen from isolated 35-update
-trials. `fixed_fresh` and `replay` are the controls. Physical role labels exist from
-T0, post-T0 write protection is exact, training state is continuous, and Split-MNIST
-style records are rewritten after every boundary. From T1 the structural controller
-(`hibacaml.control.structure`) runs audited relabel/inhibition/pruning rounds in the
-epoch hook; `structure="off"` keeps its observations without installing anything.
+Each task's support comes from restricted column reuse (`hibacaml.control.reuse`):
+after the first task, a task may adopt one earlier learned column, chosen from short
+isolated trials (one pass over the task's fit data). `fixed_fresh` and `replay` are
+the controls. Shell role labels exist from the first task, write protection after it
+is exact, training state is continuous, and the run records are rewritten after every
+task. From the second task, audited shell adaptation (`hibacaml.control.structure`)
+runs relabel/inhibition/pruning rounds in the epoch hook; `structure="off"` keeps its
+observations without installing anything. See docs/COLUMN_REUSE_AND_SHELL_ADAPTATION.md.
 
-Production runs all five tasks on GPU/JIT; no deterministic-XLA flag is required.
-Choose controls in the settings block below. Output names are generated automatically.
+Runs train all five tasks on a GPU with JIT enabled. Choose controls in the settings
+block below; output names are generated automatically.
 
     python -m experiments.split_cifar [--seed S]
 """
@@ -65,7 +66,7 @@ AUGMENT = True              # random crop + horizontal flip on the fit split
 EVAL_BATCH_SIZE = 500       # one evaluation shape for the 1,000 validation and 2,000 test images
 SHARED_K_CONNECTIVITY = "kernel-only"  # shared K kernel units read only kernel coordinates
 
-# Production choices: A by default; controls use the same learning machinery.
+# Run settings: the full method by default; the controls use the same learning machinery.
 SUPPORT_POLICY = "restricted_reuse"
 STRUCTURE = "on"
 PROMOTIONS = "on"
@@ -93,26 +94,24 @@ def condition_label(support_policy: str, structure: str, promotions: str) -> str
         return "replay"
     effective = promotions if structure == "on" else "off"
     return {
-        ("restricted_reuse", "on", "on"): "A",
-        ("restricted_reuse", "on", "off"): "C",
-        ("restricted_reuse", "off", "off"): "D",
-        ("fixed_fresh", "off", "off"): "E",
+        ("restricted_reuse", "on", "on"): "full",
+        ("restricted_reuse", "on", "off"): "no_promotions",
+        ("restricted_reuse", "off", "off"): "no_shell_adaptation",
+        ("fixed_fresh", "off", "off"): "fresh_only",
     }.get((support_policy, structure, effective), "custom")
 
 
-def _run_name(cfg, support_policy: str, structure: str, promotions: str) -> str:
-    label = condition_label(support_policy, structure, promotions)
-    if label in ("custom", "replay"):
-        effective = promotions if structure == "on" else "off"
-        label += (f"_{support_policy}" if label == "custom" else "")
-        label += f"_structure-{structure}_promotions-{effective}"
-    pool = cfg.column_pool
-    return (f"SCIFAR10_backprop_integrated-v2_{label}_s{pool.shared_count}o{pool.topk_nonshared}"
-            f"_seed{cfg.seed}_{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}")
+def _run_name(cfg) -> str:
+    """Seed and UTC timestamp; the condition is recorded in the summary (`condition_label`)."""
+    return f"SCIFAR10_backprop_seed{cfg.seed}_{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
 
 
 def load_replay(source, pool, task_count: int):
-    """Read decisions from a current or historical v2 JSON summary, then validate allocation."""
+    """Read the support decisions of an earlier run summary, then validate the allocation.
+
+    Accepts this runner's `support_selection` records and the older `pilot.selection.decisions`
+    summary layout.
+    """
     payload = json.loads(Path(source).read_text())
     require(isinstance(payload, dict), "replay source must be a JSON run summary")
     if "support_selection" in payload:
@@ -149,11 +148,11 @@ def _preflight(cfg) -> None:
     search = cfg.exact_search
     require(cfg.task_local_heads, "Split-CIFAR-10 trains task-local two-way heads")
     require(cfg.stem is not None, "Split-CIFAR-10 requires the convolutional stem")
-    require(cfg.reporting.log_gradient_clipping, "reference A records clipping through the instrumented optimizer")
+    require(cfg.reporting.log_gradient_clipping, "Split-CIFAR-10 records gradient clipping per epoch")
     require(
         not (search.enable_exact_search or search.enable_structural_edits
              or search.enable_precision_update_resistance or search.enable_demotion_swap_audit),
-        "legacy search, edits, precision resistance and demotion audits stay off",
+        "exact support search, structural edits, precision resistance and demotion audits must be off",
     )
 
 
@@ -207,7 +206,7 @@ def run_experiment(cfg, *, tasks_limit: int | None = None, run_id: str | None = 
         replay_supports = {int(t): dict(r) for t, r in replay_supports.items()}
         validate_replay(cfg.column_pool, replay_supports, [task.task_id for task in tasks])
     label = condition_label(support_policy, structure, promotions)
-    run_id = run_id or _run_name(cfg, support_policy, structure, promotions)
+    run_id = run_id or _run_name(cfg)
     cfg, run_output_root = prepare_run_root(cfg, run_id)
     graph, trainer = build_trainer(
         cfg, tasks, "backprop", run_id=run_id,

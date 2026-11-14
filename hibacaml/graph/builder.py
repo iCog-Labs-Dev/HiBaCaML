@@ -28,7 +28,7 @@ from hibacaml.types import (
     ShellStats
     )
 
-# Shared-column K input: all 92 coordinates, or only the 32 kernel ones into kernel units.
+# Shared-column K input: every shell coordinate, or only the kernel coordinates into kernel units.
 SHARED_K_CONNECTIVITY = ("dense", "kernel-only")
 
 

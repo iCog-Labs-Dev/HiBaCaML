@@ -1,4 +1,4 @@
-"""Static Full-CIFAR-10 experiment (R6): joint ten-class capacity of the 4+5 active layout.
+"""Static Full-CIFAR-10: the ten-class capacity of a fixed 4 shared + 5 adaptive column layout.
 
     python -m experiments.cifar [--seed S]
 """
@@ -48,7 +48,7 @@ def _preflight(cfg) -> None:
     require(
         not (search.enable_exact_search or search.enable_structural_edits
              or search.enable_precision_update_resistance or search.enable_demotion_swap_audit),
-        "legacy search, edits, precision resistance and demotion audits stay off",
+        "exact support search, structural edits, precision resistance and demotion audits must be off",
     )
 
 
@@ -61,14 +61,11 @@ def run_experiment(cfg, *, run_id: str | None = None):
     )
     bank = cfg.column_pool.active_support_size
     arm = f"full_cifar_backprop_bank{bank}"
-    run_id = run_id or (
-        f"CIFAR10_backprop_R6_s{cfg.column_pool.shared_count}o{cfg.column_pool.topk_nonshared}"
-        f"_seed{cfg.seed}_{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
-    )
+    run_id = run_id or f"CIFAR10_backprop_static_seed{cfg.seed}_{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
     cfg, run_output_root = prepare_run_root(cfg, run_id)
     expected_updates = len(task.train_loader) * cfg.epochs_per_task
     experiment_metadata = {
-        "experiment": "full_cifar_r6",
+        "experiment": "full_cifar_static",
         "arm": arm,
         "learner_contract": "backprop_full",
         "bank": bank,

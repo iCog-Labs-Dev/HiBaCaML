@@ -225,7 +225,7 @@ def plot_sequential_run(results: Mapping, plots_dir: Path) -> None:
     plot_accuracy_forgetting(
         results["mean_seen_accuracy"],
         results["mean_forgetting"],
-        plots_dir / "figure3_accuracy_forgetting.png",
+        plots_dir / "accuracy_forgetting.png",
     )
     plot_support_table(
         results["support_sequence"],

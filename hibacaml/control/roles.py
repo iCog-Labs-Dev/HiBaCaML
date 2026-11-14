@@ -5,10 +5,10 @@ physical layout; kernel units stay 0 and every node keeps its physical tier
 sizes. Labels set write rates and certificate tier statistics, and changing
 one never touches a parameter or moment.
 
-The structural controller's host arithmetic lives here too (guide §9): unit
-usage, same-label redundancy, multi-context promotion evidence, adjacent
+The shell-adaptation arithmetic lives here too (docs/COLUMN_REUSE_AND_SHELL_ADAPTATION.md):
+unit usage, same-label redundancy, multi-context promotion evidence, adjacent
 relabelling, labelled inhibition and the pruning trigger. Their float32/float64
-order follows the retained reference exactly.
+order is part of the method and is kept exact.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from hibacaml.reporting.integrity import fingerprint
 
 REGIONS = ("kernel", "tier1", "tier2", "tier3")  # physical storage order of a shell node's units
 # Write scale per label after T0: kernel frozen, shells increasingly plastic.
-REFERENCE_LABEL_SCALES = (0.0, 0.04140854626893997, 0.12422563880681992, 0.37267690896987915)
+LABEL_WRITE_SCALES = (0.0, 0.04140854626893997, 0.12422563880681992, 0.37267690896987915)
 
 Roles = Dict[str, np.ndarray]
 
@@ -68,7 +68,7 @@ def unit_scale_table(
     cfg: HiBaCaMLConfig,
     roles: Roles,
     scaled_columns: Iterable[int],
-    label_scales: Sequence[float] = REFERENCE_LABEL_SCALES,
+    label_scales: Sequence[float] = LABEL_WRITE_SCALES,
 ) -> np.ndarray:
     """`[columns, positions, units]` write scales: label scales on `scaled_columns`, 1 elsewhere."""
     scales = np.asarray(label_scales, dtype=np.float32)

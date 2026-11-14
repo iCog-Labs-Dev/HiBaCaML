@@ -1,6 +1,6 @@
 """Shared experiment wiring for the HiBaCaML runners.
 
-Graph construction, parameter initialization, runner selection, and run-root
+Graph construction, parameter initialization, trainer (learner) selection, and run-root
 preparation are identical for every protocol (Split-/Full-MNIST and CIFAR-10);
 only the task set and the recorded metadata differ. Keeping them here means a
 runner is just a protocol description.
@@ -154,7 +154,7 @@ def require_production_runtime() -> None:
 
 
 def log_runtime() -> Dict[str, object]:
-    """Log the backend and devices; return the runtime identity a GPU run is paired by."""
+    """Log the backend and devices; return the runtime identity recorded in the run summary."""
     log_progress(f"backend={jax.default_backend()} devices={jax.devices()}", component="runner")
     try:
         revision = subprocess.run(
@@ -172,7 +172,7 @@ def log_runtime() -> Dict[str, object]:
 
 
 def architecture_metadata(cfg: HiBaCaMLConfig, structure, params) -> Dict[str, object]:
-    """Column layout, token layout and parameter count of a built CIFAR graph."""
+    """Column layout, token layout and parameter count of a built graph."""
     pool, meta = cfg.column_pool, structure.config["hibacaml"]
     return {
         "total_columns": pool.total_columns,

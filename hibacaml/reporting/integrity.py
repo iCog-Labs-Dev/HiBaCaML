@@ -81,11 +81,10 @@ def _stream(loader):
 def learning_state_signature(trainer) -> str:
     """Digest of the state later backprop training consumes.
 
-    Excluded: timings and reports; task data contents (fixed inputs, hashed in run
-    evidence); and `_last_graph_state`, which backprop training never reads (its
-    scheduled refreshes use the update's own graph state). Only certificate refreshes
-    requested through `_build_clamps(refresh_certificates=True)` read that cache;
-    use `resume_clone` when a continuation must keep it.
+    Excluded: timings and reports; task data contents (fixed inputs); and
+    `_last_graph_state`, which backprop training never reads (its scheduled refreshes
+    use the update's own graph state). Only certificate refreshes requested through
+    `_build_clamps(refresh_certificates=True)` read that cache.
     """
     state = trainer.persistent_state
     return fingerprint({

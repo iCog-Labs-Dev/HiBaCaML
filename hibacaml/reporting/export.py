@@ -170,12 +170,12 @@ def build_run_snapshot(trainer) -> Dict[str, object]:
         "selector_bank_summary": trainer.selector_bank.summary(),
         "run_id": trainer.run_id,
         "experiment_metadata": trainer.experiment_metadata,
-        "evaluation_protocol": "target_free_inference_external_supervision_v1",
+        "evaluation_protocol": "target_free_inference_external_supervision",
     }
 
 
 def export_run_artifacts(snapshot: Dict[str, object], root: str | Path) -> None:
-    """Export the HiBaCaML artifact bundle (V20.2b)."""
+    """Export the HiBaCaML artifact bundle."""
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
 

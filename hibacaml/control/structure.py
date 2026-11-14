@@ -1,4 +1,4 @@
-"""Audited internal structural control for Split-CIFAR (guide §9).
+"""Audited shell adaptation for Split-CIFAR (docs/COLUMN_REUSE_AND_SHELL_ADAPTATION.md).
 
 From T1, scheduled rounds in the epoch hook compare an unchanged `no_edit`
 evaluation of every seen validation task with three mechanisms:
@@ -71,7 +71,7 @@ INHIBITION_FLOOR = 0.25
 PRUNE_WEAK_FRACTION = 0.10
 PRUNE_SCORE_QUANTILE = 0.125
 PRUNE_LOG_PRECISION = -4.0
-MAX_RAW_PROPOSALS = 16     # fail-fast assertion, never truncation (production reaches 15)
+MAX_RAW_PROPOSALS = 16     # fail-fast assertion, never truncation (the Split-CIFAR layout reaches 15)
 USAGE_TAG = 0x55534147
 PRUNE_PROBE_TAG = 0x50524F42
 BOOTSTRAP_TAG = 0x424F4F54
@@ -186,7 +186,7 @@ def _inhibited(trainer, layout, proposal: Proposal, params):
     return params
 
 
-def _pruned(trainer, layout, proposal: Proposal, tree, *, moments: bool):
+def _pruned(trainer, proposal: Proposal, tree, *, moments: bool):
     """Zero the slots' incoming columns, biases and recurrent inputs; gates to the prune value."""
     by_region: Dict[str, List[int]] = {}
     for slot in proposal.slots:
@@ -253,7 +253,7 @@ def build_patch(trainer, proposal: Proposal, layout, eligible: Sequence[int], *,
         names = column_nodes(layout, proposal.column, include_l=False)
     elif proposal.operation == "prune":
         _validate_prune(trainer, layout, proposal)
-        after = {tree: _pruned(trainer, layout, proposal, value, moments=tree != "params")
+        after = {tree: _pruned(trainer, proposal, value, moments=tree != "params")
                  for tree, value in before.items()}
         names = [proposal.node]
     else:

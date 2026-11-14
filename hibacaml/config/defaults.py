@@ -70,7 +70,7 @@ class HierarchyConfig:
 
 @dataclass(frozen=True)
 class ComposerConfig:
-    """Stage-2 composer settings."""
+    """Composer (column-mixing gate) settings."""
 
     hidden_dim: int = 64
     query_dim: int = 5
@@ -266,7 +266,7 @@ def make_hibacaml_config(mode: str = "default") -> HiBaCaMLConfig:
         )
 
     if mode == "cifar":
-        # Shared by static R6 and Split A; each runner sets its own pool partition.
+        # Shared by both CIFAR runners; each runner sets its own column partition.
         return HiBaCaMLConfig(
             mode=mode,
             input_shape=(32, 32, 3),

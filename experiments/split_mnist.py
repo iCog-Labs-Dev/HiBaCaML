@@ -43,7 +43,7 @@ VALIDATION_FRACTION = 0.10             # per task, carved from its training data
 # Any HiBaCaMLConfig field to override for this run.
 OVERRIDES = {
     "batch_size": 1024,
-    "patch_size": (28, 28),            # flattened tokens: the Stage 0 best configuration
+    "patch_size": (28, 28),            # one flattened raw-pixel token per image
     "exact_search__static_support_batch_size": 32,
     "exact_search__neighbor_support_batch_size": 32,
     "exact_search__boundary_current_data_batch_size": 128,
