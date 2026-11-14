@@ -6,6 +6,7 @@ from typing import Dict
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from hibacaml.nodes.composer import composer_details
 
@@ -370,7 +371,9 @@ def per_class_metrics_from_confusion(confusion: jnp.ndarray):
 class EvaluationAccumulator:
     """Accumulate batch details into the stable public evaluation report."""
 
-    def __init__(self, output_dim: int, total_columns: int):
+    def __init__(self, output_dim: int, total_columns: int, *, collect_examples: bool = False):
+        # Optional per-example arrays in loader order; the report is otherwise unchanged.
+        self.examples = {"label": [], "prediction": [], "cross_entropy": []} if collect_examples else None
         self.loss_sums = jnp.zeros((len(LOSS_NAMES),), dtype=jnp.float32)
         self.gate_sums = jnp.zeros((total_columns,), dtype=jnp.float32)
         self.selection_counts = jnp.zeros_like(self.gate_sums)
@@ -409,6 +412,15 @@ class EvaluationAccumulator:
             self.max_selected_columns,
             int(batch_scalars[-1]),
         )
+        if self.examples is not None:
+            # Task cross-entropy of the final probabilities, as the report's task loss uses.
+            values = jax.device_get((
+                targets,
+                predictions,
+                cross_entropy_per_sample(logits, jnp.asarray(batch["y"], dtype=jnp.float32)),
+            ))
+            for name, value in zip(("label", "prediction", "cross_entropy"), values):
+                self.examples[name].append(np.asarray(value))
 
     def finalize(
         self,
@@ -440,7 +452,7 @@ class EvaluationAccumulator:
             name: float(component_means[index])
             for index, name in enumerate(LOSS_NAMES)
         }
-        return {
+        report = {
             "split_name": split_name,
             "mode": mode,
             "accuracy": self.correct / denominator,
@@ -462,3 +474,12 @@ class EvaluationAccumulator:
             "max_selected_columns": int(self.max_selected_columns),
             "refresh_certificates": bool(refresh_certificates),
         }
+        if self.examples is not None:
+            arrays = {k: np.concatenate(v) if v else np.zeros((0,)) for k, v in self.examples.items()}
+            report["examples"] = {
+                "row": np.arange(len(arrays["label"]), dtype=np.int64),
+                "label": arrays["label"].astype(np.int64),
+                "prediction": arrays["prediction"].astype(np.int64),
+                "cross_entropy": arrays["cross_entropy"].astype(np.float32),
+            }
+        return report

@@ -8,6 +8,7 @@ from hibacaml.config import (
     HierarchyConfig,
     PhiConfig,
     ReportingConfig,
+    StemConfig,
     make_hibacaml_config,
     override,
 )
@@ -16,7 +17,12 @@ from hibacaml.control import (
     ExactSearchService,
     ShellController,
 )
-from hibacaml.data import build_full_mnist_task, build_split_mnist_tasks
+from hibacaml.data import (
+    build_full_cifar_task,
+    build_full_mnist_task,
+    build_split_cifar_tasks,
+    build_split_mnist_tasks,
+)
 from hibacaml.experiment import build_trainer, prepare_run_root
 from hibacaml.graph import create_hibacaml_structure, initialize_hibacaml_state
 from hibacaml.reporting import export_run_artifacts
@@ -31,7 +37,6 @@ from hibacaml.types import (
     ControllerSearchRow,
     DemotionSwapAuditRow,
     LocalSwapRow,
-    MnistTask,
     PersistentHiBaCaMLState,
     PhiLike,
     ReserveRecruitmentRow,
@@ -39,6 +44,7 @@ from hibacaml.types import (
     SupportPosteriorSummary,
     SupportSearchRow,
     SupportSnapshot,
+    Task,
     TaskSummary,
 )
 
@@ -50,7 +56,9 @@ __all__ = [
     "ControllerSearchRow",
     "create_hibacaml_structure",
     "DemotionSwapAuditRow",
+    "build_full_cifar_task",
     "build_full_mnist_task",
+    "build_split_cifar_tasks",
     "build_split_mnist_tasks",
     "build_trainer",
     "ExactSearchConfig",
@@ -64,7 +72,6 @@ __all__ = [
     "HierarchyConfig",
     "initialize_hibacaml_state",
     "LocalSwapRow",
-    "MnistTask",
     "override",
     "PersistentHiBaCaMLState",
     "PhiConfig",
@@ -74,9 +81,11 @@ __all__ = [
     "ReserveRecruitmentRow",
     "ShellController",
     "ShellStats",
+    "StemConfig",
     "SupportPosteriorSummary",
     "SupportSearchRow",
     "SupportSnapshot",
+    "Task",
     "TaskSummary",
     "make_hibacaml_config",
 ]

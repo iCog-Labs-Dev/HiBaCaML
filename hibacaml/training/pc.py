@@ -33,7 +33,7 @@ from hibacaml.training.trainer import (
     build_evaluation_programs,
     build_update_programs,
 )
-from hibacaml.types import MnistTask
+from hibacaml.types import Task
 
 
 def _targets_are_clamped(clamps, structure) -> bool:
@@ -311,7 +311,7 @@ class HiBaCaMLPCTrainer(HiBaCaMLTrainer):
     @classmethod
     def build_programs(cls, structure, optimizer, cfg):
         # Without this inference algorithm the auxiliary factors never reach
-        # settling, which is the report-only behavior this learner replaced.
+        # settling: they would appear in the reported loss without affecting learning.
         inference = structure.config["inference"]
         if not isinstance(inference, HiBaCaMLPCInference):
             raise ValueError(
@@ -361,7 +361,7 @@ class HiBaCaMLPCTrainer(HiBaCaMLTrainer):
     def _training_inputs(
         self,
         batch: Dict[str, jnp.ndarray],
-        task: MnistTask,
+        task: Task,
         nonshared: Sequence[int],
     ) -> Dict[str, object]:
         # Supervised targets are graph clamps during training, and certificates

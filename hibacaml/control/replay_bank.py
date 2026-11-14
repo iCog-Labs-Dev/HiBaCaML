@@ -1,4 +1,4 @@
-"""V20.2b cross-run replay bank for support proposal.
+"""Cross-run replay bank for support proposal.
 
 The bank persists `(context, support, observed_quality)` rows across runs.
 At every boundary and accepted local one-swap, the trainer appends a row.
@@ -25,7 +25,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from hibacaml.types import PersistentHiBaCaMLState, PhiLike
 
 
-_BANK_SCHEMA_VERSION = "v20.2b-bank-1"
+_BANK_SCHEMA_VERSION = "selector-bank-1"
 
 
 @dataclass(frozen=True)
@@ -90,7 +90,7 @@ class SelectorBank:
             payload = pickle.load(fh)
         if not isinstance(payload, _BankPayload):
             raise ValueError(
-                f"Selector bank at {self.bank_path} is not a V20.2b _BankPayload"
+                f"Selector bank at {self.bank_path} is not a selector-bank payload"
             )
         if payload.schema_version != _BANK_SCHEMA_VERSION:
             raise ValueError(
@@ -136,10 +136,6 @@ class SelectorBank:
         if row.run_id and row.run_id not in self._payload.contributing_run_ids:
             self._payload.contributing_run_ids.append(row.run_id)
 
-    def extend(self, rows: Sequence[ReplayRow]) -> None:
-        for row in rows:
-            self.add(row)
-
     # ------------------------------------------------------------------
     # Query
     # ------------------------------------------------------------------
@@ -168,7 +164,7 @@ class SelectorBank:
             if other.shape != ctx.shape:
                 continue
             # The epsilon stays float32 at its own site: widening the norm first
-            # lets 1e-8 survive where the reference arithmetic drops it.
+            # would let 1e-8 survive where float32 arithmetic drops it, reordering ties.
             sim = float(np.dot(ctx, other) / (ctx_norm * (other_norm + 1e-8)))
             scored.append((sim, row))
         scored.sort(key=lambda pair: pair[0], reverse=True)
@@ -245,7 +241,7 @@ def build_context(
     cfg: "HiBaCaMLConfig",
     full_support: Sequence[int],
 ) -> np.ndarray:
-    """Compose the 66-dim retrieval-key vector described in the V20.2b plan.
+    """Compose the retrieval-key vector for similar past boundaries (66 dims for default MNIST).
 
     Layout:
         [0 : num_tasks)                               one-hot task id

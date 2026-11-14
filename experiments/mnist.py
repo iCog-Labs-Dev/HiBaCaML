@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import sys
-from pathlib import Path
 from typing import Dict
-import jax
 
 sys.path.append(".")
 
@@ -19,15 +17,14 @@ from hibacaml import (
     override,
     prepare_run_root,
 )
+from hibacaml.experiment import log_runtime
 from hibacaml.reporting import (
     build_run_snapshot,
     export_task_artifacts,
-    plot_composer_usage,
-    plot_confusion_matrix,
-    plot_learning_curve,
+    plot_static_run,
     save_checkpoint,
-    write_csv,
-    write_json,
+    static_task_row,
+    write_run_records,
 )
 
 
@@ -36,7 +33,7 @@ LEARNING = "backprop"  # "backprop" or "pc"
 VALIDATION_FRACTION = 0.10
 RUN_ID = None
 
-# TODO: Clarify the full-bank phrasing: BANK=17 leaves three physical reserve columns inactive.
+# Active columns; the remaining 20 - BANK physical columns stay inactive in reserve (3 for BANK=17).
 BANK = 17
 
 _SHARED_COUNT = 2
@@ -44,7 +41,7 @@ _TOTAL_COLUMNS = 20
 
 
 def _bank_overrides(bank: int) -> Dict[str, int]:
-    """Config fields that make `bank` columns active, with none held in reserve."""
+    """Config fields that make `bank` columns active; the rest of the 20 are inactive reserve."""
     if isinstance(bank, bool) or not isinstance(bank, int):
         raise TypeError(f"BANK must be an integer, got {type(bank).__name__}")
     if not _SHARED_COUNT < bank <= _TOTAL_COLUMNS:
@@ -75,7 +72,7 @@ OVERRIDES = {
     "exact_search__enable_precision_update_resistance": False,
     "exact_search__enable_demotion_swap_audit": False,
     "reporting__write_selector_state": False,
-    "reporting__experiment_root": "runs/experiments/full_mnist_architecture",
+    "reporting__experiment_root": "runs",
 }
 
 
@@ -85,8 +82,7 @@ def _select(source: Dict[str, object], *names: str) -> Dict[str, object]:
 
 
 def _arm_name(learning: str, bank: int) -> str:
-    # Plain "pc": there is one PC implementation. The old "pc_local" name marks
-    # pre-2026-09-19 bundles, whose update omitted the two auxiliary terms.
+    # Plain "pc": there is one PC implementation.
     learner = {
         "backprop": "backprop",
         "pc": "pc",
@@ -126,20 +122,6 @@ def build_tasks(cfg, *, validation_fraction: float = VALIDATION_FRACTION):
     )
 
 
-def _generate_plots(epoch_records, test_metrics, plots_dir: Path) -> None:
-    """Write the three figures relevant to the static Full-MNIST study."""
-    plot_learning_curve(epoch_records, plots_dir / "learning_curve.png")
-    plot_confusion_matrix(
-        test_metrics["confusion_matrix"],
-        plots_dir / "test_confusion_matrix.png",
-    )
-    plot_composer_usage(
-        test_metrics["column_gate_mean"],
-        test_metrics["column_selection_fraction"],
-        plots_dir / "composer_usage.png",
-    )
-
-
 def run_experiment(
     cfg,
     *,
@@ -157,12 +139,9 @@ def run_experiment(
     if cfg.task_local_heads:
         raise ValueError("Full-MNIST requires task_local_heads=False")
     if cfg.composer.topk != 3:
-        raise ValueError("Full-MNIST Phase 1A requires composer.topk == 3")
+        raise ValueError("Full-MNIST requires composer.topk == 3")
 
-    log_progress(
-        f"backend={jax.default_backend()} devices={jax.devices()}",
-        component="runner",
-    )
+    log_runtime()
     tasks = build_tasks(cfg, validation_fraction=validation_fraction)
     task = tasks[0]
     bank = cfg.column_pool.active_support_size
@@ -301,24 +280,12 @@ def run_experiment(
         "checkpoint_path": str(checkpoint_path),
         "experiment_metadata": experiment_metadata,
     }
-    write_json(run_output_root / "run_summary.json", results)
-    write_csv(
-        run_output_root / "task_summary.csv",
-        [
-            {
-                "task_id": summary.task_id,
-                "classes": list(summary.classes),
-                "support": list(summary.support_indices),
-                "test_accuracy": test_metrics["accuracy"],
-                "test_cross_entropy": test_metrics["cross_entropy"],
-                "test_mean_loss": test_metrics["mean_loss"],
-                "validation_accuracy": final_validation_metrics.get("accuracy"),
-                "validation_cross_entropy": final_validation_metrics.get("cross_entropy"),
-                "completed_updates": trainer.persistent_state.global_step,
-            }
-        ],
+    write_run_records(
+        run_output_root,
+        results,
+        [static_task_row(summary, test_metrics, final_validation_metrics, trainer.persistent_state.global_step)],
     )
-    _generate_plots(epoch_records, test_metrics, run_output_root / "plots")
+    plot_static_run(epoch_records, test_metrics, run_output_root / "plots")
 
     log_progress(
         f"run complete arm={arm} dir={run_output_root} "

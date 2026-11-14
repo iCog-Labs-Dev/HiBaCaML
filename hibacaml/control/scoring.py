@@ -213,7 +213,7 @@ class SupportScorer:
         refresh_certificates: bool,
         cache_audit: bool = True,
     ) -> Dict[str, float]:
-        """Boundary objective from Eq. (1)."""
+        """Boundary objective: current-task losses + weighted old-task audit losses + switch penalty."""
         return self.objectives(
             trainer,
             task_id,
@@ -233,7 +233,7 @@ class SupportScorer:
         refresh_certificates: bool,
         cache_audit: bool = True,
     ) -> List[Dict[str, float]]:
-        """Batched Eq. (1) boundary objective for support candidates."""
+        """Batched boundary objective for support candidates."""
         support_list = [tuple(sorted(support)) for support in supports]
         count = len(support_list)
         task = trainer.task(task_id)

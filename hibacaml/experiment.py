@@ -1,14 +1,16 @@
 """Shared experiment wiring for the HiBaCaML runners.
 
-Graph construction, parameter initialization, runner selection, and run-root
-preparation are identical for Split- and Full-MNIST; only the task set and the
-recorded metadata differ. Keeping them here means a runner is just a protocol
-description.
+Graph construction, parameter initialization, trainer (learner) selection, and run-root
+preparation are identical for every protocol (Split-/Full-MNIST and CIFAR-10);
+only the task set and the recorded metadata differ. Keeping them here means a
+runner is just a protocol description.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import subprocess
+from importlib import metadata
 from pathlib import Path
 from typing import Dict, Optional, Sequence, Tuple
 
@@ -17,11 +19,12 @@ from fabricpc.graph_initialization import initialize_params
 from fabricpc.graph_initialization.state_initializer import FeedforwardStateInit
 
 from hibacaml.config import HiBaCaMLConfig
+from hibacaml.reporting.integrity import IntegrityError, require, require_finite  # noqa: F401  (re-exported)
 from hibacaml.reporting.logger import log_progress
 from hibacaml.graph import create_hibacaml_structure
 from hibacaml.training import HiBaCaMLBackpropTrainer, HiBaCaMLPCTrainer
 from hibacaml.training.pc import HiBaCaMLPCInference
-from hibacaml.types import MnistTask
+from hibacaml.types import Task
 
 LEARNERS = ("pc", "backprop")
 
@@ -67,7 +70,8 @@ def _log_run_summary(cfg, tasks, learning: str, structure) -> None:
     """
     pool = cfg.column_pool
     classes = len(tasks[0].classes) if tasks else 0
-    protocol = "Full-MNIST" if len(tasks) == 1 and classes == 10 else "Split-MNIST"
+    dataset = "CIFAR-10" if cfg.input_shape[-1] == 3 else "MNIST"
+    protocol = f"{'Full' if len(tasks) == 1 and classes == 10 else 'Split'}-{dataset}"
     log_progress(
         f"protocol={protocol} tasks={len(tasks)} classes={classes} "
         f"learning={learning}",
@@ -80,6 +84,14 @@ def _log_run_summary(cfg, tasks, learning: str, structure) -> None:
         f"scale={1.0 / pool.active_support_size:.6f}",
         component="runner",
     )
+    rows, cols = cfg.token_grid
+    stem = cfg.stem
+    log_progress(
+        (f"stem channels={stem.channels} strides={stem.strides} pool={stem.pool_window} " if stem else "")
+        + f"tokens={rows}x{cols} token_dim={cfg.patch_token_dim} "
+        f"shared_k={structure.config['hibacaml']['shared_k_connectivity']}",
+        component="runner",
+    )
     log_progress(
         f"schedule epochs={cfg.epochs_per_task} batch={cfg.batch_size} "
         f"seed={cfg.seed} infer_steps={cfg.infer_steps} eta={cfg.eta_infer}",
@@ -89,11 +101,12 @@ def _log_run_summary(cfg, tasks, learning: str, structure) -> None:
 
 def build_trainer(
     cfg: HiBaCaMLConfig,
-    tasks: Sequence[MnistTask],
+    tasks: Sequence[Task],
     learning: str,
     *,
     run_id: str = "",
     experiment_metadata: Optional[Dict[str, object]] = None,
+    shared_k_connectivity: str = "dense",
 ):
     """Build the graph, initialize parameters, and construct one runner."""
     if learning not in LEARNERS:
@@ -110,6 +123,7 @@ def build_trainer(
         cfg,
         inference,
         graph_state_initializer=FeedforwardStateInit(),
+        shared_k_connectivity=shared_k_connectivity,
     )
     _log_run_summary(cfg, tasks, learning, structure)
 
@@ -131,3 +145,47 @@ def build_trainer(
         f"trainer constructed class={type(trainer).__name__}", component="runner"
     )
     return structure, trainer
+
+
+def require_production_runtime() -> None:
+    """Production runs need a GPU backend with JIT enabled."""
+    require(jax.default_backend() == "gpu" and not jax.config.jax_disable_jit,
+            "production runs require a GPU backend with JIT enabled")
+
+
+def log_runtime() -> Dict[str, object]:
+    """Log the backend and devices; return the runtime identity recorded in the run summary."""
+    log_progress(f"backend={jax.default_backend()} devices={jax.devices()}", component="runner")
+    try:
+        revision = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parents[1],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip() or None
+    except (OSError, subprocess.TimeoutExpired):
+        revision = None
+    return {
+        "git_revision": revision,
+        "jax": metadata.version("jax"),
+        "jaxlib": metadata.version("jaxlib"),
+        "backend": jax.default_backend(),
+    }
+
+
+def architecture_metadata(cfg: HiBaCaMLConfig, structure, params) -> Dict[str, object]:
+    """Column layout, token layout and parameter count of a built graph."""
+    pool, meta = cfg.column_pool, structure.config["hibacaml"]
+    return {
+        "total_columns": pool.total_columns,
+        "shared_columns": pool.shared_indices,
+        "adaptive_columns": pool.adaptive_indices,
+        "reserve_columns": pool.reserve_indices,
+        "topk_nonshared": pool.topk_nonshared,
+        "active_support_size": pool.active_support_size,
+        "aggregation_scale": 1.0 / pool.active_support_size,
+        "composer_topk": cfg.composer.topk,
+        "stem": cfg.stem,
+        "token_grid": cfg.token_grid,
+        "token_dim": cfg.patch_token_dim,
+        "shared_k_connectivity": meta["shared_k_connectivity"],
+        "parameter_count": int(sum(leaf.size for leaf in jax.tree_util.tree_leaves(params))),
+    }
