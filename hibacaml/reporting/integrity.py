@@ -1,14 +1,35 @@
-"""Byte-exact state digests for protection, isolation and provenance checks."""
+"""Run invariants and byte-exact state digests for protection, isolation and provenance checks."""
 
 from __future__ import annotations
 
 import dataclasses
 import hashlib
 from contextlib import contextmanager
-from typing import Dict, Iterable
+from typing import Dict, Iterable, Optional
 
 import jax
 import numpy as np
+
+
+class IntegrityError(AssertionError):
+    """A broken run invariant; `details` is recorded with the failure."""
+
+    def __init__(self, message: str, details: Optional[Dict[str, object]] = None):
+        super().__init__(message)
+        self.details = details or {}
+
+
+def require(condition, message: str, **details) -> None:
+    if not condition:
+        raise IntegrityError(message, details)
+
+
+def require_finite(tree, *, label: str) -> None:
+    """Reject nonfinite numeric leaves in model/report pytrees at task boundaries."""
+    for path, value in jax.tree_util.tree_leaves_with_path(jax.device_get(tree)):
+        if isinstance(value, (float, complex, np.number, np.ndarray)):
+            require(np.all(np.isfinite(value)),
+                    f"nonfinite value in {label}{jax.tree_util.keystr(path)}")
 
 
 def fingerprint(value) -> str:
@@ -94,6 +115,17 @@ def column_fingerprints(params, columns: Iterable[int]) -> Dict[int, str]:
         if head.startswith("col") and int(head[3:]) in wanted:
             grouped[int(head[3:])][name] = node
     return {c: fingerprint(nodes) for c, nodes in grouped.items()}
+
+
+def leaf_digests(params, leaves) -> Dict[tuple, str]:
+    """`{(node, field, key): digest}` of individual parameter leaves."""
+    return {leaf: fingerprint(getattr(params.nodes[leaf[0]], leaf[1])[leaf[2]]) for leaf in leaves}
+
+
+def changed_leaves(params, references: Dict[tuple, str]):
+    """Sorted leaves whose bytes no longer match their reference digest."""
+    current = leaf_digests(params, references)
+    return sorted(leaf for leaf, digest in references.items() if current[leaf] != digest)
 
 
 @contextmanager

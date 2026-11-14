@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import itertools
+import math
 import time
 from abc import ABC, abstractmethod
 from functools import cached_property
@@ -46,6 +47,7 @@ from hibacaml.reporting import (
     write_run_state,
 )
 from hibacaml.reporting.export import write_json
+from hibacaml.reporting.integrity import require
 from hibacaml.training import write_policy
 from hibacaml.types import (
     Task,
@@ -126,10 +128,22 @@ def clipping_telemetry(opt_state) -> Optional[GradientClippingState]:
     return first if isinstance(first, GradientClippingState) else None
 
 
+def adam_state(opt_state) -> optax.ScaleByAdamState:
+    """The Adam count/moments of bare or clip-chained AdamW."""
+    return opt_state[0] if isinstance(opt_state[0], optax.ScaleByAdamState) else opt_state[1][0]
+
+
 def adam_count(opt_state) -> int:
     """The single global Adam step count, for bare or clip-chained AdamW."""
-    adam = opt_state[0] if isinstance(opt_state[0], optax.ScaleByAdamState) else opt_state[1][0]
-    return int(adam.count)
+    return int(adam_state(opt_state).count)
+
+
+def with_moments(opt_state, mu, nu):
+    """`opt_state` with new Adam moments; count, clipping state and layout unchanged."""
+    if isinstance(opt_state[0], optax.ScaleByAdamState):
+        return (opt_state[0]._replace(mu=mu, nu=nu), *opt_state[1:])
+    adamw = opt_state[1]
+    return (opt_state[0], (adamw[0]._replace(mu=mu, nu=nu), *adamw[1:]), *opt_state[2:])
 
 
 def build_update_programs(
@@ -899,11 +913,16 @@ class HiBaCaMLTrainer(ABC):
         nonshared: Sequence[int],
         *,
         epoch_index: int = 0,
+        check_finite: bool = False,
     ) -> Tuple[int, ...]:
-        """Train fixed batches through the ordinary per-batch lifecycle; no loaders or validation."""
+        """Train fixed batches through the ordinary per-batch lifecycle; no loaders or validation.
+
+        `check_finite` rejects a nonfinite loss component right after its update
+        (the losses are already host floats, so the check adds no transfer).
+        """
         count = len(batches)
         for batch_index, batch in enumerate(batches):
-            nonshared, _, _ = self._train_batch(
+            nonshared, losses, _ = self._train_batch(
                 task,
                 batch,
                 nonshared,
@@ -912,6 +931,9 @@ class HiBaCaMLTrainer(ABC):
                 train_batches=count,
                 batch_log_every=max(1, count // 4),
             )
+            if check_finite:
+                require(all(math.isfinite(v) for v in losses.values()), "nonfinite training loss",
+                        global_step=self.persistent_state.global_step, losses=losses)
         self._close_clipping_epoch()
         return tuple(nonshared)
 
