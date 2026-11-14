@@ -9,18 +9,17 @@ runner is just a protocol description.
 from __future__ import annotations
 
 import dataclasses
-import os
 import subprocess
 from importlib import metadata
 from pathlib import Path
 from typing import Dict, Optional, Sequence, Tuple
 
 import jax
-import numpy as np
 from fabricpc.graph_initialization import initialize_params
 from fabricpc.graph_initialization.state_initializer import FeedforwardStateInit
 
 from hibacaml.config import HiBaCaMLConfig
+from hibacaml.reporting.integrity import IntegrityError, require, require_finite  # noqa: F401  (re-exported)
 from hibacaml.reporting.logger import log_progress
 from hibacaml.graph import create_hibacaml_structure
 from hibacaml.training import HiBaCaMLBackpropTrainer, HiBaCaMLPCTrainer
@@ -148,37 +147,10 @@ def build_trainer(
     return structure, trainer
 
 
-class IntegrityError(AssertionError):
-    """A broken run invariant; `details` is recorded with the failure."""
-
-    def __init__(self, message: str, details: Optional[Dict[str, object]] = None):
-        super().__init__(message)
-        self.details = details or {}
-
-
-def require(condition, message: str, **details) -> None:
-    if not condition:
-        raise IntegrityError(message, details)
-
-
-def require_finite(tree, *, label: str) -> None:
-    """Reject nonfinite numeric leaves in model/report pytrees at task boundaries."""
-    for path, value in jax.tree_util.tree_leaves_with_path(jax.device_get(tree)):
-        if isinstance(value, (float, complex, np.number, np.ndarray)):
-            require(np.all(np.isfinite(value)),
-                    f"nonfinite value in {label}{jax.tree_util.keystr(path)}")
-
-
-DETERMINISTIC_XLA_FLAG = "--xla_gpu_deterministic_ops=true"
-
-
-def require_production_runtime(*, deterministic_xla: bool = False) -> None:
-    """Production runs need a GPU with JIT (and, for paired runs, deterministic XLA ops)."""
+def require_production_runtime() -> None:
+    """Production runs need a GPU backend with JIT enabled."""
     require(jax.default_backend() == "gpu" and not jax.config.jax_disable_jit,
             "production runs require a GPU backend with JIT enabled")
-    if deterministic_xla:
-        require(DETERMINISTIC_XLA_FLAG in os.environ.get("XLA_FLAGS", "").split(),
-                f"production runs require XLA_FLAGS to contain {DETERMINISTIC_XLA_FLAG}")
 
 
 def log_runtime() -> Dict[str, object]:

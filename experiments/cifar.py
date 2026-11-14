@@ -1,6 +1,6 @@
 """Static Full-CIFAR-10 experiment (R6): joint ten-class capacity of the 4+5 active layout.
 
-    python -m experiments.cifar [--run-id NAME]
+    python -m experiments.cifar [--seed S]
 """
 
 from __future__ import annotations
@@ -61,7 +61,10 @@ def run_experiment(cfg, *, run_id: str | None = None):
     )
     bank = cfg.column_pool.active_support_size
     arm = f"full_cifar_backprop_bank{bank}"
-    run_id = run_id or f"CIFAR10_backprop_{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
+    run_id = run_id or (
+        f"CIFAR10_backprop_R6_s{cfg.column_pool.shared_count}o{cfg.column_pool.topk_nonshared}"
+        f"_seed{cfg.seed}_{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
+    )
     cfg, run_output_root = prepare_run_root(cfg, run_id)
     expected_updates = len(task.train_loader) * cfg.epochs_per_task
     experiment_metadata = {
@@ -116,6 +119,7 @@ def run_experiment(cfg, *, run_id: str | None = None):
     final_validation_metrics = epoch_records[-1]["validation_metrics"] if epoch_records else {}
     results = {
         "run_id": run_id,
+        "seed": int(cfg.seed),
         "arm": arm,
         "learning": "backprop",
         "learner_contract": experiment_metadata["learner_contract"],
@@ -167,10 +171,10 @@ def run_experiment(cfg, *, run_id: str | None = None):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--run-id", default=None)
+    parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args(argv)
     require_production_runtime()
-    return run_experiment(override(make_hibacaml_config(MODE), **OVERRIDES), run_id=args.run_id)
+    return run_experiment(override(make_hibacaml_config(MODE), **{**OVERRIDES, "seed": args.seed}))
 
 
 if __name__ == "__main__":
