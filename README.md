@@ -1,29 +1,29 @@
 # HiBaCaML Experiments
 
-This repository contains experiments and exploratory implementations based on the **Hierarchical Bayesian Causal Modular Learning (HiBaCaML)** framework described in *Hierarchical Bayesian Causal Modular Learning: A Two-Level Columnar Architecture for Continual Learning*.
+Continual-learning experiments based on [*Hierarchical Bayesian Causal Modular
+Learning: A Two-Level Columnar Architecture for Continual Learning*](https://link.springer.com/chapter/10.1007/978-3-032-33010-9_21).
+The paper introduces **HiBaCaML**, in which a controller activates a sparse set of
+columns for each task, and each column
+separates reusable structure from task-specific information, so new tasks can be
+learned with limited forgetting of earlier ones. The models are built with
+[FabricPC](https://github.com/trueagi-io/FabricPC), a JAX predictive-coding library.
 
-HiBaCaML is a continual learning framework built around a **two-level modular architecture**. At the top level, a controller selects a sparse subset of component learners, or "columns", to use for a given task or context. Inside each column, a second probabilistic process separates reusable structure from task-specific information, helping the system preserve previously learned knowledge while still adapting to new tasks.
-
-The framework is motivated by the idea that catastrophic forgetting can be reduced when learning is organized into modules with limited interference, rather than forcing all tasks to share the same parameters in a dense monolithic network. In the paper, this idea is instantiated through a columnar architecture referred to as **ColBa**, which is designed to support reuse, specialization, and controlled adaptation over time.
-
-The experiments in this repository are implemented using [FabricPC](https://github.com/trueagi-io/FabricPC), a JAX-based predictive coding library for building modular graph-structured models. In this project, it serves as the experimental framework for exploring HiBaCaML-inspired continual learning behavior.
-
-Supported Split-MNIST run modes are:
-
-- `default`: the main implementation mode.
-- `smoke`: a small developer sanity-check mode.
-
-The work in this repository focuses on experimenting with these ideas on standard continual learning benchmarks, with particular attention to:
-
-- `SplitMNIST`
-- `SplitCIFAR`
-
-The goal of this repo is to explore how a HiBaCaML/ColBa-style columnar, modular approach behaves on sequential task settings, and how effectively it supports continual learning without catastrophic forgetting.
-
-## Install dependencies
-
-From the  repo root:
+## Setup
 
 ```bash
 pip install -r requirements.txt
 ```
+
+## Experiments
+
+Run from the repository root; results are written under `runs/`.
+
+| Experiment | Command |
+|---|---|
+| Split-MNIST | `python -m experiments.split_mnist` |
+| Full-MNIST | `python -m experiments.mnist` |
+| Full-CIFAR-10 (GPU) | `python -m experiments.cifar --seed 0` |
+| Split-CIFAR-10 (GPU) | `python -m experiments.split_cifar --seed 0` |
+
+The method, code structure and experiment details are documented in
+[docs/Implementation_details.md](docs/Implementation_details.md).
