@@ -2,3 +2,11 @@
 .venv/
 __pycache__/
 runs/
+docs/*
+!docs/Implementation_details.md
+!docs/ALGORITHM.md
+!docs/CODE_STRUCTURE.md
+!docs/EXPERIMENTS.md
+!docs/COLUMN_REUSE_AND_SHELL_ADAPTATION.md
+tests/
+*.log
