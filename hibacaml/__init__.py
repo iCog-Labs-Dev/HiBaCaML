@@ -15,6 +15,8 @@ from hibacaml.config import (
 from hibacaml.control import (
     CertificateController,
     ExactSearchService,
+    Router,
+    RouterProfile,
     ShellController,
 )
 from hibacaml.data import (
@@ -78,6 +80,8 @@ __all__ = [
     "prepare_run_root",
     "PhiLike",
     "ReportingConfig",
+    "Router",
+    "RouterProfile",
     "ReserveRecruitmentRow",
     "ShellController",
     "ShellStats",
