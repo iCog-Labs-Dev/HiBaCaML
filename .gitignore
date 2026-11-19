@@ -1,12 +1,14 @@
+# system files
 .vscode/
+
+# virtual environment and cache
 .venv/
 __pycache__/
+
+# Run artifacts and internal documentations
 runs/
-docs/*
-!docs/Implementation_details.md
-!docs/ALGORITHM.md
-!docs/CODE_STRUCTURE.md
-!docs/EXPERIMENTS.md
-!docs/COLUMN_REUSE_AND_SHELL_ADAPTATION.md
-tests/
+docs/project/*
+
+# internal tests and logs
+tests_internal/
 *.log
