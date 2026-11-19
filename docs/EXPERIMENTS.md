@@ -252,6 +252,8 @@ task-local two-way readouts, a 20-column pool with 2 shared and 3 selected colum
 active per task, and the teacher-first support controller of
 [ALGORITHM.md](ALGORITHM.md) (section 2.5).
 
+Only the Split-MNIST backprop runner currently uses the shared support router. It fits prototypes for the teacher’s saved supports and selects one from the image alone at inference. [Support router and Split-MNIST settings](SUPPORT_ROUTER.md)
+
 **Configuration.** The `default` preset (`HiBaCaMLConfig` and its nested configs)
 plus the runner's `OVERRIDES`:
 

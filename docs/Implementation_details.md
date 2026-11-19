@@ -8,6 +8,7 @@ The implementation documentation is split by the question it answers:
 | [CODE_STRUCTURE.md](CODE_STRUCTURE.md) | Every module and what it owns, the order of operations in one training update, how a run flows through the code, the two learners (backprop and predictive coding), and a suggested reading order. |
 | [EXPERIMENTS.md](EXPERIMENTS.md) | The four runners (Split-MNIST, Full-MNIST, Full-CIFAR-10, Split-CIFAR-10): data, configuration, how to run them, what they write, and reference results. |
 | [COLUMN_REUSE_AND_SHELL_ADAPTATION.md](COLUMN_REUSE_AND_SHELL_ADAPTATION.md) | The Split-CIFAR-10 controllers in full: exact write protection, restricted column reuse at task boundaries, and audited shell adaptation during training. |
+| [SUPPORT_ROUTER.md](SUPPORT_ROUTER.md) | How the shared router selects a saved column support from an image, and how to configure and evaluate it in Split-MNIST backprop, the only runner currently using it. |
 
 Quick start:
 
